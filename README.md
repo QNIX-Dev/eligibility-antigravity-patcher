@@ -1,91 +1,128 @@
-# agy-unlock
+<h1 align="center">🚀 agy-unlock</h1>
+<p align="center">
+  <b>Легковесный и надежный патчер ограничений доступности Antigravity для Windows</b>
+</p>
 
-A tiny Python tool (Windows) — **dependency-free core**, plus an optional
-interactive menu (`rich` + `questionary`) — that hides the
-**"Sorry, this account is ineligible … not currently available in your location"**
-eligibility screen in the three Antigravity apps:
+<p align="center">
+  <b>Русский</b> | <a href="README.en.md">English</a>
+</p>
 
-| Target | App | What it patches |
-|---|---|---|
-| `cli` | **Antigravity CLI** (`agy.exe`, Go binary) | NOPs the call that prints the startup eligibility banner |
-| `manager` | **Antigravity** Manager (Electron, `app.asar`) | injects a tiny `fetch` hook that clears the `ineligible` verdict from the `GetAuthStatus` response |
-| `ide` | **Antigravity IDE** (VS Code fork, `out/main.js`) | forces the internal-eligible auth branch (`isGoogleInternal → true`) |
+<p align="center">
+  <a href="https://microsoft.com/windows"><img src="https://img.shields.io/badge/OS-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="OS - Windows"></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python - 3.8+"></a>
+  <a href="https://github.com/nikitos4683/agy-eligibility-patcher"><img src="https://img.shields.io/badge/Core_Deps-None-brightgreen?style=flat-square" alt="Core Dependencies - None"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License - MIT"></a>
+</p>
 
-## What it does (and doesn't)
+---
 
-These gates are **non-blocking eligibility checks** — once past them the models and
-features work normally. The tool only stops the local gate screen from appearing.
-It does **not** unlock anything you couldn't already use, steal, or bypass any paid
-feature — it neutralizes a client-side "not available in your region" notice.
+> [!NOTE]
+> Эти экраны — чисто локальное ограничение на стороне клиента. После их обхода модели и функции работают в штатном режиме. Этот инструмент **не** обходит серверную авторизацию, он лишь отключает локальную заглушку региональных ограничений.
 
-Every change is **backed up** (`<file>.agybak`) and reversible with `restore`.
-Pure standard library — no pip installs, no Node required.
+---
 
-## Usage
+## ✨ Возможности
 
-### Interactive menu (recommended)
+- ⚡ **Ядро без зависимостей:** Базовые команды (`status`, `patch`, `restore`) работают на стандартной библиотеке Python без необходимости установки сторонних пакетов.
+- 🎨 **Интерактивный TUI:** Красивое консольное меню для управления патчами на базе библиотек `rich` и `questionary`.
+- 🛡️ **Безопасность и откат:** Автоматически создает резервные копии (`*.agybak`) перед модификацией файлов, позволяя восстановить оригинальное состояние в один клик.
+- ⚙️ **Автоматический поиск:** Сканирует реестр Windows, переменные окружения, системный PATH и директории Scoop для автоматического нахождения путей установки. Никаких хардкод-путей!
+- 🧬 **Устойчивость к обновлениям:** Ищет сигнатуры и инструкции (через регулярные выражения и относительные смещения), а не привязывается к жестко заданным байтовым сдвигам.
 
-```sh
-pip install -r requirements.txt   # one-time: rich + questionary
-python patch.py                   # launches the interactive menu
-```
+---
 
-A live status table of the three apps, then arrow-key menus to **patch** /
-**restore** any subset (space to toggle, enter to confirm).
+## 📱 Поддерживаемые приложения
 
-### Scriptable commands (no dependencies)
+| Таргет | Приложение | Метод патчинга | Маркер поиска |
+| :---: | :--- | :--- | :--- |
+| **`cli`** | **Antigravity CLI** (`agy.exe`) | NOP-ование вызова функции, которая выводит приветственный баннер о недоступности. | `agy.exe` (в PATH или scoop) |
+| **`manager`** | **Antigravity Manager** (Electron) | Внедрение хука-перехватчика `fetch` в preload-скрипт внутри `app.asar`. | `resources\app.asar` |
+| **`ide`** | **Antigravity IDE** (VS Code) | Патч минифицированного скрипта запуска VS Code для принудительного включения флага `isGoogleInternal`. | `resources\app\out\main.js` |
 
-```sh
-python patch.py status            # show patch status of all three
-python patch.py patch             # patch every app it can find
-python patch.py restore           # restore every app from backup
-python patch.py patch ide manager # only the listed targets (cli|manager|ide)
-python patch.py --path-cli "C:\custom\agy.exe" patch cli
-```
+---
 
-The `status` / `patch` / `restore` commands use only the standard library —
-`rich` + `questionary` are needed **only** for the interactive menu.
+## 🚀 Быстрый старт
 
-Close the relevant app first (the tool refuses to touch a locked file).
-After patching the IDE/Manager it clears their V8 byte-code caches automatically.
+### Вариант А: Интерактивное меню (рекомендуется)
 
-## How it finds your install
+Для запуска интерактивного TUI-интерфейса с таблицей статусов:
 
-No hard-coded paths or versions. For each app it searches the usual roots —
-per-user & machine `…\Programs`, `Program Files`, `Program Files (x86)`,
-`%LOCALAPPDATA%`, the Windows **registry** (`Uninstall` → `InstallLocation` of
-anything named *Antigravity*), the **PATH** (for `agy`), and Scoop if present —
-then matches each app by a **structural marker file**, not by name/version:
+1. **Установите зависимости:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Запустите патчер:**
+   ```bash
+   python patch.py
+   ```
 
-| App | Marker |
-|---|---|
-| cli | `agy.exe` (on PATH or `…\agy\bin\`) |
-| manager | `…\resources\app.asar` |
-| ide | `…\resources\app\out\main.js` |
+*(Поддерживает навигацию стрелочками, выбор пробелом и подтверждение по Enter).*
 
-If your install lives somewhere unusual, point at it with `--path-cli` /
-`--path-manager` / `--path-ide`.
+---
 
-## Why it's version-robust
+### Вариант Б: Консольные команды (без зависимостей)
 
-Nothing is hard-coded to a build:
+Работает полностью на стандартной библиотеке Python (установка сторонних пакетов не требуется).
 
-- **cli** — finds the unique `Eligibility Check` string, follows the RIP-relative
-  `LEA` that references it, and NOPs the first `call rel32` after it. Survived an
-  `agy.exe` auto-update during testing (located the new offset on its own).
-- **manager** — parses & rebuilds the `app.asar` in pure Python (preserves the
-  `app.asar.unpacked` entries and recomputes per-file integrity), appending the
-  hook to `dist/preload.js`.
-- **ide** — a regex (`resetIsTierGCPTos(),this.<X>.isGoogleInternal → …,true`)
-  that matches the auth gate regardless of the minified variable name / version.
+| Команда | Описание |
+| :--- | :--- |
+| `python patch.py status` | Проверить статус патча для всех приложений. |
+| `python patch.py patch` | Пропатчить все найденные приложения (резервные копии создаются автоматически). |
+| `python patch.py restore` | Восстановить все приложения из бэкапов. |
+| `python patch.py patch ide` | Пропатчить только указанные приложения (например, `ide`, `manager` или `cli`). |
 
-## Caveats
+> [!TIP]
+> Если ваше приложение установлено в нестандартную директорию, автопоиск можно переопределить ручным указанием пути:
+> ```bash
+> python patch.py --path-cli "D:\CustomTools\agy.exe" patch cli
+> ```
 
-- **Windows x64.** Built against CLI 1.0.x, Manager 2.0.6, IDE 2.0.3.
-- **App updates revert it** — just run `python patch.py patch` again afterwards.
-- Modifying these proprietary apps may be against their Terms of Service. It's a
-  cosmetic, local, reversible tweak — use at your own risk.
+---
 
-## License
+## 🔍 Детали реализации (под капотом)
 
-MIT — see [LICENSE](LICENSE).
+<details>
+<summary>🛠️ <b>CLI (`agy.exe` Go PE-патчинг)</b></summary>
+
+CLI-приложение представляет собой Go-бинарник. Патчер парсит его PE-заголовки для нахождения секции `.text`:
+1. Находит уникальную строку `Eligibility Check`.
+2. Находит RIP-относительную инструкцию `LEA`, которая ссылается на эту строку.
+3. Сканирует код дальше в поисках первой инструкции вызова `call` (опкод `E8`).
+4. Перезаписывает эти 5 байт инструкциями `NOP` (`0x90`), безопасно пропуская вызов проверки.
+</details>
+
+<details>
+<summary>📦 <b>Manager (`app.asar` Electron-инъекция)</b></summary>
+
+Менеджер упакован в стандартный Electron ASAR-архив:
+1. Инструмент парсит структуру заголовка ASAR без сторонних библиотек.
+2. Извлекает скрипт `dist/preload.js` и дописывает в него наш хук.
+3. Хук перехватывает глобальный `window.fetch` при запросах к `GetAuthStatus`.
+4. Полученный gRPC-web JSON-ответ парсится, устанавливается флаг `authResult.hasValidAuth = true`, а поля ошибок удаляются.
+5. ASAR пересобирается с пересчетом хешей блоков, после чего очищается кэш байт-кода V8.
+</details>
+
+<details>
+<summary>💻 <b>IDE (`main.js` патч VS Code)</b></summary>
+
+IDE построена на базе VS Code:
+1. Скрипт сканирует файл `resources/app/out/main.js` с помощью регулярного выражения.
+2. Ищет минифицированный шаблон авторизации:
+   `resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal`
+3. Заменяет его на `resetIsTierGCPTos(),true`, чтобы принудительно выдать права внутреннего разработчика.
+4. Очищает кэши байт-кода VS Code (`CachedData` и `Code Cache/js`) для моментального применения изменений.
+</details>
+
+---
+
+## ⚠️ Важные примечания
+
+- **Сброс при обновлениях:** При обновлении приложений пропатченные файлы будут перезаписаны оригинальными. Просто запустите `python patch.py patch` заново.
+- **Блокировка файлов:** Убедитесь, что патчируемое приложение полностью закрыто перед запуском скрипта, иначе операционная система заблокирует запись в файл.
+- **Условия использования:** Изменение проприетарного кода приложений может нарушать условия использования (ToS). Данный проект создан исключительно в образовательных целях — используйте его под свою ответственность.
+
+---
+
+## 📄 Лицензия
+
+Проект распространяется под лицензией MIT. Подробности см. в файле [LICENSE](LICENSE).
