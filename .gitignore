@@ -1,0 +1,14 @@
+# never commit proprietary binaries, archives, or backups
+*.exe
+*.asar
+*.bak
+*.agybak
+*.bak.*
+_t_*
+_orig_test*
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,5 @@
+# Optional — only needed for the interactive menu (`python patch.py`).
+# The scriptable commands (status / patch / restore) work with the Python
+# standard library alone, no installs required.
+rich>=13
+questionary>=2
