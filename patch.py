@@ -366,9 +366,6 @@ def interactive(overrides):
         sel = questionary.checkbox(f"Select app(s) to {action}:", choices=opts, style=qs).ask()
         if not sel:
             continue
-        if action == "patch" and not questionary.confirm(
-                f"Patch {len(sel)} app(s)? A backup is made first.", default=True, style=qs).ask():
-            continue
         console.rule(f"[bold cyan]{action}[/]")
         run(action, sel, overrides)
         for t in sel:                              # refresh only what we just touched
