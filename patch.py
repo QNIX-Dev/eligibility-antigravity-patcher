@@ -3,8 +3,8 @@
 agy-unlock — hide the cosmetic / non-blocking "not available in your location"
 eligibility gate in the three Antigravity apps on Windows:
 
-  * cli      Antigravity CLI         (agy.exe, Go binary)        -> NOP the startup banner
-  * manager  Antigravity (Manager)   (Electron, app.asar)        -> neutralize GetAuthStatus verdict
+  * cli      Antigravity CLI         (agy.exe, Go binary)        -> suppress eligibility screen
+  * manager  Antigravity (Manager)   (language_server.exe, Go)   -> force hasValidAuth=true
   * ide      Antigravity IDE         (VS Code fork, out/main.js)  -> force the internal-eligible branch
 
 None of these unlock anything you can't already use — they only stop a local,
@@ -19,7 +19,7 @@ Usage:
     python patch.py --path-cli "C:\\...\\agy.exe" patch cli
 """
 from __future__ import annotations
-import argparse, contextlib, functools, glob, hashlib, json, mmap, os, shutil, struct, sys
+import argparse, contextlib, filecmp, functools, glob, mmap, os, re, shutil, sys
 from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
@@ -43,9 +43,17 @@ def is_locked(path):
         return True
 
 def make_backup(path):
-    if not os.path.exists(path + BAK):
-        shutil.copy2(path, path + BAK)
+    """Snapshot the clean file as <path>.agybak (callers reach here only when unpatched,
+    so the live bytes are this build's pristine original). A backup that no longer
+    matches the file is stale (app auto-updated) — refresh it instead of keeping it."""
+    bak = path + BAK
+    if os.path.exists(bak):
+        if filecmp.cmp(path, bak, shallow=False):
+            return                                  # backup already matches this build
+        info(f"backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK}")
+    else:
         info(f"backup -> {os.path.basename(path)}{BAK}")
+    shutil.copy2(path, bak)
 
 def restore_file(path):
     b = path + BAK
@@ -66,9 +74,8 @@ def rmtree_quiet(p):
 
 @contextlib.contextmanager
 def mapped(path):
-    """Read-only, zero-copy view of a file for marker/regex scans — avoids
-    slurping multi-MB binaries (agy.exe, app.asar, main.js) into RAM. The view
-    is bytes-like: it works with .find(), slicing, struct.unpack_from and re."""
+    """Read-only, zero-copy bytes-like view (works with .find(), slicing, re) for
+    marker/regex scans — avoids slurping multi-MB binaries into RAM."""
     with open(path, "rb") as f:
         if os.fstat(f.fileno()).st_size == 0:
             yield b""; return
@@ -77,10 +84,9 @@ def mapped(path):
         finally: mm.close()
 
 # ----------------------------------------------------------------- discovery --
-# Generic, install-location-agnostic search: standard env roots + per-user/
-# machine "Programs"/Program Files + Windows registry InstallLocation + PATH
-# (+ scoop if present). Apps are matched by a STRUCTURAL marker file, never by
-# a hard-coded path or version.
+# Install-location-agnostic search: env roots + Programs/Program Files + registry
+# InstallLocation + PATH (+ scoop). Apps are matched by a structural marker file,
+# never a hard-coded path or version.
 @functools.lru_cache(maxsize=1)
 def _reg_install_dirs():
     dirs = []
@@ -138,35 +144,51 @@ def find_marker(rel):
         if os.path.isfile(direct): hits.append(direct)
     return _dedup_newest(hits)
 
-# --------------------------------------------------------------- PE (cli) -----
-class PE:
-    def __init__(self, data: bytes):
-        if data[:2] != b"MZ": raise ValueError("not a PE")
-        e = struct.unpack_from("<I", data, 0x3C)[0]
-        if data[e:e+4] != b"PE\0\0": raise ValueError("no PE sig")
-        nsec = struct.unpack_from("<H", data, e+6)[0]
-        optsz = struct.unpack_from("<H", data, e+20)[0]
-        opt = e+24
-        if struct.unpack_from("<H", data, opt)[0] != 0x20B: raise ValueError("not PE32+")
-        self.base = struct.unpack_from("<Q", data, opt+24)[0]
-        self.secs = []
-        sh = opt + optsz
-        for i in range(nsec):
-            o = sh + 40*i
-            name = data[o:o+8].rstrip(b"\0").decode("latin1")
-            vsz, va, rsz, rp = struct.unpack_from("<IIII", data, o+8)
-            self.secs.append((name, rp, rsz, va, vsz))
-    def off2va(self, off):
-        for _n, rp, rsz, va, _vs in self.secs:
-            if rp <= off < rp+rsz: return self.base+va+(off-rp)
-    def text(self):
-        for s in self.secs:
-            if s[0] == ".text": return s
-        raise ValueError("no .text")
+# ---------------------------------------------------- byte-signature gate -----
+# CLI and Manager each fix ONE machine-code site found by a binary-unique signature,
+# overwriting a few bytes in place. The machinery is shared; only the signatures,
+# replacement bytes, write offset and labels differ, so each target declares a Gate.
+# (Signatures use re.S so a `.` wildcard also matches a 0x0a displacement byte.)
+class Gate:
+    def __init__(self, sig, patched, fix, offset=0, desc=""):
+        self.sig, self.patched = re.compile(sig, re.S), re.compile(patched, re.S)
+        self.fix, self.offset, self.desc = fix, offset, desc
+    def find(self, data):
+        """('patched'|'unpatched', file offset to write at), or raise LookupError if
+        the signature is missing or not unique (unknown build — refuse to guess)."""
+        m = self.patched.search(data)
+        if m: return ("patched", m.start()+self.offset)
+        m = self.sig.search(data)
+        if not m: raise LookupError("gate signature not found (unsupported version?)")
+        if self.sig.search(data, m.end()): raise LookupError("gate signature is not unique — refusing to guess")
+        return ("unpatched", m.start()+self.offset)
+
+def gate_status(path, gate):
+    with mapped(path) as d:
+        try: return (gate.find(d)[0], None)
+        except LookupError: return ("unknown", None)
+
+def gate_patch(path, gate, app, fname):
+    if is_locked(path):
+        warn(f"{fname} is locked — close {app} first"); return False
+    with mapped(path) as d:                       # zero-copy scan; mmap closed before we write
+        try: kind, off = gate.find(d)
+        except LookupError as e: warn(str(e)); return False
+        if kind == "patched": ok(f"{app} already patched"); return True
+    make_backup(path)
+    with open(path, "r+b") as f:
+        f.seek(off); f.write(gate.fix); f.flush(); os.fsync(f.fileno())
+    ok(f"{app} patched ({gate.desc} @ file 0x{off:x})")
+    return True
 
 # ------------------------------------------------------------------- CLI ------
-CLI_MARKER = b"Eligibility Check"
-NOP5 = b"\x90"*5
+# agy.exe's handleAuthResult gates the cosmetic "Eligibility Check" on the server
+# AuthResult's hasValidAuth (+8):  test rax,rax ; je ; cmp byte[rax+8],0 ; jne.
+# rax is non-null here (the je above), so rewriting the compare to `test rax,rax`+nop
+# keeps ZF=0 -> the jne always takes the eligible branch and the screen never renders.
+CLI_GATE = Gate(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
+                rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....",
+                b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off")
 
 def cli_default_paths():
     cands = []
@@ -178,149 +200,20 @@ def cli_default_paths():
         cands += glob.glob(os.path.join(root, "agy*", "agy.exe"))
     return _dedup_newest(cands)
 
-def cli_find_call(data):
-    """Return file offset of the `call` that emits the eligibility section, or
-    ('patched', off) / raise. Version-robust: locate the unique marker string,
-    the RIP-relative LEA that references it, then the first `call rel32` after."""
-    pe = PE(data)
-    first = data.find(CLI_MARKER)
-    if first < 0 or data.find(CLI_MARKER, first+1) != -1:
-        raise LookupError("marker string missing or not unique")
-    mva = pe.off2va(first)
-    _n, traw, trsz, tva, _vs = pe.text()
-    tb = data[traw:traw+trsz]; tva0 = pe.base+tva
-    # Find the RIP-relative LEA (48/4C 8D /r, mod=00 rm=101) referencing the
-    # marker. Scan the two opcode prefixes at C speed via bytes.find — only real
-    # candidates reach Python — instead of a per-byte loop over multi-MB .text.
-    lea = None
-    for prefix in (b"\x48\x8d", b"\x4c\x8d"):
-        p = tb.find(prefix)
-        while p != -1:
-            if p+7 <= len(tb) and (tb[p+2] & 0xC7) == 0x05:
-                disp = struct.unpack_from("<i", tb, p+3)[0]
-                if tva0+p+7+disp == mva:
-                    if lea is not None: raise LookupError("multiple LEA refs")
-                    lea = traw+p
-            p = tb.find(prefix, p+1)
-    if lea is None: raise LookupError("no LEA ref to marker")
-    for j in range(lea+7, lea+7+0x100):
-        if data[j:j+5] == NOP5: return ("patched", j)
-        if data[j] == 0xE8:
-            tgt = pe.off2va(j) + 5 + struct.unpack_from("<i", data, j+1)[0]
-            if tva0 <= tgt < tva0+trsz: return ("call", j)
-    raise LookupError("no call after render site")
+# --------------------------------------------------- Manager (auth gate) ------
+# language_server.exe (Go) gates the account on validateLogin's hasValidAuth (byte at
+# result+8) and won't persist the OAuth token while it's false; the validator attaches
+# the token right after via stores into result+0x40 (temp register wildcarded for
+# recompiles). Forcing the byte true covers every login flow (incl. account switch).
+# cmp byte[rax+8],0 ; je ; mov rT,[rsp+d] ; mov [rax+0x40],rT  ->  mov byte[rax+8],1;nop;nop
+MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89[\x40\x48\x50\x58\x60\x68\x70\x78]\x40",
+                    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89[\x40\x48\x50\x58\x60\x68\x70\x78]\x40",
+                    b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
 
-def cli_status(path):
-    with mapped(path) as data:
-        kind, off = cli_find_call(data)
-    return ("patched" if kind == "patched" else "unpatched", off)
-
-def cli_patch(path):
-    if is_locked(path): warn("agy.exe is locked — close the CLI first"); return False
-    data = open(path, "rb").read()
-    kind, off = cli_find_call(data)
-    if kind == "patched": ok("CLI already patched"); return True
-    make_backup(path)
-    with open(path, "r+b") as f:
-        f.seek(off); f.write(NOP5); f.flush(); os.fsync(f.fileno())
-    ok(f"CLI patched (NOP @ file 0x{off:x})")
-    return True
-
-# ----------------------------------------------------------------- asar -------
-def asar_load(path):
-    raw = open(path, "rb").read()
-    json_size = struct.unpack_from("<I", raw, 12)[0]
-    header = json.loads(raw[16:16+json_size].decode("utf-8"))
-    base = 8 + struct.unpack_from("<I", raw, 4)[0]
-    return raw, header, base
-
-def asar_get(header, parts):
-    node = header
-    for p in parts: node = node["files"][p]
-    return node
-
-def asar_save(path, header, base, raw, mods):
-    files = []
-    def walk(node, pref):
-        for name, meta in node.get("files", {}).items():
-            p = pref+(name,)
-            if "files" in meta: walk(meta, p)
-            else: files.append((meta, p))
-    walk(header, ())
-    blob = bytearray()
-    for meta, p in files:
-        if meta.get("unpacked"): continue
-        if p in mods:
-            content = mods[p]
-        else:
-            off = int(meta["offset"]); sz = meta["size"]
-            content = raw[base+off:base+off+sz]
-        meta["offset"] = str(len(blob)); meta["size"] = len(content)
-        integ = meta.get("integrity")
-        if integ:
-            bs = integ.get("blockSize", 4*1024*1024)
-            integ["hash"] = hashlib.sha256(content).hexdigest()
-            integ["blocks"] = [hashlib.sha256(content[i:i+bs]).hexdigest()
-                               for i in range(0, len(content), bs)] or [hashlib.sha256(b"").hexdigest()]
-        blob += content
-    js = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    pad = (4 - len(js) % 4) % 4
-    aligned = len(js) + pad
-    head = struct.pack("<IIII", 4, 8+aligned, 4+aligned, len(js)) + js + b"\0"*pad
-    with open(path, "wb") as f:
-        f.write(head); f.write(bytes(blob))
-
-# ----------------------------------------------------------------- Manager ----
-# Injected (main world) hook: intercept GetAuthStatus (grpc-web+json), de-frame,
-# set authResult.hasValidAuth=true and drop the failure_details oneof, re-frame.
-MANAGER_HOOK = (
-"(function(){if(window.__agyAuth)return;window.__agyAuth=1;"
-"var td=new TextDecoder(),te=new TextEncoder();"
-"var rd=function(b,i){return b[i]*16777216+b[i+1]*65536+b[i+2]*256+b[i+3];};"
-'var FK=["ineligible","verificationRequired","tosViolation","generalError","projectRequired","headlessAuthRequired","uiMessage"];'
-'function fix(o){var c=false,ar=o&&o.authResult;if(ar&&typeof ar==="object"&&!Array.isArray(ar)){FK.forEach(function(k){if(k in ar){delete ar[k];c=true;}});if(ar.hasValidAuth!==true){ar.hasValidAuth=true;c=true;}}return c;}'
-"var OF=window.fetch;window.fetch=function(input){"
-'var url=(typeof input==="string")?input:(input&&input.url)||"";'
-'if(url.indexOf("GetAuthStatus")===-1)return OF.apply(this,arguments);'
-"return OF.apply(this,arguments).then(function(resp){return resp.clone().arrayBuffer().then(function(buf){try{"
-'var ct=resp.headers.get("content-type")||"";if(ct.indexOf("grpc-web")===-1)return resp;'
-"var b=new Uint8Array(buf),fr=[],i=0,ch=false;"
-"while(i+5<=b.length){var fl=b[i],L=rd(b,i+1);fr.push({flag:fl,payload:b.subarray(i+5,i+5+L)});i+=5+L;}"
-"fr.forEach(function(f){if((f.flag&0x80)===0){try{var o=JSON.parse(td.decode(f.payload));if(fix(o)){f.payload=te.encode(JSON.stringify(o));ch=true;}}catch(e){}}});"
-"if(!ch)return resp;var t=0;fr.forEach(function(f){t+=5+f.payload.length;});var out=new Uint8Array(t),p=0;"
-"fr.forEach(function(f){var L=f.payload.length;out[p]=f.flag;out[p+1]=(L>>>24)&255;out[p+2]=(L>>>16)&255;out[p+3]=(L>>>8)&255;out[p+4]=L&255;out.set(f.payload,p+5);p+=5+L;});"
-'var h=new Headers(resp.headers);h.delete("content-length");'
-"return new Response(out,{status:resp.status,statusText:resp.statusText,headers:h});"
-"}catch(e){return resp;}}).catch(function(){return resp;});});};})();"
-)
-MANAGER_INJECT = ('\n// agy-unlock: neutralize GetAuthStatus ineligible verdict\n'
-                  'try{require("electron").webFrame.executeJavaScript(' + json.dumps(MANAGER_HOOK) + ');}catch(e){}\n')
-
-def manager_default_asars():
-    return find_marker(os.path.join("resources", "app.asar"))
-
-def manager_status(path):
-    with mapped(path) as raw:
-        return ("patched" if raw.find(b"__agyAuth") != -1 else "unpatched", None)
-
-def manager_patch(path):
-    if is_locked(path): warn("app.asar is locked — close Antigravity (Manager) first"); return False
-    raw, header, base = asar_load(path)
-    if b"__agyAuth" in raw: ok("Manager already patched"); return True
-    try:
-        pre = asar_get(header, ("dist", "preload.js"))
-    except KeyError:
-        warn("dist/preload.js not found in app.asar"); return False
-    off = int(pre["offset"]); sz = pre["size"]
-    content = raw[base+off:base+off+sz]
-    make_backup(path)
-    asar_save(path, header, base, raw, {("dist", "preload.js"): content + MANAGER_INJECT.encode("utf-8")})
-    _clear_caches(os.path.expandvars(r"%APPDATA%\Antigravity"))
-    ok("Manager patched (preload hook injected, asar repacked)")
-    return True
+def manager_default_bins():
+    return find_marker(os.path.join("resources", "bin", "language_server.exe"))
 
 # --------------------------------------------------------------------- IDE ----
-import re
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
 IDE_DONE = b"resetIsTierGCPTos(),true"
 
@@ -342,26 +235,24 @@ def _ide_cache_dirs():
                  os.path.join(base, "Code Cache", "js")]
     return dirs
 
-def _clear_caches(userdata_root):
-    for sub in ("CachedData", os.path.join("Code Cache", "js")):
-        rmtree_quiet(os.path.join(userdata_root, sub))
-
 def ide_patch(path):
     if is_locked(path): warn("main.js is locked — close Antigravity IDE first"); return False
-    d = open(path, "rb").read()
+    with open(path, "rb") as f: d = f.read()
     if IDE_DONE in d and not IDE_RE.search(d): ok("IDE already patched"); return True
     if not IDE_RE.search(d):
         warn("isGoogleInternal auth-gate pattern not found (unsupported version?)"); return False
     make_backup(path)
-    open(path, "wb").write(IDE_RE.sub(rb"\1true", d))
+    with open(path, "wb") as f: f.write(IDE_RE.sub(rb"\1true", d))
     for c in _ide_cache_dirs(): rmtree_quiet(c)
     ok("IDE patched (isGoogleInternal -> true) + caches cleared")
     return True
 
 # -------------------------------------------------------------------- driver --
 SPEC = {
-    "cli":     dict(name="Antigravity CLI",      find=cli_default_paths,     status=cli_status,     patch=cli_patch),
-    "manager": dict(name="Antigravity Manager",  find=manager_default_asars, status=manager_status, patch=manager_patch),
+    "cli":     dict(name="Antigravity CLI",      find=cli_default_paths,     status=functools.partial(gate_status, gate=CLI_GATE),
+                    patch=functools.partial(gate_patch, gate=CLI_GATE, app="CLI", fname="agy.exe")),
+    "manager": dict(name="Antigravity Manager",  find=manager_default_bins,  status=functools.partial(gate_status, gate=MANAGER_GATE),
+                    patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname="language_server.exe")),
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
 }
 
@@ -385,7 +276,10 @@ def run(action, targets, overrides):
             elif action == "patch":
                 if not spec["patch"](path): rc = 1
             elif action == "restore":
-                restore_file(path)
+                if spec["status"](path)[0] == "patched":
+                    restore_file(path)
+                else:
+                    warn("not patched — skipping restore (backup may be a different build)")
         except Exception as e:
             warn(f"error: {e}"); rc = 1
     return rc
@@ -404,10 +298,9 @@ def state(t, overrides=None):
     return path, _status_of(t, path)
 
 def scan(overrides):
-    """Resolve paths + compute status for every target, once and concurrently.
-    Returns (paths, status) dicts keyed by target. Discovery (glob + registry)
-    and binary scans happen here instead of per menu redraw; the registry/root
-    probe is shared across targets and the three targets run in parallel."""
+    """Resolve paths + status for every target once, concurrently. Discovery and
+    binary scans happen here (not per menu redraw); the registry/root probe is
+    shared and the three targets run in parallel. Returns (paths, status) dicts."""
     _reg_install_dirs.cache_clear(); _roots.cache_clear()   # rediscover on (re)scan
     _roots()                                                # warm shared cache once
     def one(t):
@@ -465,7 +358,7 @@ def interactive(overrides):
             if not path:
                 continue
             if action == "patch" and st == "patched": continue        # nothing to do
-            if action == "restore" and not os.path.exists(path + BAK): continue
+            if action == "restore" and st != "patched": continue   # only undo a real patch
             opts.append(questionary.Choice(f"{SPEC[t]['name']}  · {st}", value=t))
         if not opts:
             console.print(f"[yellow]Nothing to {action}.[/]")

@@ -35,8 +35,8 @@
 
 | Target | Application | Patch Vector | Detection Marker |
 | :---: | :--- | :--- | :--- |
-| **`cli`** | **Antigravity CLI** (`agy.exe`) | NOPs the function call initiating the startup eligibility warning screen. | `agy.exe` (in path or scoop directories) |
-| **`manager`** | **Antigravity Manager** (Electron) | Injects a preload `fetch` interceptor hook inside the `app.asar` container. | `resources\app.asar` |
+| **`cli`** | **Antigravity CLI** (`agy.exe`) | Binary-patches `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy.exe` (in path or scoop directories) |
+| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources\bin\language_server.exe` |
 | **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force `isGoogleInternal` auth branch to `true`. | `resources\app\out\main.js` |
 
 ---
@@ -82,24 +82,25 @@ Runs purely on the Python Standard Library (no `pip install` required).
 ## 🔍 How it Works (Technical Details)
 
 <details>
-<summary>🛠️ <b>CLI (`agy.exe` Go Binary PE Patching)</b></summary>
+<summary>🛠️ <b>CLI (`agy.exe` Go binary patch)</b></summary>
 
-The CLI application is a Go binary. The patcher parses its Portable Executable (PE) headers to locate the `.text` section:
-1. It searches for the unique string `Eligibility Check`.
-2. Resolves the RIP-relative `LEA` instruction pointing to the string.
-3. Finds the next `call` instruction (opcode `E8`) in the execution flow.
-4. Overwrites the 5-byte instruction with `NOP`s (`0x90`), bypassing the check safely.
+The CLI prints a cosmetic "Eligibility Check" section at startup. The decision to show it is made in `handleAuthResult`, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned **by the server**.
+
+1. The patcher scans the binary for a gate signature that is unique across the whole file, and refuses to run if it is missing or occurs more than once (a guard against unknown versions).
+2. The signature pinpoints the check: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible). When `hasValidAuth` is zero, execution falls through and prints "Eligibility check failed".
+3. The `cmp byte ptr [rax+8], 0` is rewritten to `test rax,rax` (+`NOP`). Since `rax` is known non-null here, the `jne` always takes the eligible branch.
+4. As a result the restriction section never renders, regardless of the server response.
 </details>
 
 <details>
-<summary>📦 <b>Manager (`app.asar` Electron Injector)</b></summary>
+<summary>📦 <b>Manager (`language_server.exe` Go Backend Patch)</b></summary>
 
-The Manager packages its frontend files in an Electron ASAR archive:
-1. The tool parses and decodes the ASAR header structure.
-2. It extracts `dist/preload.js` and appends a custom script wrapper.
-3. The injected script hooks `window.fetch` to catch `GetAuthStatus` queries.
-4. When a gRPC-web JSON response is caught, it sets `authResult.hasValidAuth = true` and wipes the eligibility failure payload.
-5. Finally, the tool recalculates file hashes, re-aligns structures, repacks the ASAR, and wipes the V8 cache directory.
+The Manager talks to a local Go backend, `language_server.exe` (over connect-rpc), and that backend is what issues the eligibility verdict. More importantly, when it marks the account as ineligible it never persists the OAuth token, forcing a fresh browser login on every launch.
+
+1. The tool scans the binary for a signature that is unique across the whole file, and refuses to run if it is missing or occurs more than once (a guard against unknown versions).
+2. The signature pinpoints the `hasValidAuth` check inside the login-validation routine — a `cmp byte ptr [rax+8], 0` immediately followed by the token being attached to the auth status.
+3. That check is overwritten with `mov byte ptr [rax+8], 1` + 2×`NOP` (6 bytes total; the `NOP`s neutralize the now-dead jump).
+4. As a result the account is always treated as valid: the token is attached, persisted to disk, and the cosmetic restriction screen no longer appears.
 </details>
 
 <details>
