@@ -42,7 +42,7 @@ Launches the complete terminal dashboard with live status reports for managing b
    ```
 2. **Launch agy-manager:**
    ```bash
-   python patch.py
+   python manager.py
    ```
 
 *(Supports arrow-key navigation, spacebar multi-selection, and Enter key confirmations).*
@@ -55,16 +55,16 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 
 | Command | Action |
 | :--- | :--- |
-| `python patch.py status` | Scan and display the patch status of all applications. |
-| `python patch.py patch` | Patch all detected applications. |
-| `python patch.py restore` | Revert all changes and restore original files. |
-| `python patch.py patch <cli\|manager\|ide>` | Patch only the specified applications. |
-| `python patch.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles (see details below). |
+| `python manager.py status` | Scan and display the patch status of all applications. |
+| `python manager.py patch` | Patch all detected applications. |
+| `python manager.py restore` | Revert all changes and restore original files. |
+| `python manager.py patch <cli\|manager\|ide>` | Patch only the specified applications. |
+| `python manager.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles (see details below). |
 
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
 > ```bash
-> python patch.py --path-cli "D:\CustomTools\agy.exe" patch cli
+> python manager.py --path-cli "D:\CustomTools\agy.exe" patch cli
 > ```
 
 ---
@@ -98,22 +98,22 @@ Sessions are isolated into two independent scopes:
 This separation avoids database locking conflicts and lets you switch accounts for different tools independently.
 
 ### Usage in the Interactive Menu:
-1. Choose **Manage accounts** in the main menu of `python patch.py`.
+1. Choose **Manage accounts** in the main menu of `python manager.py`.
 2. Select the target scope: **CLI + Manager** or **IDE**.
 3. Use the menu options to save the current session, switch to a saved profile, delete profiles, or log out locally.
 
 ### Usage via the Command Line:
-Command structure: `python patch.py accounts <cli-manager|ide> <action> [name]`
+Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]`
 
 | Action | Example Command | Description |
 | :--- | :--- | :--- |
-| `list` (or `ls`) | `python patch.py accounts cli-manager list` | List saved profiles for the chosen scope and mark the active one. |
-| `save <name>` | `python patch.py accounts cli-manager save work` | Save the current active session under the specified name. |
-| `use <name>` (or `switch`) | `python patch.py accounts cli-manager use personal` | Switch to a saved profile. |
-| `logout` | `python patch.py accounts cli-manager logout` | Sign out locally (allowing you to sign into another account). |
-| `rename <old> <new>` (or `mv`) | `python patch.py accounts cli-manager rename work personal` | Rename a saved profile. |
-| `rm <name>` | `python patch.py accounts cli-manager rm work` | Remove a saved profile. |
-| `current` (or `who`) | `python patch.py accounts cli-manager current` | Print the name of the current active profile. |
+| `list` (or `ls`) | `python manager.py accounts cli-manager list` | List saved profiles for the chosen scope and mark the active one. |
+| `save <name>` | `python manager.py accounts cli-manager save work` | Save the current active session under the specified name. |
+| `use <name>` (or `switch`) | `python manager.py accounts cli-manager use personal` | Switch to a saved profile. |
+| `logout` | `python manager.py accounts cli-manager logout` | Sign out locally (allowing you to sign into another account). |
+| `rename <old> <new>` (or `mv`) | `python manager.py accounts cli-manager rename work personal` | Rename a saved profile. |
+| `rm <name>` | `python manager.py accounts cli-manager rm work` | Remove a saved profile. |
+| `current` (or `who`) | `python manager.py accounts cli-manager current` | Print the name of the current active profile. |
 
 ---
 
@@ -163,7 +163,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 ## ⚠️ Caveats & Warnings
 
-- **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python patch.py patch` again.
+- **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
 - **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
 - **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
 - **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.

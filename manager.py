@@ -14,15 +14,15 @@ non-blocking eligibility screen from appearing. Every change is backed up
 (<file>.agybak) and reversible with `restore`. Pure standard library.
 
 Usage:
-    python patch.py status                 # show all three (default)
-    python patch.py patch                  # patch all detected apps
-    python patch.py restore                # restore all from backup
-    python patch.py patch ide manager      # only specific targets
-    python patch.py --path-cli "C:\\...\\agy.exe" patch cli
+    python manager.py status                 # show all three (default)
+    python manager.py patch                  # patch all detected apps
+    python manager.py restore                # restore all from backup
+    python manager.py patch ide manager      # only specific targets
+    python manager.py --path-cli "C:\\...\\agy.exe" patch cli
 
-    python patch.py accounts list          # saved logins (+ which is active)
-    python patch.py accounts save work     # snapshot the current login as "work"
-    python patch.py accounts use personal  # switch login in-place (no re-login)
+    python manager.py accounts list          # saved logins (+ which is active)
+    python manager.py accounts save work     # snapshot the current login as "work"
+    python manager.py accounts use personal  # switch login in-place (no re-login)
 """
 from __future__ import annotations
 import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, sys, time

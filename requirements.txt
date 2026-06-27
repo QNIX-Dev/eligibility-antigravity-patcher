@@ -1,4 +1,4 @@
-# Optional — only needed for the interactive menu (`python patch.py`).
+# Optional — only needed for the interactive menu (`python manager.py`).
 # The scriptable commands (status / patch / restore / accounts) work with the Python
 # standard library alone, no installs required.
 rich>=13
