@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-agy-manager — hide the cosmetic / non-blocking "not available in your location"
-eligibility gate in the three Antigravity apps on Windows:
+agy-manager — environment manager for Antigravity developer tools on Windows.
+Provides location restriction bypass (patching eligibility gates)
+and multi-account profile switching.
 
   * cli      Antigravity CLI         (agy.exe, Go binary)        -> suppress eligibility screen
   * manager  Antigravity (Manager)   (language_server.exe, Go)   -> force hasValidAuth=true
   * ide      Antigravity IDE         (VS Code fork, out/main.js)  -> force the internal-eligible branch
+  * accounts Multi-account manager                               -> save & switch logins in-place
 
-None of these unlock anything you can't already use — they only stop a local,
+None of the patches unlock anything you can't already use — they only stop a local,
 non-blocking eligibility screen from appearing. Every change is backed up
 (<file>.agybak) and reversible with `restore`. Pure standard library.
 
@@ -551,6 +553,18 @@ def acct_rm(target_type, name):
         ok(f"removed account '{name}'"); return 0
     warn(f"no saved account '{name}'"); return 1
 
+def acct_rename(target_type, old_name, new_name):
+    if "/" in new_name:
+        warn("new name can't contain '/'"); return 1
+    target = profile_load(target_type, old_name)
+    if target is None:
+        warn(f"no saved account '{old_name}'"); return 1
+    if profile_load(target_type, new_name) is not None:
+        warn(f"account '{new_name}' already exists"); return 1
+    profile_save(target_type, new_name, target)
+    _profile_delete(target_type, old_name)
+    ok(f"renamed account '{old_name}' to '{new_name}'"); return 0
+
 def acct_logout(target_type):
     """Clear the live login LOCALLY (no server-side revoke) so the app shows its login
     screen and you can sign into another account to capture it — without invalidating
@@ -582,12 +596,12 @@ def run_accounts(argv):
     if os.name != "nt":
         warn("account management is Windows-only"); return 2
     if not argv:
-        warn("usage: accounts <cli-manager|ide> <list|save|use|current|logout|rm> [name]"); return 1
+        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
     
     target_type = argv[0].lower()
     if target_type not in ("cli-manager", "ide"):
         warn(f"unknown account target '{target_type}' (choose: cli-manager | ide)")
-        warn("usage: accounts <cli-manager|ide> <list|save|use|current|logout|rm> [name]"); return 1
+        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
 
     sub = (argv[1] if len(argv) > 1 else "list").lower()
     arg = argv[2] if len(argv) > 2 else None
@@ -598,10 +612,14 @@ def run_accounts(argv):
         if sub == "save":                  return acct_save(target_type, arg) if arg else need()
         if sub in ("use", "switch"):       return acct_use(target_type, arg)  if arg else need()
         if sub in ("rm", "remove", "del"): return acct_rm(target_type, arg)   if arg else need()
+        if sub in ("rename", "mv"):
+            arg2 = argv[3] if len(argv) > 3 else None
+            need_rename = lambda: (warn(f"usage: accounts {target_type} {sub} <old_name> <new_name>"), 1)[1]
+            return acct_rename(target_type, arg, arg2) if (arg and arg2) else need_rename()
         if sub in ("logout", "signout", "clear"): return acct_logout(target_type)
     except Exception as e:
         warn(f"accounts error: {e}"); return 1
-    warn(f"unknown accounts subcommand '{sub}' (list | current | save | use | logout | rm)"); return 2
+    warn(f"unknown accounts subcommand '{sub}' (list | current | save | use | rename | logout | rm)"); return 2
 
 # -------------------------------------------------------------------- driver --
 SPEC = {
@@ -694,7 +712,7 @@ def _render(console, paths, status):
     for t in TARGETS:
         path, st = paths[t], status[t]
         acct = cur_cli_manager if t in ("cli", "manager") else cur_ide
-        acct_str = acct if acct else "[dim]—[/]"
+        acct_str = acct if acct else "[white dim]—[/]"
         tbl.add_row(SPEC[t]["name"], f"[{_STYLE[st]}]{_ICON[st]} {st}[/]", acct_str, path or "—")
         
     console.print(Panel(tbl, title="[bold white]agy-manager[/] · Antigravity environment manager",
@@ -725,6 +743,7 @@ def _accounts_submenu(console, qs, target_type):
         act = questionary.select("Accounts:", style=qs, qmark="»", choices=[
             questionary.Choice("Save current login as…", "save"),
             questionary.Choice("Switch to…", "use"),
+            questionary.Choice("Rename…", "rename"),
             questionary.Choice("Sign out locally", "logout"),
             questionary.Choice("Remove…", "rm"),
             questionary.Choice("Back", "back"),
@@ -742,6 +761,14 @@ def _accounts_submenu(console, qs, target_type):
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
                 name = questionary.select("Switch to:", style=qs, choices=choices).ask()
                 if name and name != "back": acct_use(target_type, name)
+        elif act == "rename":
+            if not names: console.print("[yellow]Nothing saved yet.[/]")
+            else:
+                choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
+                old_name = questionary.select("Select account to rename:", style=qs, choices=choices).ask()
+                if old_name and old_name != "back":
+                    new_name = questionary.text(f"New name for '{old_name}':", style=qs).ask()
+                    if new_name and new_name.strip(): acct_rename(target_type, old_name, new_name.strip())
         elif act == "rm":
             if not names: console.print("[yellow]Nothing to remove.[/]")
             else:
@@ -813,11 +840,11 @@ def interactive(overrides):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Hide the Antigravity eligibility gate (CLI / Manager / IDE). "
+        description="Manage the Antigravity environment (patch location gates and manage profiles). "
                     "Run with no arguments for the interactive menu.")
     ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts"), nargs="?",
                     help="menu (default) | status | patch | restore | "
-                         "accounts <cli-manager|ide> <list|save|use|current|logout|rm> [name]")
+                         "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]")
     ap.add_argument("targets", nargs="*", default=[], metavar="{cli,manager,ide}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")

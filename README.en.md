@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, powerful environment manager for Antigravity developer tools on Windows (multi-account profile switching and location restriction bypass)</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools on Windows (location restriction bypass and multi-account profile switching)</b>
 </p>
 
 <p align="center">
@@ -16,62 +16,50 @@
 
 ---
 
-> [!NOTE]
-> These gates are local client-side restrictions. Once bypassed, the backend models and features function normally. This tool **does not** unlock paid features or bypass server-side authentication; it simply disables the local location blocker.
-
----
-
 ## ✨ Features
 
-- 👥 **Account Profile Manager:** Save, switch, and manage multiple authorization profiles (independently for CLI/Manager and IDE) without browser re-authentication or server-side token revocation.
-- 🔓 **Location Restriction Bypass:** Disable cosmetic location gates ("not available in your location") across all three applications (CLI, Manager, IDE).
-- 🎨 **Interactive TUI Dashboard:** Features a beautiful console dashboard built with `rich` and `questionary` for patches and accounts management.
-- ⚡ **Zero-Dependency Core:** Scriptable commands (`status`, `patch`, `restore`) run natively using Python's standard library.
-- 🛡️ **Safe & Reversible:** Automatically creates file backups (`*.agybak`) before any modification, allowing one-click rollback.
-- ⚙️ **Autodetect & Discover:** Searches registry keys, system PATH, environment variables, and Scoop directories to locate installations dynamically.
-- 🧬 **Version-Robust Patching:** Locates code signatures (using regex and relative instruction offsets) rather than relying on static file offsets.
+`agy-manager` combines two essential tools for a seamless development experience in the Antigravity ecosystem:
 
----
-
-## 📱 Supported Targets
-
-| Target | Application | Patch Vector | Detection Marker |
-| :---: | :--- | :--- | :--- |
-| **`cli`** | **Antigravity CLI** (`agy.exe`) | Binary-patches `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy.exe` (in path or scoop directories) |
-| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources\bin\language_server.exe` |
-| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force `isGoogleInternal` auth branch to `true`. | `resources\app\out\main.js` |
+- 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all three core applications (CLI, Manager, IDE).
+- 👥 **Account Profile Manager:** Safely store and quickly switch between multiple authorization profiles offline, without the need for browser-based re-authentication.
+- 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
+- ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
+- 🛡️ **Safe & Reversible:** Automatically creates file backups (`*.agybak`) before any modification for a quick, one-click rollback.
+- ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, and Scoop paths to automatically locate installations.
+- 🧬 **Version-Robust Patching:** Locates instruction signatures using regex patterns rather than relying on brittle, static file offsets.
 
 ---
 
 ## 🚀 Quick Start
 
-### Option A: Interactive Dashboard (Recommended)
+### Option A: Interactive TUI (Recommended)
 
-To launch the interactive CLI menu with status summaries:
+Launches the complete terminal dashboard with live status reports for managing both patches and profiles:
 
-1. **Install requirements:**
+1. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
-2. **Launch the patcher:**
+2. **Launch agy-manager:**
    ```bash
    python patch.py
    ```
 
-*(Provides arrow-key navigation, spacebar multi-selection, and live status reports).*
+*(Supports arrow-key navigation, spacebar multi-selection, and Enter key confirmations).*
 
 ---
 
-### Option B: Scriptable Command Line (No Dependencies)
+### Option B: Scriptable CLI (No Dependencies)
 
-Runs purely on the Python Standard Library (no `pip install` required).
+Runs purely on the Python Standard Library (no installation required). Ideal for automation or direct execution from standard terminals.
 
 | Command | Action |
 | :--- | :--- |
-| `python patch.py status` | Scan and display the status of all applications. |
-| `python patch.py patch` | Patch all detected applications (creates backups automatically). |
+| `python patch.py status` | Scan and display the patch status of all applications. |
+| `python patch.py patch` | Patch all detected applications. |
 | `python patch.py restore` | Revert all changes and restore original files. |
-| `python patch.py patch ide` | Only patch specified apps (e.g. `ide`, `manager`, or `cli`). |
+| `python patch.py patch <cli\|manager\|ide>` | Patch only the specified applications. |
+| `python patch.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles (see details below). |
 
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
@@ -81,90 +69,104 @@ Runs purely on the Python Standard Library (no `pip install` required).
 
 ---
 
-## 👥 Account Manager (Multi-Account Support)
+## 🔓 Location Restriction Bypass
 
-The tool allows saving and switching Antigravity authorization profiles without logging in again through the browser. Management is split into two independent areas:
-1. **CLI + Manager** (share a common token in Windows Credential Manager).
-2. **IDE** (uses its own authorization keys in the `state.vscdb` database).
+The tool modifies local eligibility gates, allowing the client applications to run in restricted regions.
 
-This allows you to switch profiles for different applications independently and avoid file locking conflicts. Profiles are safely stored in Windows Credential Manager.
+> [!NOTE]
+> These gates are purely client-side cosmetic restrictions. Once bypassed, all backend models and tools function normally. This utility **does not** bypass server-side authentication or unlock paid features; it simply disables the local restriction screens.
+
+### Supported Targets
+
+| Target | Application | Patch Vector | Detection Marker |
+| :---: | :--- | :--- | :--- |
+| **`cli`** | **Antigravity CLI** (`agy.exe`) | Binary-patches `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy.exe` |
+| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources\bin\language_server.exe` |
+| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force the `isGoogleInternal` auth branch to `true`. | `resources\app\out\main.js` |
+
+---
+
+## 👥 Account Profile Manager
+
+Saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser.
+
+### Management Scopes
+Sessions are isolated into two independent scopes:
+1. **CLI + Manager** (share a common credential stored in Windows Credential Manager).
+2. **IDE** (uses its own authorization keys in the SQLite database `state.vscdb` inside VS Code).
+
+This separation avoids database locking conflicts and lets you switch accounts for different tools independently.
 
 ### Usage in the Interactive Menu:
-1. Run `python patch.py`
-2. Select **Manage accounts**
-3. Select the target area to manage: **CLI + Manager** or **IDE**
-4. You will have options to save, switch, remove profiles, or log out locally.
+1. Choose **Manage accounts** in the main menu of `python patch.py`.
+2. Select the target scope: **CLI + Manager** or **IDE**.
+3. Use the menu options to save the current session, switch to a saved profile, delete profiles, or log out locally.
 
 ### Usage via the Command Line:
-Commands follow the pattern: `python patch.py accounts <cli-manager|ide> <action> [name]`
+Command structure: `python patch.py accounts <cli-manager|ide> <action> [name]`
 
 | Action | Example Command | Description |
 | :--- | :--- | :--- |
-| `list` (or `ls`) | `python patch.py accounts cli-manager list` | List saved profiles for the chosen area and mark the active one. |
+| `list` (or `ls`) | `python patch.py accounts cli-manager list` | List saved profiles for the chosen scope and mark the active one. |
 | `save <name>` | `python patch.py accounts cli-manager save work` | Save the current active session under the specified name. |
 | `use <name>` (or `switch`) | `python patch.py accounts cli-manager use personal` | Switch to a saved profile. |
-| `logout` | `python patch.py accounts cli-manager logout` | Sign out locally (to sign into another account). |
+| `logout` | `python patch.py accounts cli-manager logout` | Sign out locally (allowing you to sign into another account). |
+| `rename <old> <new>` (or `mv`) | `python patch.py accounts cli-manager rename work personal` | Rename a saved profile. |
 | `rm <name>` | `python patch.py accounts cli-manager rm work` | Remove a saved profile. |
 | `current` (or `who`) | `python patch.py accounts cli-manager current` | Print the name of the current active profile. |
-
-> [!IMPORTANT]
-> Before switching profiles or signing out locally, make sure to close any running applications for the corresponding area (CLI/Manager or IDE) to avoid database and token file locking errors in memory.
 
 ---
 
 ## 🔍 How it Works (Technical Details)
 
 <details>
-<summary>🛠️ <b>CLI (`agy.exe` Go binary patch)</b></summary>
+<summary>🛠️ <b>CLI Patch (`agy.exe` Go Binary)</b></summary>
 
-The CLI prints a cosmetic "Eligibility Check" section at startup. The decision to show it is made in `handleAuthResult`, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned **by the server**.
+At startup, the CLI renders an "Eligibility Check" section. The check resides in the `handleAuthResult` routine, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned by the server.
 
-1. The patcher scans the binary for a gate signature that is unique across the whole file, and refuses to run if it is missing or occurs more than once (a guard against unknown versions).
-2. The signature pinpoints the check: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible). When `hasValidAuth` is zero, execution falls through and prints "Eligibility check failed".
-3. The `cmp byte ptr [rax+8], 0` is rewritten to `test rax,rax` (+`NOP`). Since `rax` is known non-null here, the `jne` always takes the eligible branch.
-4. As a result the restriction section never renders, regardless of the server response.
+1. The patcher scans the binary for the unique gate instruction signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible).
+2. If `hasValidAuth` is zero, execution falls through and prints the location error.
+3. The patch rewrites the `cmp byte ptr [rax+8], 0` check to `test rax,rax` (+`NOP`). Since `rax` is always non-null here, the `jne` jump is always taken, resolving the check to "eligible".
 </details>
 
 <details>
-<summary>📦 <b>Manager (`language_server.exe` Go Backend Patch)</b></summary>
+<summary>📦 <b>Manager Patch (`language_server.exe` Go Backend)</b></summary>
 
-The Manager talks to a local Go backend, `language_server.exe` (over connect-rpc), and that backend is what issues the eligibility verdict. More importantly, when it marks the account as ineligible it never persists the OAuth token, forcing a fresh browser login on every launch.
+The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc.
 
-1. The tool scans the binary for a signature that is unique across the whole file, and refuses to run if it is missing or occurs more than once (a guard against unknown versions).
-2. The signature pinpoints the `hasValidAuth` check inside the login-validation routine — a `cmp byte ptr [rax+8], 0` immediately followed by the token being attached to the auth status.
-3. That check is overwritten with `mov byte ptr [rax+8], 1` + 2×`NOP` (6 bytes total; the `NOP`s neutralize the now-dead jump).
-4. As a result the account is always treated as valid: the token is attached, persisted to disk, and the cosmetic restriction screen no longer appears.
+1. The tool searches for the `hasValidAuth` check inside the login validation routine: a `cmp byte ptr [rax+8], 0` instruction followed by the token binding block.
+2. The check is overwritten with `mov byte ptr [rax+8], 1` + 2×`NOP`.
+3. In effect, the account is always treated as valid: the token is bound and saved, and the error screen is bypassed.
 </details>
 
 <details>
-<summary>💻 <b>IDE (`main.js` VS Code Hack)</b></summary>
+<summary>💻 <b>IDE Patch (`main.js` VS Code Hack)</b></summary>
 
-The IDE is built on top of VS Code:
-1. It scans `resources/app/out/main.js` using regular expressions.
-2. Identifies the minified auth evaluator pattern:
-   `resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal`
+1. The script parses the minified entrypoint `resources/app/out/main.js` using regular expressions.
+2. It looks for the minified auth branch pattern: `resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal`.
 3. Replaces it with `resetIsTierGCPTos(),true` to force Google internal developer privileges.
-4. Wipes the system's VS Code compiled bytecode caches (`CachedData` and `Code Cache/js`) to ensure modifications apply instantly.
+4. Clears VS Code's system bytecode caches (`CachedData` and `Code Cache/js`) to apply modifications instantly.
 </details>
 
 <details>
-<summary>👥 <b>Account Manager (Session and Profile Control)</b></summary>
+<summary>👥 <b>Account Profile Manager (Offline Session Swapping)</b></summary>
 
-The account switching mechanism works entirely offline without invoking logout APIs, preventing server-side token revocation (the app's built-in logout button invalidates the refresh token on the server).
+Profile switching is fully offline and does not call standard logout endpoints (which would revoke tokens on the server).
 
-1. **Storage Separation:** CLI and Manager tokens reside in Windows Credential Manager as `gemini:antigravity`. IDE tokens are stored in the VS Code SQLite global state database `state.vscdb` under `antigravityUnifiedStateSync.*` keys.
-2. **Secure Persistence:** When saving a profile (`save`), the script reads the active tokens, formats them, and saves them back into the Credential Manager under a secure name prefixed with `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
-3. **Blob Size Limit Bypass:** Windows Credential Manager caps generic credential blobs at ~2560 bytes, but the IDE's JSON data (specifically `userStatus`) easily exceeds 8 KB. To circumvent this, the profile payload is automatically split into 2000-byte shards and stored as sequential entries (`.../<index>`).
-4. **Syncing and Lock Prevention:** Before switching profiles (`use`), the manager verifies that target applications are closed. If they are running, the switch is blocked to prevent the app from overwriting the restored keys from its in-memory cache. Before writing the new profile, the active session is automatically synced to preserve any rotated tokens.
+1. **Storage Separation:** CLI/Manager tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
+2. **Secure Persistence:** On `save`, active credentials are read, encoded, and saved back to Windows Credential Manager under unique prefixed names: `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
+3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
+4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.
 </details>
 
 ---
 
 ## ⚠️ Caveats & Warnings
 
-- **Updates Overwrite Patches:** Since target files are modified locally, updating any of the apps will overwrite the patches. Just run `python patch.py patch` again to re-apply.
-- **File Locks:** Make sure the corresponding application is completely closed before running the patcher; otherwise, file handles will be locked and patching will fail.
-- **Terms of Service:** Modifying proprietary client code may violate the applications' Terms of Service. This is an educational showcase of client-side patch execution—use it responsibly.
+- **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python patch.py patch` again.
+- **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
+- **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
+- **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.
 
 ---
 
