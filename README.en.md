@@ -163,6 +163,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 ## ⚠️ Caveats & Warnings
 
+- **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
 - **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
 - **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
 - **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
