@@ -41,6 +41,12 @@ def ok(m):   _say("ok", m)
 def info(m): _say("..", m)
 def warn(m): _say("!!", m)
 
+def _bin(name):
+    """Platform executable name: 'language_server' on Linux/mac, 'language_server.exe'
+    on Windows. The Go binaries are byte-identical across OSes (same source, same
+    linux/windows-amd64 codegen), so only the on-disk name and search roots differ."""
+    return name + (".exe" if os.name == "nt" else "")
+
 def is_locked(path):
     try:
         with open(path, "r+b"):
@@ -224,8 +230,30 @@ MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
                     rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
                     b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
 
+# Linux/mac install prefixes for the Manager only (Windows discovery stays in _roots()).
+# The release tarball unpacks to <root>/*ntigravity*/, matched the same way as find_marker.
+def _manager_linux_roots():
+    home = os.path.expanduser("~")
+    roots = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share", "/usr/local/lib",
+             "/Applications",                              # macOS
+             os.path.join(home, ".local", "share"),
+             os.path.join(home, "Applications"),           # macOS (per-user)
+             os.path.join(home, "Downloads"), home]
+    w = shutil.which("antigravity")                        # launcher on PATH -> its install dir
+    if w: roots.append(os.path.dirname(os.path.realpath(w)))
+    return roots
+
 def manager_default_bins():
-    return find_marker(os.path.join("resources", "bin", "language_server.exe"))
+    rel = os.path.join("resources", "bin", _bin("language_server"))
+    if os.name == "nt":
+        return find_marker(rel)                            # Windows: shared registry/env discovery
+    hits = []                                              # Linux/mac: Manager-only search
+    for root in _manager_linux_roots():
+        hits += glob.glob(os.path.join(root, "*ntigravity*", rel))
+        hits += glob.glob(os.path.join(root, "*ntigravity*", "*", rel))
+        direct = os.path.join(root, rel)
+        if os.path.isfile(direct): hits.append(direct)
+    return _dedup_newest(hits)
 
 # --------------------------------------------------------------------- IDE ----
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
@@ -633,7 +661,7 @@ SPEC = {
     "cli":     dict(name="Antigravity CLI",      find=cli_default_paths,     status=functools.partial(gate_status, gate=CLI_GATE),
                     patch=functools.partial(gate_patch, gate=CLI_GATE, app="CLI", fname="agy.exe")),
     "manager": dict(name="Antigravity Manager",  find=manager_default_bins,  status=functools.partial(gate_status, gate=MANAGER_GATE),
-                    patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname="language_server.exe")),
+                    patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname=_bin("language_server"))),
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
 }
 

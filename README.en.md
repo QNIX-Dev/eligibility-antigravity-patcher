@@ -137,6 +137,8 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 1. The tool searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
 2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
 3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
+
+> **Linux / macOS.** The `manager` patch is cross-platform. The Go backend is built from a single source, so the machine code is identical on `linux/amd64` and `windows/amd64` — the same signature and the same byte replacement apply to the ELF binary `resources/bin/language_server` (no `.exe`). Outside Windows, `manager` autodetection scans the common install prefixes (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `/Applications`, and the directory of an `antigravity` launcher on `PATH`); for a non-standard location, pass the path manually via `--path-manager`. Close the app before patching (otherwise the OS returns `ETXTBSY`). The `cli` and `ide` patches, along with account management (`accounts`), remain Windows-only for now.
 </details>
 
 <details>
