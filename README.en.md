@@ -16,7 +16,19 @@
 
 ---
 
-## ✨ Features
+## 📌 Table of Contents
+
+- [✨ Features](#features)
+- [🚀 Quick Start](#quick-start)
+- [🔓 Location Restriction Bypass](#bypass)
+- [👥 Account Profile Manager](#accounts)
+- [🔍 How it Works (Technical Details)](#details)
+- [⚠️ Caveats & Warnings](#warnings)
+- [📄 License](#license)
+
+---
+
+## <a id="features"></a>✨ Features
 
 `agy-manager` combines two essential tools for a seamless development experience in the Antigravity ecosystem:
 
@@ -30,7 +42,7 @@
 
 ---
 
-## 🚀 Quick Start
+## <a id="quick-start"></a>🚀 Quick Start
 
 ### Option A: Interactive TUI (Recommended)
 
@@ -69,7 +81,7 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 
 ---
 
-## 🔓 Location Restriction Bypass
+## <a id="bypass"></a>🔓 Location Restriction Bypass
 
 The tool modifies local eligibility gates, allowing the client applications to run in restricted regions.
 
@@ -86,7 +98,7 @@ The tool modifies local eligibility gates, allowing the client applications to r
 
 ---
 
-## 👥 Account Profile Manager
+## <a id="accounts"></a>👥 Account Profile Manager
 
 Saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser.
 
@@ -117,7 +129,7 @@ Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]
 
 ---
 
-## 🔍 How it Works (Technical Details)
+## <a id="details"></a>🔍 How it Works (Technical Details)
 
 <details>
 <summary>🛠️ <b>CLI Patch (`agy.exe` Go Binary)</b></summary>
@@ -163,7 +175,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 ---
 
-## ⚠️ Caveats & Warnings
+## <a id="warnings"></a>⚠️ Caveats & Warnings
 
 - **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
 - **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
@@ -173,6 +185,6 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 ---
 
-## 📄 License
+## <a id="license"></a>📄 License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for details.
