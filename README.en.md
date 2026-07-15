@@ -132,11 +132,11 @@ At startup, the CLI renders an "Eligibility Check" section. The check resides in
 <details>
 <summary>📦 <b>Manager Patch (`language_server.exe` Go Backend)</b></summary>
 
-The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc.
+The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
 
-1. The tool searches for the `hasValidAuth` check inside the login validation routine: a `cmp byte ptr [rax+8], 0` instruction followed by the token binding block.
-2. The check is overwritten with `mov byte ptr [rax+8], 1` + 2×`NOP`.
-3. In effect, the account is always treated as valid: the token is bound and saved, and the error screen is bypassed.
+1. The tool searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
+2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
+3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
 </details>
 
 <details>

@@ -208,13 +208,20 @@ def cli_default_paths():
     return _dedup_newest(cands)
 
 # --------------------------------------------------- Manager (auth gate) ------
-# language_server.exe (Go) gates the account on validateLogin's hasValidAuth (byte at
-# result+8) and won't persist the OAuth token while it's false; the validator attaches
-# the token right after via stores into result+0x40 (temp register wildcarded for
-# recompiles). Forcing the byte true covers every login flow (incl. account switch).
-# cmp byte[rax+8],0 ; je ; mov rT,[rsp+d] ; mov [rax+0x40],rT  ->  mov byte[rax+8],1;nop;nop
-MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89[\x40\x48\x50\x58\x60\x68\x70\x78]\x40",
-                    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89[\x40\x48\x50\x58\x60\x68\x70\x78]\x40",
+# language_server.exe (Go) decides the account's hasValidAuth (proto3 bool = byte at
+# AuthResult+8) in authclient.(*PersonalAuthValidator).Validate — the single root
+# authority. It calls ValidateAndOnboardAccount, then gates on the verdict:
+#   cmp byte[rax+8],0 ; je skip ; mov r,[rsp+d] ; mov [rax+0x60],r   (attach the token)
+# This is the AuthResult GetAuthStatus returns, so it governs EVERY path: cold restart /
+# token-restore, AND the first interactive login ((*AuthClient).Login calls this
+# validator and, on the no-error path, gates on this exact result object — so forcing the
+# byte here also satisfies Login's later check; no separate Login patch needed).
+# Fix: rewrite the compare to `mov byte[rax+8],1` and NOP the `je`, forcing the byte true
+# AND always falling through to the token-attach branch. (Store offset moved +0x40 ->
+# +0x60 vs older builds; displacements wildcarded via re.S to survive recompiles.)
+# cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2
+MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
+                    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
                     b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
 
 def manager_default_bins():
