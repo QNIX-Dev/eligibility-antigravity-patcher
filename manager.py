@@ -156,6 +156,33 @@ def find_marker(rel):
         if os.path.isfile(direct): hits.append(direct)
     return _dedup_newest(hits)
 
+# Linux/mac discovery (Windows keeps _roots()/find_marker). Release tarballs unpack to
+# <root>/*ntigravity*/ under a handful of standard prefixes; a launcher on PATH also
+# contributes its own install dir. Apps are matched by the same structural marker
+# rel-path as on Windows — never a hard-coded path or version.
+def _posix_install_roots(*launchers):
+    home = os.path.expanduser("~")
+    roots = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share", "/usr/local/lib",
+             "/Applications",                              # macOS
+             os.path.join(home, ".local", "share"),
+             os.path.join(home, "Applications"),           # macOS (per-user)
+             os.path.join(home, "Downloads"), home]
+    for launcher in launchers:
+        w = shutil.which(launcher)
+        if w: roots.append(os.path.dirname(os.path.realpath(w)))
+    return roots
+
+def _posix_find(rel, *launchers):
+    """POSIX analogue of find_marker: <root>/*ntigravity*/<rel> (and one level deeper),
+    plus rel directly under a launcher's install dir."""
+    hits = []
+    for root in _posix_install_roots(*launchers):
+        hits += glob.glob(os.path.join(root, "*ntigravity*", rel))
+        hits += glob.glob(os.path.join(root, "*ntigravity*", "*", rel))
+        direct = os.path.join(root, rel)
+        if os.path.isfile(direct): hits.append(direct)
+    return _dedup_newest(hits)
+
 # ---------------------------------------------------- byte-signature gate -----
 # CLI and Manager each fix ONE machine-code site found by a binary-unique signature,
 # overwriting a few bytes in place. The machinery is shared; only the signatures,
@@ -205,12 +232,18 @@ CLI_GATE = Gate(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
 def cli_default_paths():
     cands = []
     w = shutil.which("agy")
-    if w:                                    # which() appends PATHEXT's upper-case .EXE; normalize for display + dedup
+    if w:                                    # PATH hit (Windows which() appends PATHEXT's .EXE — normalize case)
         base, ext = os.path.splitext(w); cands.append(base + ext.lower())
-    for root in _roots():
-        cands += glob.glob(os.path.join(root, "agy", "bin", "agy.exe"))
-        cands += glob.glob(os.path.join(root, "agy", "*", "bin", "agy.exe"))   # scoop version dirs
-        cands += glob.glob(os.path.join(root, "agy*", "agy.exe"))
+    if os.name == "nt":
+        for root in _roots():
+            cands += glob.glob(os.path.join(root, "agy", "bin", "agy.exe"))
+            cands += glob.glob(os.path.join(root, "agy", "*", "bin", "agy.exe"))   # scoop version dirs
+            cands += glob.glob(os.path.join(root, "agy*", "agy.exe"))
+    else:                                    # Linux/mac: install.sh drops a flat `agy` into ~/.local/bin
+        home = os.path.expanduser("~")      # (default), or a custom --dir on PATH (caught by which() above)
+        cands += [os.path.join(d, "agy") for d in
+                  (os.path.join(home, ".local", "bin"), os.path.join(home, "bin"),
+                   "/usr/local/bin", "/usr/bin", "/opt/homebrew/bin")]
     return _dedup_newest(cands)
 
 # --------------------------------------------------- Manager (auth gate) ------
@@ -230,37 +263,21 @@ MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
                     rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
                     b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
 
-# Linux/mac install prefixes for the Manager only (Windows discovery stays in _roots()).
-# The release tarball unpacks to <root>/*ntigravity*/, matched the same way as find_marker.
-def _manager_linux_roots():
-    home = os.path.expanduser("~")
-    roots = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share", "/usr/local/lib",
-             "/Applications",                              # macOS
-             os.path.join(home, ".local", "share"),
-             os.path.join(home, "Applications"),           # macOS (per-user)
-             os.path.join(home, "Downloads"), home]
-    w = shutil.which("antigravity")                        # launcher on PATH -> its install dir
-    if w: roots.append(os.path.dirname(os.path.realpath(w)))
-    return roots
-
 def manager_default_bins():
     rel = os.path.join("resources", "bin", _bin("language_server"))
     if os.name == "nt":
         return find_marker(rel)                            # Windows: shared registry/env discovery
-    hits = []                                              # Linux/mac: Manager-only search
-    for root in _manager_linux_roots():
-        hits += glob.glob(os.path.join(root, "*ntigravity*", rel))
-        hits += glob.glob(os.path.join(root, "*ntigravity*", "*", rel))
-        direct = os.path.join(root, rel)
-        if os.path.isfile(direct): hits.append(direct)
-    return _dedup_newest(hits)
+    return _posix_find(rel, "antigravity")                 # Linux/mac: launcher `antigravity`
 
 # --------------------------------------------------------------------- IDE ----
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
 IDE_DONE = b"resetIsTierGCPTos(),true"
 
 def ide_default_mains():
-    return find_marker(os.path.join("resources", "app", "out", "main.js"))
+    rel = os.path.join("resources", "app", "out", "main.js")
+    if os.name == "nt":
+        return find_marker(rel)                            # Windows: shared registry/env discovery
+    return _posix_find(rel, "antigravity-ide", "antigravity")   # Linux/mac: VS Code-fork launcher
 
 def ide_status(path):
     with mapped(path) as d:
@@ -269,10 +286,21 @@ def ide_status(path):
         return ("unpatched" if gate else "unknown", None)
 
 def _ide_cache_dirs():
+    """VS Code CachedData / Code Cache dirs to drop after patching main.js, so the IDE
+    recompiles the patched bytes instead of replaying a stale compile cache. The user-data
+    folder is the product nameLong ('Antigravity IDE') under each OS's app-data root."""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        bases = [os.path.expandvars(p) for p in
+                 (r"%USERPROFILE%\scoop\persist\antigravity-ide\data\user-data",
+                  r"%APPDATA%\Antigravity IDE")]
+    elif sys.platform == "darwin":
+        bases = [os.path.join(home, "Library", "Application Support", "Antigravity IDE")]
+    else:                                                  # Linux (respect XDG_CONFIG_HOME)
+        cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        bases = [os.path.join(cfg, "Antigravity IDE")]
     dirs = []
-    for p in (r"%USERPROFILE%\scoop\persist\antigravity-ide\data\user-data",
-              r"%APPDATA%\Antigravity IDE"):
-        base = os.path.expandvars(p)
+    for base in bases:
         dirs += [os.path.join(base, "CachedData"),
                  os.path.join(base, "Code Cache", "js")]
     return dirs
@@ -659,7 +687,7 @@ def run_accounts(argv):
 # -------------------------------------------------------------------- driver --
 SPEC = {
     "cli":     dict(name="Antigravity CLI",      find=cli_default_paths,     status=functools.partial(gate_status, gate=CLI_GATE),
-                    patch=functools.partial(gate_patch, gate=CLI_GATE, app="CLI", fname="agy.exe")),
+                    patch=functools.partial(gate_patch, gate=CLI_GATE, app="CLI", fname=_bin("agy"))),
     "manager": dict(name="Antigravity Manager",  find=manager_default_bins,  status=functools.partial(gate_status, gate=MANAGER_GATE),
                     patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname=_bin("language_server"))),
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
