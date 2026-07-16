@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>Легковесный и мощный менеджер окружения Antigravity на Windows (обход региональных ограничений и управление несколькими аккаунтами)</b>
+  <b>Легковесный и мощный менеджер окружения Antigravity (обход региональных ограничений на Windows и Linux, управление несколькими аккаунтами на Windows)</b>
 </p>
 
 <p align="center">
@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="https://microsoft.com/windows"><img src="https://img.shields.io/badge/OS-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="OS - Windows"></a>
+  <a href="https://www.linux.org"><img src="https://img.shields.io/badge/OS-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="OS - Linux"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python - 3.8+"></a>
   <a href="https://github.com/QNIX-Dev/eligibility-antigravity-patcher"><img src="https://img.shields.io/badge/Core_Deps-None-brightgreen?style=flat-square" alt="Core Dependencies - None"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License - MIT"></a>
@@ -37,7 +38,7 @@
 - 🎨 **Интерактивный TUI:** Удобное консольное меню для управления патчами и аккаунтами на базе библиотек `rich` и `questionary`.
 - ⚡ **Ядро без зависимостей:** Все основные консольные команды работают на стандартной библиотеке Python без необходимости установки сторонних пакетов.
 - 🛡️ **Безопасность и откат:** Автоматическое резервное копирование (`*.agybak`) файлов перед модификацией для безопасного отката изменений в один клик.
-- ⚙️ **Умный автопоиск:** Автоматическое сканирование реестра Windows, системного PATH, переменных окружения и путей Scoop для динамического обнаружения установленных приложений.
+- ⚙️ **Умный автопоиск:** Автоматическое сканирование реестра Windows, системного PATH, переменных окружения и путей Scoop, а также стандартных путей установки в Linux (`/opt`, `~/.local/share` и др.) для динамического обнаружения установленных приложений.
 - 🧬 **Устойчивость к обновлениям:** Поиск уникальных сигнатур и инструкций через регулярные выражения вместо привязки к статическим файловым смещениям.
 
 ---
@@ -92,9 +93,12 @@
 
 | Идентификатор | Приложение | Метод патчинга | Маркер поиска |
 | :---: | :--- | :--- | :--- |
-| **`cli`** | **Antigravity CLI** (`agy.exe`) | Бинарный патч `agy.exe`, нейтрализующий проверку гейта `hasValidAuth`. | `agy.exe` |
-| **`manager`** | **Antigravity Manager** (Electron) | Бинарный патч Go-бэкенда `language_server.exe` для принудительной установки флага `hasValidAuth` в `true`. | `resources\bin\language_server.exe` |
-| **`ide`** | **Antigravity IDE** (VS Code) | Патч минифицированного скрипта запуска VS Code для принудительного включения флага `isGoogleInternal`. | `resources\app\out\main.js` |
+| **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Бинарный патч `agy` / `agy.exe`, нейтрализующий проверку гейта `hasValidAuth`. | `agy` / `agy.exe` |
+| **`manager`** | **Antigravity Manager** (Electron) | Бинарный патч Go-бэкенда `language_server` / `language_server.exe` для принудительной установки флага `hasValidAuth` в `true`. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
+| **`ide`** | **`Antigravity IDE`** (VS Code) | Патч минифицированного скрипта запуска VS Code для принудительного включения флага `isGoogleInternal`. | `resources/app/out/main.js` |
+
+> [!NOTE]
+> **Поддержка платформ:** Все три патча (`cli`, `manager`, `ide`) являются кросс-платформенными и поддерживают Windows и Linux. В Linux автопоиск сканирует стандартные префиксы установки (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, каталог лаунчера `antigravity` и `antigravity-ide` из `PATH`). Для нестандартных путей укажите их вручную с помощью флагов командной строки (например, `--path-cli`). Перед патчем закройте приложения, чтобы избежать блокировок файлов. Управление аккаунтами (`accounts`) на данный момент поддерживается только в Windows.
 
 ---
 
@@ -149,8 +153,6 @@ CLI выводит при запуске косметическую секцию
 1. Патчер ищет в валидаторе сигнатуру проверки: `cmp byte ptr [rax+8], 0` → `je` (уводит выполнение в обход привязки токена).
 2. Проверка вместе с переходом перезаписывается на `mov byte ptr [rax+8], 1` + `NOP`: флаг принудительно выставляется в `true`, а нейтрализованный `je` гарантирует, что выполнение всегда идёт в ветку привязки и сохранения токена.
 3. Именно результат этого валидатора возвращает `GetAuthStatus` и на него же опирается функция логина, поэтому одного патча достаточно для всех сценариев — и первого входа, и последующих перезапусков. Токен сохраняется на диске, а экран ошибки не отображается.
-
-> **Linux / macOS.** Патч `manager` кросс-платформенный. Go-бэкенд собран из одного исходника, поэтому машинный код на `linux/amd64` и `windows/amd64` идентичен — та же сигнатура и та же замена байтов применяются к ELF-бинарнику `resources/bin/language_server` (без `.exe`). Автопоиск для `manager` вне Windows сканирует стандартные префиксы установки (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `/Applications`, каталог лаунчера `antigravity` из `PATH`); для нестандартного расположения укажите путь вручную через `--path-manager`. Перед патчем закройте приложение (иначе ОС вернёт `ETXTBSY`). Патчи `cli` и `ide`, а также управление аккаунтами (`accounts`) пока остаются только для Windows.
 </details>
 
 <details>

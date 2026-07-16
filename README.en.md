@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, powerful environment manager for Antigravity developer tools on Windows (location restriction bypass and multi-account profile switching)</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows & Linux, multi-account profile switching on Windows)</b>
 </p>
 
 <p align="center">
@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="https://microsoft.com/windows"><img src="https://img.shields.io/badge/OS-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="OS - Windows"></a>
+  <a href="https://www.linux.org"><img src="https://img.shields.io/badge/OS-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="OS - Linux"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python - 3.8+"></a>
   <a href="https://github.com/QNIX-Dev/eligibility-antigravity-patcher"><img src="https://img.shields.io/badge/Core_Deps-None-brightgreen?style=flat-square" alt="Core Dependencies - None"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License - MIT"></a>
@@ -37,7 +38,7 @@
 - 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
 - ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
 - 🛡️ **Safe & Reversible:** Automatically creates file backups (`*.agybak`) before any modification for a quick, one-click rollback.
-- ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, and Scoop paths to automatically locate installations.
+- ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, Scoop paths, and standard Linux installation paths (such as `/opt`, `~/.local/share`, etc.) to automatically locate installations.
 - 🧬 **Version-Robust Patching:** Locates instruction signatures using regex patterns rather than relying on brittle, static file offsets.
 
 ---
@@ -92,9 +93,12 @@ The tool modifies local eligibility gates, allowing the client applications to r
 
 | Target | Application | Patch Vector | Detection Marker |
 | :---: | :--- | :--- | :--- |
-| **`cli`** | **Antigravity CLI** (`agy.exe`) | Binary-patches `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy.exe` |
-| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources\bin\language_server.exe` |
-| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force the `isGoogleInternal` auth branch to `true`. | `resources\app\out\main.js` |
+| **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Binary-patches `agy` / `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy` / `agy.exe` |
+| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server` / `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
+| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force the `isGoogleInternal` auth branch to `true`. | `resources/app/out/main.js` |
+
+> [!NOTE]
+> **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform and support both Windows and Linux. On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
 
 ---
 
@@ -149,8 +153,6 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 1. The tool searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
 2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
 3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
-
-> **Linux / macOS.** The `manager` patch is cross-platform. The Go backend is built from a single source, so the machine code is identical on `linux/amd64` and `windows/amd64` — the same signature and the same byte replacement apply to the ELF binary `resources/bin/language_server` (no `.exe`). Outside Windows, `manager` autodetection scans the common install prefixes (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `/Applications`, and the directory of an `antigravity` launcher on `PATH`); for a non-standard location, pass the path manually via `--path-manager`. Close the app before patching (otherwise the OS returns `ETXTBSY`). The `cli` and `ide` patches, along with account management (`accounts`), remain Windows-only for now.
 </details>
 
 <details>
