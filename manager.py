@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-agy-manager — environment manager for Antigravity developer tools on Windows.
-Provides location restriction bypass (patching eligibility gates)
-and multi-account profile switching.
-
-  * cli      Antigravity CLI         (agy.exe, Go binary)        -> suppress eligibility screen
-  * manager  Antigravity (Manager)   (language_server.exe, Go)   -> force hasValidAuth=true
-  * ide      Antigravity IDE         (VS Code fork, out/main.js)  -> force the internal-eligible branch
-  * accounts Multi-account manager                               -> save & switch logins in-place
-
-None of the patches unlock anything you can't already use — they only stop a local,
-non-blocking eligibility screen from appearing. Every change is backed up
-(<file>.agybak) and reversible with `restore`. Pure standard library.
-
-Usage:
-    python manager.py status                 # show all three (default)
-    python manager.py patch                  # patch all detected apps
-    python manager.py restore                # restore all from backup
-    python manager.py patch ide manager      # only specific targets
-    python manager.py --path-cli "C:\\...\\agy.exe" patch cli
-
-    python manager.py accounts list          # saved logins (+ which is active)
-    python manager.py accounts save work     # snapshot the current login as "work"
-    python manager.py accounts use personal  # switch login in-place (no re-login)
-"""
+"""Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
 import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, struct, sys, time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,16 +11,13 @@ except Exception:
 BAK = ".agybak"
 TARGETS = ("cli", "manager", "ide")
 
-# ----------------------------------------------------------------------- utils
+# Utilities
 def _say(tag, msg): print(f"  [{tag}] {msg}")
 def ok(m):   _say("ok", m)
 def info(m): _say("..", m)
 def warn(m): _say("!!", m)
 
 def _bin(name):
-    """Platform executable name: 'language_server' on Linux/mac, 'language_server.exe'
-    on Windows. The Go binaries are byte-identical across OSes (same source, same
-    linux/windows-amd64 codegen), so only the on-disk name and search roots differ."""
     return name + (".exe" if os.name == "nt" else "")
 
 def is_locked(path):
@@ -55,13 +28,11 @@ def is_locked(path):
         return True
 
 def make_backup(path):
-    """Snapshot the clean file as <path>.agybak (callers reach here only when unpatched,
-    so the live bytes are this build's pristine original). A backup that no longer
-    matches the file is stale (app auto-updated) — refresh it instead of keeping it."""
+    """Create or refresh a verified clean backup."""
     bak = path + BAK
     if os.path.exists(bak):
         if filecmp.cmp(path, bak, shallow=False):
-            return bak                              # backup already matches this build
+            return bak
         info(f"backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK}")
     else:
         info(f"backup -> {os.path.basename(path)}{BAK}")
@@ -99,8 +70,7 @@ def rmtree_quiet(p):
 
 @contextlib.contextmanager
 def mapped(path):
-    """Read-only, zero-copy bytes-like view (works with .find(), slicing, re) for
-    marker/regex scans — avoids slurping multi-MB binaries into RAM."""
+    """Yield a read-only mmap."""
     with open(path, "rb") as f:
         if os.fstat(f.fileno()).st_size == 0:
             yield b""; return
@@ -116,7 +86,6 @@ def _read_exact(f, offset, size):
     return data
 
 def _normalized_ranges(ranges, file_size):
-    """Sorted, merged file-offset ranges clipped to the actual file."""
     clean = []
     for start, end in ranges:
         start, end = max(0, start), min(file_size, end)
@@ -142,7 +111,7 @@ def _pe_executable_ranges(f, file_size):
         section = _read_exact(f, section_table + i * 40, 40)
         raw_size, raw_offset = struct.unpack_from("<II", section, 16)
         characteristics = struct.unpack_from("<I", section, 36)[0]
-        if characteristics & 0x20000000:                  # IMAGE_SCN_MEM_EXECUTE
+        if characteristics & 0x20000000:
             ranges.append((raw_offset, raw_offset + raw_size))
     return _normalized_ranges(ranges, file_size)
 
@@ -152,12 +121,12 @@ def _elf_executable_ranges(f, file_size):
     endian = "<" if data_order == 1 else ">" if data_order == 2 else None
     if endian is None:
         raise ValueError("unknown ELF byte order")
-    if elf_class == 2:                                    # ELF64
+    if elf_class == 2:
         header = _read_exact(f, 0, 64)
         phoff = struct.unpack_from(endian + "Q", header, 32)[0]
         phentsize, phnum = struct.unpack_from(endian + "HH", header, 54)
         layout = (0, 4, 8, 32, "I", "I", "Q", "Q")
-    elif elf_class == 1:                                  # ELF32
+    elif elf_class == 1:
         header = _read_exact(f, 0, 52)
         phoff = struct.unpack_from(endian + "I", header, 28)[0]
         phentsize, phnum = struct.unpack_from(endian + "HH", header, 42)
@@ -172,7 +141,7 @@ def _elf_executable_ranges(f, file_size):
         flags = struct.unpack_from(endian + flags_fmt, entry, flags_off)[0]
         offset = struct.unpack_from(endian + off_fmt, entry, file_off)[0]
         size = struct.unpack_from(endian + size_fmt, entry, size_off)[0]
-        if p_type == 1 and flags & 1:                      # PT_LOAD + PF_X
+        if p_type == 1 and flags & 1:
             ranges.append((offset, offset + size))
     return _normalized_ranges(ranges, file_size)
 
@@ -192,7 +161,7 @@ def _macho_slice_ranges(f, file_size, base, slice_size):
         command, command_size = struct.unpack(endian + "II", command_header)
         if command_size < 8 or pos + command_size > base + slice_size:
             raise ValueError("invalid Mach-O load command")
-        if command == 0x19:                               # LC_SEGMENT_64
+        if command == 0x19:
             segment = _read_exact(f, pos, command_size)
             section_count = struct.unpack_from(endian + "I", segment, 64)[0]
             if 72 + section_count * 80 > command_size:
@@ -237,8 +206,7 @@ def _macho_executable_ranges(f, file_size):
     return _normalized_ranges(ranges, file_size)
 
 def executable_ranges(path):
-    """File-offset ranges containing executable instructions in PE, ELF, or Mach-O.
-    Refuse unknown formats instead of falling back to a whole-file signature scan."""
+    """Return executable file ranges for PE, ELF, or Mach-O."""
     with open(path, "rb") as f:
         file_size = os.fstat(f.fileno()).st_size
         magic = _read_exact(f, 0, min(4, file_size))
@@ -252,10 +220,7 @@ def executable_ranges(path):
         raise ValueError("no executable code ranges found")
     return ranges
 
-# ----------------------------------------------------------------- discovery --
-# Install-location-agnostic search: env roots + Programs/Program Files + registry
-# InstallLocation + PATH (+ scoop). Apps are matched by a structural marker file,
-# never a hard-coded path or version.
+# Discovery
 @functools.lru_cache(maxsize=1)
 def _reg_install_dirs():
     dirs = []
@@ -303,8 +268,7 @@ def _dedup_newest(paths):
     return out
 
 def find_marker(rel):
-    """Find <root>/*antigravity*/<rel> (also one level deeper for scoop version/
-    'current' dirs, and rel directly under a registry InstallLocation)."""
+    """Find a marker below known Windows install roots."""
     hits = []
     for root in _roots():
         hits += glob.glob(os.path.join(root, "*ntigravity*", rel))
@@ -313,16 +277,12 @@ def find_marker(rel):
         if os.path.isfile(direct): hits.append(direct)
     return _dedup_newest(hits)
 
-# Linux/mac discovery (Windows keeps _roots()/find_marker). Release tarballs unpack to
-# <root>/*ntigravity*/ under a handful of standard prefixes; a launcher on PATH also
-# contributes its own install dir. Apps are matched by the same structural marker
-# rel-path as on Windows — never a hard-coded path or version.
 def _posix_install_roots(*launchers):
     home = os.path.expanduser("~")
     roots = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share", "/usr/local/lib",
-             "/Applications",                              # macOS
+             "/Applications",
              os.path.join(home, ".local", "share"),
-             os.path.join(home, "Applications"),           # macOS (per-user)
+             os.path.join(home, "Applications"),
              os.path.join(home, "Downloads"), home]
     for launcher in launchers:
         w = shutil.which(launcher)
@@ -330,8 +290,7 @@ def _posix_install_roots(*launchers):
     return roots
 
 def _posix_find(rel, *launchers):
-    """POSIX analogue of find_marker: <root>/*ntigravity*/<rel> (and one level deeper),
-    plus rel directly under a launcher's install dir."""
+    """Find a marker below known POSIX install roots."""
     hits = []
     for root in _posix_install_roots(*launchers):
         hits += glob.glob(os.path.join(root, "*ntigravity*", rel))
@@ -340,11 +299,7 @@ def _posix_find(rel, *launchers):
         if os.path.isfile(direct): hits.append(direct)
     return _dedup_newest(hits)
 
-# ---------------------------------------------------- byte-signature gate -----
-# CLI and Manager each fix ONE machine-code site found by a binary-unique signature,
-# overwriting a few bytes in place. The machinery is shared; only the signatures,
-# replacement bytes, write offset and labels differ, so each target declares a Gate.
-# (Signatures use re.S so a `.` wildcard also matches a 0x0a displacement byte.)
+# Binary gates; re.S lets wildcards match every displacement byte.
 class SignatureNotFound(LookupError):
     pass
 
@@ -352,7 +307,6 @@ class SignatureAmbiguous(LookupError):
     pass
 
 def _unique_match(pattern, data, ranges, label):
-    """The sole regex match inside the supplied file ranges, None if absent."""
     found = None
     for start, end in ranges:
         pos = start
@@ -371,8 +325,7 @@ class Gate:
         self.sig, self.patched = re.compile(sig, re.S), re.compile(patched, re.S)
         self.fix, self.offset, self.desc = fix, offset, desc
     def find(self, data, ranges=None):
-        """('patched'|'unpatched', file offset to write at), or raise LookupError if
-        the signature is missing or not unique (unknown build — refuse to guess)."""
+        """Return state and write offset for one unambiguous signature."""
         search_ranges = ranges or ((0, len(data)),)
         original = _unique_match(self.sig, data, search_ranges, "unpatched gate")
         patched = _unique_match(self.patched, data, search_ranges, "patched gate")
@@ -384,16 +337,11 @@ class Gate:
             return ("unpatched", original.start() + self.offset)
         raise SignatureNotFound("gate signature not found (unsupported version?)")
     def resolve(self, data, ranges=None):
-        """(kind, write-offset, concrete-gate). The concrete gate carries the fix bytes
-        and label to apply — so a MultiGate can hand back the arch-matching sub-gate."""
         kind, off = self.find(data, ranges)
         return kind, off, self
 
 class MultiGate:
-    """One logical gate whose machine code differs per CPU arch (the Manager's auth check
-    compiles to distinct amd64 vs arm64 instructions), so it declares one Gate signature
-    per arch. A valid binary matches exactly one — matching more than one architecture
-    is treated as ambiguous and refused."""
+    """Select one architecture-specific gate."""
     def __init__(self, *gates, desc=""):
         self.gates, self.desc = gates, desc
     def resolve(self, data, ranges=None):
@@ -422,8 +370,8 @@ def gate_patch(path, gate, app, fname):
         warn(f"{fname} is locked — close {app} first"); return False
     try:
         ranges = executable_ranges(path)
-        with mapped(path) as d:                   # zero-copy scan; mmap closed before we write
-            kind, off, g = gate.resolve(d, ranges)  # g = the arch-specific gate that matched
+        with mapped(path) as d:
+            kind, off, g = gate.resolve(d, ranges)
     except (LookupError, OSError, ValueError) as e:
         warn(str(e)); return False
     if kind == "patched":
@@ -460,16 +408,10 @@ def gate_patch(path, gate, app, fname):
     ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
     return True
 
-# ------------------------------------------------------------------- CLI ------
-# agy's handleAuthResult gates the cosmetic "Eligibility Check" on the server
-# AuthResult's hasValidAuth (+8). Both native architectures are supported:
-#
-# amd64 (Windows, Linux x64, Intel macOS):
+# CLI eligibility screen
+# x64:
 #   test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible
-# rax is non-null here (the je above), so rewriting the compare to `test rax,rax`+nop
-# keeps ZF=0 -> the jne always takes the eligible branch. The trailing result-shape
-# checks make the signature unique even in Mach-O, which contains byte-like data outside
-# executable code that matched the older, shorter pattern.
+# Repeating the non-null test keeps ZF=0, so jne always selects eligible.
 CLI_GATE_X64 = Gate(
     rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
     rb"\x48\x8b\x50\x50\x4c\x8d\x1d....\x66\x90\x4c\x39\x58\x48",
@@ -477,11 +419,9 @@ CLI_GATE_X64 = Gate(
     rb"\x48\x8b\x50\x50\x4c\x8d\x1d....\x66\x90\x4c\x39\x58\x48",
     b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)")
 
-# arm64 (Windows ARM64, Linux arm64, Apple Silicon):
+# arm64:
 #   cbnz x1,error ; cbz x0,eligible ; ldrb w8,[x0,#8] ; tbnz w8,#0,eligible
-# Replace only the load with `mov w8,#1`; the existing tbnz then always takes the
-# eligible branch. Branch displacement bytes are wildcarded so harmless layout changes
-# do not break detection, while the surrounding instructions keep the match unique.
+# Loading 1 instead makes tbnz always select eligible.
 CLI_GATE_ARM64 = Gate(
     rb"...\xb5...\xb4\x08\x20\x40\x39...\x37\x08\xa4\x44\xa9",
     rb"...\xb5...\xb4\x28\x00\x80\x52...\x37\x08\xa4\x44\xa9",
@@ -492,48 +432,30 @@ CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, desc="eligibility screen off"
 def cli_default_paths():
     cands = []
     w = shutil.which("agy")
-    if w:                                    # PATH hit (Windows which() appends PATHEXT's .EXE — normalize case)
+    if w:
         base, ext = os.path.splitext(w); cands.append(base + ext.lower())
     if os.name == "nt":
         for root in _roots():
             cands += glob.glob(os.path.join(root, "agy", "bin", "agy.exe"))
-            cands += glob.glob(os.path.join(root, "agy", "*", "bin", "agy.exe"))   # scoop version dirs
+            cands += glob.glob(os.path.join(root, "agy", "*", "bin", "agy.exe"))
             cands += glob.glob(os.path.join(root, "agy*", "agy.exe"))
-    else:                                    # Linux/mac: install.sh drops a flat `agy` into ~/.local/bin
-        home = os.path.expanduser("~")      # (default), or a custom --dir on PATH (caught by which() above)
+    else:
+        home = os.path.expanduser("~")
         cands += [os.path.join(d, "agy") for d in
                   (os.path.join(home, ".local", "bin"), os.path.join(home, "bin"),
                    "/usr/local/bin", "/usr/bin", "/opt/homebrew/bin")]
     return _dedup_newest(cands)
 
-# --------------------------------------------------- Manager (auth gate) ------
-# language_server.exe (Go) decides the account's hasValidAuth (proto3 bool = byte at
-# AuthResult+8) in authclient.(*PersonalAuthValidator).Validate — the single root
-# authority. It calls ValidateAndOnboardAccount, then gates on the verdict:
-#   cmp byte[rax+8],0 ; je skip ; mov r,[rsp+d] ; mov [rax+0x60],r   (attach the token)
-# This is the AuthResult GetAuthStatus returns, so it governs EVERY path: cold restart /
-# token-restore, AND the first interactive login ((*AuthClient).Login calls this
-# validator and, on the no-error path, gates on this exact result object — so forcing the
-# byte here also satisfies Login's later check; no separate Login patch needed).
-# Fix: rewrite the compare to `mov byte[rax+8],1` and NOP the `je`, forcing the byte true
-# AND always falling through to the token-attach branch. (Store offset moved +0x40 ->
-# +0x60 vs older builds; displacements wildcarded via re.S to survive recompiles.)
+# Manager auth result
+# x64: force hasValidAuth and fall through to token attachment.
 # cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2
-#
-# amd64 covers Windows (incl. Windows-on-ARM, which ships the x64 language_server and runs
-# it under x64 emulation), Linux x86_64 and Intel macOS — Go emits byte-identical code there.
 MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
                         rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
                         b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
 
-# aarch64 (Linux arm64, Apple-Silicon macOS). Same validator, arm64 codegen:
-#   ldrb w3,[x0,#8]          ; load hasValidAuth        03 20 40 39
-#   tbz  w3,#0,skip          ; if bit0==0 -> skip attach c3 .. .. 36  (branch disp wildcarded)
-#   ldr  x3,[sp,#..] ; ldr x4,[sp,#..]                  (token halves; sp offsets wildcarded)
-#   stp  x3,x4,[x0,#0x60]    ; attach token             03 10 06 a9
-# Fix (same intent as x64): force the byte true AND drop the branch, always attaching:
+# arm64: force hasValidAuth and remove the token-attachment branch.
 #   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
-# w3 is immediately reloaded by the following `ldr x3,[sp,..]`, so clobbering it is safe.
+# The following ldr overwrites w3.
 MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39\xc3..\x36........\x03\x10\x06\xa9",
                           rb"\x23\x00\x80\x52\x03\x20\x00\x39........\x03\x10\x06\xa9",
                           b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)")
@@ -543,12 +465,11 @@ MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAut
 def manager_default_bins():
     if os.name == "nt":
         return find_marker(os.path.join("resources", "bin", "language_server.exe"))
-    # macOS keeps it inside the .app bundle (Contents/Resources/bin); Linux uses resources/bin.
     rel = (os.path.join("Contents", "Resources", "bin", "language_server") if sys.platform == "darwin"
            else os.path.join("resources", "bin", "language_server"))
-    return _posix_find(rel, "antigravity")                 # Linux/mac: launcher `antigravity`
+    return _posix_find(rel, "antigravity")
 
-# --------------------------------------------------------------------- IDE ----
+# IDE
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
 IDE_DONE = b"resetIsTierGCPTos(),true"
 IDE_DONE_RE = re.compile(re.escape(IDE_DONE))
@@ -556,10 +477,9 @@ IDE_DONE_RE = re.compile(re.escape(IDE_DONE))
 def ide_default_mains():
     if os.name == "nt":
         return find_marker(os.path.join("resources", "app", "out", "main.js"))
-    # macOS bundles main.js under the .app (Contents/Resources/app/out); Linux uses resources/app/out.
     rel = (os.path.join("Contents", "Resources", "app", "out", "main.js") if sys.platform == "darwin"
            else os.path.join("resources", "app", "out", "main.js"))
-    return _posix_find(rel, "antigravity-ide", "antigravity")   # Linux/mac: VS Code-fork launcher
+    return _posix_find(rel, "antigravity-ide", "antigravity")
 
 def _ide_gate_state(data):
     ranges = ((0, len(data)),)
@@ -581,9 +501,7 @@ def ide_status(path):
         return ("unknown", None)
 
 def _ide_cache_dirs():
-    """VS Code CachedData / Code Cache dirs to drop after patching main.js, so the IDE
-    recompiles the patched bytes instead of replaying a stale compile cache. The user-data
-    folder is the product nameLong ('Antigravity IDE') under each OS's app-data root."""
+    """Return JavaScript cache directories invalidated by the patch."""
     home = os.path.expanduser("~")
     if os.name == "nt":
         bases = [os.path.expandvars(p) for p in
@@ -591,7 +509,7 @@ def _ide_cache_dirs():
                   r"%APPDATA%\Antigravity IDE")]
     elif sys.platform == "darwin":
         bases = [os.path.join(home, "Library", "Application Support", "Antigravity IDE")]
-    else:                                                  # Linux (respect XDG_CONFIG_HOME)
+    else:
         cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
         bases = [os.path.join(cfg, "Antigravity IDE")]
     dirs = []
@@ -637,26 +555,18 @@ def ide_patch(path):
     ok("IDE patched (isGoogleInternal -> true) + caches cleared")
     return True
 
-# ============================================================== accounts =====
-# Save / switch Antigravity logins WITHOUT the app's own logout (which revokes the
-# refresh token server-side). The login lives in two independent stores:
-#   * CLI + Manager : Windows Credential Manager generic cred "gemini:antigravity"
-#                     (plaintext JSON holding a long-lived refresh_token)
-#   * IDE           : the VS Code state.vscdb -> antigravityUnifiedStateSync.* keys
-# Both are treated as OPAQUE blobs — snapshot and restore the bytes, never decrypt —
-# so the refresh token survives, an expired access token is re-minted by the app, and
-# the format stays version-robust. Saved profiles are themselves Credential Manager
-# entries "agy-manager:account:<name>" (same OS at-rest protection, nothing on disk).
+# Accounts
+# Live logins remain opaque: CLI/Manager use Credential Manager; IDE uses state.vscdb.
 ACCT_PREFIX = "agy-manager:account:"
-CRED_TARGET = "gemini:antigravity"                       # shared by CLI + Manager
+CRED_TARGET = "gemini:antigravity"
 CRED_USER   = "antigravity"
-IDE_KEYS = ("antigravityUnifiedStateSync.oauthToken",    # the token itself, plus the
-            "antigravityUnifiedStateSync.userStatus",    # identity/UI keys so the IDE
-            "antigravityUnifiedStateSync.profileUrl",    # doesn't keep showing the
-            "antigravityUnifiedStateSync.modelCredits")  # previous account after swap
+IDE_KEYS = ("antigravityUnifiedStateSync.oauthToken",
+            "antigravityUnifiedStateSync.userStatus",
+            "antigravityUnifiedStateSync.profileUrl",
+            "antigravityUnifiedStateSync.modelCredits")
 
 def _advapi():
-    """Bind advapi32 Cred* with correct 64-bit signatures (ctypes is stdlib)."""
+    """Bind the Windows Credential API."""
     import ctypes
     from ctypes import wintypes
     class CREDENTIAL(ctypes.Structure):
@@ -678,10 +588,9 @@ def _advapi():
     return ctypes, wintypes, a, CREDENTIAL, PCRED
 
 def cred_read(target):
-    """Raw CredentialBlob bytes for a GENERIC credential, or None if it doesn't exist."""
     ctypes, wintypes, a, CRED, PCRED = _advapi()
     p = PCRED()
-    if not a.CredReadW(target, 1, 0, ctypes.byref(p)):   # 1 = CRED_TYPE_GENERIC
+    if not a.CredReadW(target, 1, 0, ctypes.byref(p)):
         return None
     try:    return ctypes.string_at(p.contents.CredentialBlob, p.contents.CredentialBlobSize)
     finally: a.CredFree(p)
@@ -692,7 +601,7 @@ def cred_write(target, blob, user):
     c = CRED(); c.Type = 1; c.TargetName = target; c.UserName = user
     c.CredentialBlobSize = len(blob)
     c.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))
-    c.Persist = 2                                          # CRED_PERSIST_LOCAL_MACHINE
+    c.Persist = 2
     if not a.CredWriteW(ctypes.byref(c), 0):
         raise OSError(f"CredWrite failed (err {ctypes.get_last_error()})")
 
@@ -709,7 +618,7 @@ def cred_enum(prefix):
     finally: a.CredFree(arr)
 
 def _ide_state_db():
-    """Path to the IDE's active VS Code global-state DB (newest of the candidates)."""
+    """Return the newest IDE state database."""
     cands = []
     for base in (r"%USERPROFILE%\scoop\persist\antigravity-ide\data\user-data",
                  r"%APPDATA%\Antigravity IDE"):
@@ -744,12 +653,11 @@ def ide_write(values):
         con.commit()
     finally: con.close()
 
-# IDE values may be str or bytes; tag them so a bundle stays JSON-serializable.
+# Preserve SQLite value types in JSON.
 def _enc(v): return {"b": base64.b64encode(v).decode()} if isinstance(v, (bytes, bytearray)) else {"s": v}
 def _dec(d): return base64.b64decode(d["b"]) if "b" in d else d["s"]
 
 def _snapshot(target_type):
-    """Bundle the live login from the specified store into a JSON-safe dict."""
     if target_type == "cli-manager":
         cred = cred_read(CRED_TARGET)
         return {"version": 1, "type": "cli-manager", "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -768,7 +676,7 @@ def _apply(target_type, bundle):
         ide = {k: _dec(v) for k, v in (bundle.get("ide") or {}).items()}
         if ide:
             if _ide_state_db():
-                ide_write(ide)                           # lock-prone store first
+                ide_write(ide)
             else:
                 info("IDE database not found — skipping IDE token restoration")
 
@@ -788,8 +696,7 @@ def _ide_refresh_token(oauth_token_val):
         return None
 
 def _refresh_token(target_type, bundle):
-    """The (stable) refresh_token in a bundle's CLI/Manager or IDE blob — used to match
-    a live login to a saved profile."""
+    """Extract the refresh token used to identify a profile."""
     if target_type == "cli-manager":
         b64 = bundle.get("cred")
         if not b64: return None
@@ -806,9 +713,7 @@ def _refresh_token(target_type, bundle):
             return None
     return None
 
-# A bundle can exceed Credential Manager's ~2560-byte blob cap (the IDE userStatus key
-# alone is ~8 KB), so each profile is stored as numbered chunks "...<name>/<i>" — the
-# same way go-keyring shards large secrets.
+# Credential Manager blobs are limited to about 2560 bytes.
 _CHUNK = 2000
 
 def _acct_prefix(target_type):
@@ -835,14 +740,14 @@ def _profile_delete(target_type, name):
 
 def profile_save(target_type, name, bundle):
     prefix = _acct_prefix(target_type)
-    _profile_delete(target_type, name)                                # drop old chunks (new blob may be shorter)
+    _profile_delete(target_type, name)
     data = json.dumps(bundle).encode("utf-8")
     parts = [data[j:j+_CHUNK] for j in range(0, len(data), _CHUNK)] or [b""]
     for i, part in enumerate(parts):
         cred_write(f"{prefix}{name}/{i}", part, name)
 
 def current_account(target_type):
-    """Name of the saved profile matching the live login (by refresh_token), or None."""
+    """Match the live refresh token to a saved profile."""
     if target_type == "cli-manager":
         live = cred_read(CRED_TARGET)
         if not live: return None
@@ -864,13 +769,12 @@ def current_account(target_type):
     return None
 
 def _accounts_busy(target_type):
-    """Token-holding apps currently running (their store is in use), so a switch would
-    be ignored (token cached) or hit a locked store."""
+    """Return apps that may cache or lock the active login."""
     busy = []
     if target_type == "cli-manager":
         for t, label in (("manager", "Manager"), ("cli", "CLI")):
             p = resolve(t, {})
-            if p and is_locked(p): busy.append(label)         # running exe image is write-locked
+            if p and is_locked(p): busy.append(label)
     elif target_type == "ide":
         db = _ide_state_db()
         if db:
@@ -879,7 +783,7 @@ def _accounts_busy(target_type):
                 try: con.execute("BEGIN IMMEDIATE"); con.rollback()
                 finally: con.close()
             except sqlite3.OperationalError:
-                busy.append("IDE")                            # state.vscdb is write-locked by the IDE
+                busy.append("IDE")
     return busy
 
 def acct_list(target_type):
@@ -922,8 +826,8 @@ def acct_use(target_type, name):
     if busy:
         warn(f"close {', '.join(busy)} first - the token is cached in memory while running"); return 1
     cur = current_account(target_type)
-    if cur and cur != name:                               # sync-on-switch: capture any refresh-token
-        try: profile_save(target_type, cur, _snapshot(target_type)); info(f"synced '{cur}' before switching")  # rotation since
+    if cur and cur != name:
+        try: profile_save(target_type, cur, _snapshot(target_type)); info(f"synced '{cur}' before switching")
         except Exception as e: warn(f"couldn't sync '{cur}': {e}")
     try:
         _apply(target_type, target)
@@ -949,15 +853,12 @@ def acct_rename(target_type, old_name, new_name):
     ok(f"renamed account '{old_name}' to '{new_name}'"); return 0
 
 def acct_logout(target_type):
-    """Clear the live login LOCALLY (no server-side revoke) so the app shows its login
-    screen and you can sign into another account to capture it — without invalidating
-    the refresh token of the account you just saved. Use this instead of the app's own
-    'log out' button when adding accounts."""
+    """Clear the live login locally without revoking its refresh token."""
     busy = _accounts_busy(target_type)
     if busy:
         warn(f"close {', '.join(busy)} first - the token is cached in memory while running"); return 1
     cur = current_account(target_type)
-    if cur:                                              # keep the saved copy current before clearing
+    if cur:
         try: profile_save(target_type, cur, _snapshot(target_type)); info(f"synced '{cur}' first")
         except Exception as e: warn(f"couldn't sync '{cur}': {e}")
     
@@ -968,7 +869,7 @@ def acct_logout(target_type):
     elif target_type == "ide":
         try:
             if _ide_state_db():
-                ide_write({})                            # delete all IDE token keys (lock-prone first)
+                ide_write({})
         except sqlite3.OperationalError:
             warn("IDE database is locked - close Antigravity IDE and retry"); return 1
         ok("live IDE login cleared locally (NOT revoked) - launch Antigravity IDE, "
@@ -1004,7 +905,7 @@ def run_accounts(argv):
         warn(f"accounts error: {e}"); return 1
     warn(f"unknown accounts subcommand '{sub}' (list | current | save | use | rename | logout | rm)"); return 2
 
-# -------------------------------------------------------------------- driver --
+# Driver
 SPEC = {
     "cli":     dict(name="Antigravity CLI",      find=cli_default_paths,     status=functools.partial(gate_status, gate=CLI_GATE),
                     patch=functools.partial(gate_patch, gate=CLI_GATE, app="CLI", fname=_bin("agy"))),
@@ -1042,7 +943,6 @@ def run(action, targets, overrides):
     return rc
 
 def _status_of(t, path):
-    """Status string for an already-resolved path (no filesystem/registry scan)."""
     if not path: return "not found"
     try:
         return SPEC[t]["status"](path)[0]
@@ -1050,16 +950,13 @@ def _status_of(t, path):
         return "error"
 
 def state(t, overrides=None):
-    """(path|None, status_str) for one target."""
     path = resolve(t, (overrides or {}).get(t))
     return path, _status_of(t, path)
 
 def scan(overrides):
-    """Resolve paths + status for every target once, concurrently. Discovery and
-    binary scans happen here (not per menu redraw); the registry/root probe is
-    shared and the three targets run in parallel. Returns (paths, status) dicts."""
-    _reg_install_dirs.cache_clear(); _roots.cache_clear()   # rediscover on (re)scan
-    _roots()                                                # warm shared cache once
+    """Resolve and scan all targets concurrently."""
+    _reg_install_dirs.cache_clear(); _roots.cache_clear()
+    _roots()
     def one(t):
         p = resolve(t, overrides.get(t))
         return t, p, _status_of(t, p)
@@ -1069,7 +966,7 @@ def scan(overrides):
             paths[t], status[t] = p, st
     return paths, status
 
-# --------------------------------------------------------------- interactive --
+# Interactive UI
 _STYLE = {"patched": "bold green", "unpatched": "yellow", "unknown": "magenta",
           "not found": "dim", "error": "bold red"}
 _ICON  = {"patched": "✓", "unpatched": "●", "unknown": "?", "not found": "·", "error": "!"}
@@ -1182,7 +1079,7 @@ def interactive(overrides):
     qs = questionary.Style([("qmark", "fg:#00afff bold"), ("pointer", "fg:#00afff bold"),
                             ("highlighted", "fg:#00afff bold"), ("selected", "fg:#00ff87 bold"),
                             ("answer", "fg:#00ff87 bold")])
-    paths, status = scan(overrides)        # discover + status once; reused across redraws
+    paths, status = scan(overrides)
     while True:
         console.clear()
         _render(console, paths, status)
@@ -1196,7 +1093,7 @@ def interactive(overrides):
         if action in (None, "quit"):
             console.print("[dim]bye 👋[/]"); return 0
         if action == "refresh":
-            paths, status = scan(overrides)        # explicit rescan on user request
+            paths, status = scan(overrides)
             continue
         if action == "accounts":
             _accounts_menu(console, qs); continue
@@ -1205,8 +1102,8 @@ def interactive(overrides):
             path, st = paths[t], status[t]
             if not path:
                 continue
-            if action == "patch" and st == "patched": continue        # nothing to do
-            if action == "restore" and st != "patched": continue   # only undo a real patch
+            if action == "patch" and st == "patched": continue
+            if action == "restore" and st != "patched": continue
             opts.append(questionary.Choice(f"{SPEC[t]['name']}  · {st}", value=t))
         if not opts:
             console.print(f"[yellow]Nothing to {action}.[/]")
@@ -1216,7 +1113,7 @@ def interactive(overrides):
             continue
         console.rule(f"[bold cyan]{action}[/]")
         run(action, sel, overrides)
-        for t in sel:                              # refresh only what we just touched
+        for t in sel:
             status[t] = _status_of(t, paths[t])
         console.rule(style="dim")
         questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs).ask()
@@ -1233,7 +1130,7 @@ def main(argv=None):
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
     args = ap.parse_args(argv)
 
-    if args.action == "accounts":                       # free-form subcommand; skip target validation
+    if args.action == "accounts":
         return run_accounts(args.targets)
 
     bad = [t for t in args.targets if t not in TARGETS]
@@ -1255,7 +1152,6 @@ def main(argv=None):
         except Exception:
             if args.action == "menu":
                 warn("interactive menu needs a real terminal"); return 2
-        # plain fallback (no TTY / missing deps)
         print("agy-manager - status")
         return run("status", list(TARGETS), overrides)
 

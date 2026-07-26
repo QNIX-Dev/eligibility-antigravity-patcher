@@ -15,12 +15,13 @@ def _write(path, data):
 
 
 def _minimal_pe(code=b"", data=b""):
+    # One executable and one data section.
     image = bytearray(0x400)
     image[:2] = b"MZ"
     struct.pack_into("<I", image, 0x3C, 0x80)
     image[0x80:0x84] = b"PE\0\0"
-    struct.pack_into("<H", image, 0x86, 2)          # NumberOfSections
-    struct.pack_into("<H", image, 0x94, 0)          # SizeOfOptionalHeader
+    struct.pack_into("<H", image, 0x86, 2)
+    struct.pack_into("<H", image, 0x94, 0)
     section_table = 0x98
     image[section_table:section_table + 8] = b".text\0\0\0"
     struct.pack_into("<II", image, section_table + 16, 0x40, 0x200)
@@ -35,28 +36,30 @@ def _minimal_pe(code=b"", data=b""):
 
 
 def _minimal_elf():
+    # One executable and one read-only segment.
     image = bytearray(0x200)
-    image[:6] = b"\x7fELF\x02\x01"                 # ELF64, little-endian
-    struct.pack_into("<Q", image, 32, 64)           # e_phoff
-    struct.pack_into("<HH", image, 54, 56, 2)       # e_phentsize, e_phnum
-    struct.pack_into("<II", image, 64, 1, 5)        # PT_LOAD, PF_R|PF_X
-    struct.pack_into("<Q", image, 72, 0x100)        # p_offset
-    struct.pack_into("<Q", image, 96, 0x20)         # p_filesz
+    image[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<Q", image, 32, 64)
+    struct.pack_into("<HH", image, 54, 56, 2)
+    struct.pack_into("<II", image, 64, 1, 5)
+    struct.pack_into("<Q", image, 72, 0x100)
+    struct.pack_into("<Q", image, 96, 0x20)
     second = 64 + 56
-    struct.pack_into("<II", image, second, 1, 4)    # PT_LOAD, PF_R
+    struct.pack_into("<II", image, second, 1, 4)
     struct.pack_into("<Q", image, second + 8, 0x120)
     struct.pack_into("<Q", image, second + 32, 0x20)
     return bytes(image)
 
 
 def _minimal_macho():
+    # One __TEXT,__text section.
     image = bytearray(0x300)
-    image[:4] = b"\xcf\xfa\xed\xfe"                # MH_MAGIC_64, little-endian
-    struct.pack_into("<I", image, 16, 1)            # ncmds
-    struct.pack_into("<I", image, 20, 152)          # sizeofcmds
+    image[:4] = b"\xcf\xfa\xed\xfe"
+    struct.pack_into("<I", image, 16, 1)
+    struct.pack_into("<I", image, 20, 152)
     command = 32
-    struct.pack_into("<II", image, command, 0x19, 152)  # LC_SEGMENT_64
-    struct.pack_into("<I", image, command + 64, 1)  # nsects
+    struct.pack_into("<II", image, command, 0x19, 152)
+    struct.pack_into("<I", image, command + 64, 1)
     section = command + 72
     image[section:section + 16] = b"__text" + b"\0" * 10
     image[section + 16:section + 32] = b"__TEXT" + b"\0" * 10
@@ -68,7 +71,7 @@ def _minimal_macho():
 def _minimal_fat_macho():
     thin = _minimal_macho()
     image = bytearray(0x100 + len(thin))
-    image[:4] = b"\xca\xfe\xba\xbe"                # FAT_MAGIC, big-endian
+    image[:4] = b"\xca\xfe\xba\xbe"
     struct.pack_into(">I", image, 4, 1)
     struct.pack_into(">IIIII", image, 8, 0x01000007, 3, 0x100, len(thin), 8)
     image[0x100:] = thin
