@@ -47,6 +47,13 @@
 
 ## <a id="quick-start"></a>🚀 Quick Start
 
+Clone the repository and enter its directory first:
+
+```bash
+git clone https://github.com/QNIX-Dev/eligibility-antigravity-patcher.git
+cd eligibility-antigravity-patcher
+```
+
 ### Option A: Interactive TUI (Recommended)
 
 Launches the complete terminal dashboard with live status reports for managing both patches and profiles:

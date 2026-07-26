@@ -47,6 +47,13 @@
 
 ## <a id="quick-start"></a>🚀 Быстрый старт
 
+Сначала клонируйте репозиторий и перейдите в его каталог:
+
+```bash
+git clone https://github.com/QNIX-Dev/eligibility-antigravity-patcher.git
+cd eligibility-antigravity-patcher
+```
+
 ### Вариант А: Интерактивный TUI (рекомендуется)
 
 Запуск полноценного интерактивного интерфейса с таблицей статусов для управления как патчами, так и аккаунтами:
