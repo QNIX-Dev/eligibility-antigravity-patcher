@@ -240,13 +240,33 @@ def gate_patch(path, gate, app, fname):
     return True
 
 # ------------------------------------------------------------------- CLI ------
-# agy.exe's handleAuthResult gates the cosmetic "Eligibility Check" on the server
-# AuthResult's hasValidAuth (+8):  test rax,rax ; je ; cmp byte[rax+8],0 ; jne.
+# agy's handleAuthResult gates the cosmetic "Eligibility Check" on the server
+# AuthResult's hasValidAuth (+8). Both native architectures are supported:
+#
+# amd64 (Windows, Linux x64, Intel macOS):
+#   test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible
 # rax is non-null here (the je above), so rewriting the compare to `test rax,rax`+nop
-# keeps ZF=0 -> the jne always takes the eligible branch and the screen never renders.
-CLI_GATE = Gate(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
-                rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85....",
-                b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off")
+# keeps ZF=0 -> the jne always takes the eligible branch. The trailing result-shape
+# checks make the signature unique even in Mach-O, which contains byte-like data outside
+# executable code that matched the older, shorter pattern.
+CLI_GATE_X64 = Gate(
+    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
+    rb"\x48\x8b\x50\x50\x4c\x8d\x1d....\x66\x90\x4c\x39\x58\x48",
+    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
+    rb"\x48\x8b\x50\x50\x4c\x8d\x1d....\x66\x90\x4c\x39\x58\x48",
+    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)")
+
+# arm64 (Windows ARM64, Linux arm64, Apple Silicon):
+#   cbnz x1,error ; cbz x0,eligible ; ldrb w8,[x0,#8] ; tbnz w8,#0,eligible
+# Replace only the load with `mov w8,#1`; the existing tbnz then always takes the
+# eligible branch. Branch displacement bytes are wildcarded so harmless layout changes
+# do not break detection, while the surrounding instructions keep the match unique.
+CLI_GATE_ARM64 = Gate(
+    rb"...\xb5...\xb4\x08\x20\x40\x39...\x37\x08\xa4\x44\xa9",
+    rb"...\xb5...\xb4\x28\x00\x80\x52...\x37\x08\xa4\x44\xa9",
+    b"\x28\x00\x80\x52", offset=8, desc="eligibility screen off (arm64)")
+
+CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, desc="eligibility screen off")
 
 def cli_default_paths():
     cands = []

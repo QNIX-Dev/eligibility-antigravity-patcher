@@ -147,6 +147,7 @@ At startup, the CLI renders an "Eligibility Check" section. The check resides in
 1. The patcher scans the binary for the unique gate instruction signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible).
 2. If `hasValidAuth` is zero, execution falls through and prints the location error.
 3. The patch rewrites the `cmp byte ptr [rax+8], 0` check to `test rax,rax` (+`NOP`). Since `rax` is always non-null here, the `jne` jump is always taken, resolving the check to "eligible".
+4. In native **arm64 builds** for Windows, Linux, and macOS, the same check is emitted as `cbz x0,eligible` → `ldrb w8,[x0,#8]` → `tbnz w8,#0,eligible`. The patch replaces the flag load with `mov w8,#1`, so the existing `tbnz` always selects the eligible branch. A `MultiGate` automatically selects the x64 or arm64 signature.
 </details>
 
 <details>
