@@ -25,7 +25,7 @@ Usage:
     python manager.py accounts use personal  # switch login in-place (no re-login)
 """
 from __future__ import annotations
-import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, sys, time
+import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, struct, sys, time
 from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
@@ -61,20 +61,33 @@ def make_backup(path):
     bak = path + BAK
     if os.path.exists(bak):
         if filecmp.cmp(path, bak, shallow=False):
-            return                                  # backup already matches this build
+            return bak                              # backup already matches this build
         info(f"backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK}")
     else:
         info(f"backup -> {os.path.basename(path)}{BAK}")
     shutil.copy2(path, bak)
+    if not filecmp.cmp(path, bak, shallow=False):
+        raise OSError("backup verification failed")
+    return bak
 
-def restore_file(path):
+def restore_file(path, status=None):
     b = path + BAK
     if not os.path.exists(b):
         warn(f"no backup for {os.path.basename(path)} (nothing to restore)")
         return False
     if is_locked(path):
         warn("file is locked — close the app first"); return False
+    if status:
+        try:
+            if status(b)[0] != "unpatched":
+                warn("backup is not a recognized clean build — refusing to restore")
+                return False
+        except Exception as e:
+            warn(f"couldn't validate backup: {e}"); return False
     shutil.copy2(b, path)
+    if status and status(path)[0] != "unpatched":
+        warn("restore verification failed")
+        return False
     ok(f"restored {os.path.basename(path)}")
     return True
 
@@ -94,6 +107,150 @@ def mapped(path):
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         try: yield mm
         finally: mm.close()
+
+def _read_exact(f, offset, size):
+    f.seek(offset)
+    data = f.read(size)
+    if len(data) != size:
+        raise ValueError("truncated executable header")
+    return data
+
+def _normalized_ranges(ranges, file_size):
+    """Sorted, merged file-offset ranges clipped to the actual file."""
+    clean = []
+    for start, end in ranges:
+        start, end = max(0, start), min(file_size, end)
+        if start < end: clean.append((start, end))
+    out = []
+    for start, end in sorted(clean):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return tuple(out)
+
+def _pe_executable_ranges(f, file_size):
+    pe = struct.unpack("<I", _read_exact(f, 0x3c, 4))[0]
+    if _read_exact(f, pe, 4) != b"PE\0\0":
+        raise ValueError("invalid PE signature")
+    coff = _read_exact(f, pe + 4, 20)
+    section_count = struct.unpack_from("<H", coff, 2)[0]
+    optional_size = struct.unpack_from("<H", coff, 16)[0]
+    section_table = pe + 24 + optional_size
+    ranges = []
+    for i in range(section_count):
+        section = _read_exact(f, section_table + i * 40, 40)
+        raw_size, raw_offset = struct.unpack_from("<II", section, 16)
+        characteristics = struct.unpack_from("<I", section, 36)[0]
+        if characteristics & 0x20000000:                  # IMAGE_SCN_MEM_EXECUTE
+            ranges.append((raw_offset, raw_offset + raw_size))
+    return _normalized_ranges(ranges, file_size)
+
+def _elf_executable_ranges(f, file_size):
+    ident = _read_exact(f, 0, 16)
+    elf_class, data_order = ident[4], ident[5]
+    endian = "<" if data_order == 1 else ">" if data_order == 2 else None
+    if endian is None:
+        raise ValueError("unknown ELF byte order")
+    if elf_class == 2:                                    # ELF64
+        header = _read_exact(f, 0, 64)
+        phoff = struct.unpack_from(endian + "Q", header, 32)[0]
+        phentsize, phnum = struct.unpack_from(endian + "HH", header, 54)
+        layout = (0, 4, 8, 32, "I", "I", "Q", "Q")
+    elif elf_class == 1:                                  # ELF32
+        header = _read_exact(f, 0, 52)
+        phoff = struct.unpack_from(endian + "I", header, 28)[0]
+        phentsize, phnum = struct.unpack_from(endian + "HH", header, 42)
+        layout = (0, 24, 4, 16, "I", "I", "I", "I")
+    else:
+        raise ValueError("unknown ELF class")
+    type_off, flags_off, file_off, size_off, type_fmt, flags_fmt, off_fmt, size_fmt = layout
+    ranges = []
+    for i in range(phnum):
+        entry = _read_exact(f, phoff + i * phentsize, phentsize)
+        p_type = struct.unpack_from(endian + type_fmt, entry, type_off)[0]
+        flags = struct.unpack_from(endian + flags_fmt, entry, flags_off)[0]
+        offset = struct.unpack_from(endian + off_fmt, entry, file_off)[0]
+        size = struct.unpack_from(endian + size_fmt, entry, size_off)[0]
+        if p_type == 1 and flags & 1:                      # PT_LOAD + PF_X
+            ranges.append((offset, offset + size))
+    return _normalized_ranges(ranges, file_size)
+
+def _macho_slice_ranges(f, file_size, base, slice_size):
+    magic = _read_exact(f, base, 4)
+    if magic == b"\xcf\xfa\xed\xfe":
+        endian = "<"
+    elif magic == b"\xfe\xed\xfa\xcf":
+        endian = ">"
+    else:
+        raise ValueError("unsupported Mach-O slice")
+    header = _read_exact(f, base, 32)
+    command_count = struct.unpack_from(endian + "I", header, 16)[0]
+    pos, ranges = base + 32, []
+    for _ in range(command_count):
+        command_header = _read_exact(f, pos, 8)
+        command, command_size = struct.unpack(endian + "II", command_header)
+        if command_size < 8 or pos + command_size > base + slice_size:
+            raise ValueError("invalid Mach-O load command")
+        if command == 0x19:                               # LC_SEGMENT_64
+            segment = _read_exact(f, pos, command_size)
+            section_count = struct.unpack_from(endian + "I", segment, 64)[0]
+            if 72 + section_count * 80 > command_size:
+                raise ValueError("invalid Mach-O section table")
+            section_pos = 72
+            for _ in range(section_count):
+                section = segment[section_pos:section_pos + 80]
+                section_name = section[:16].split(b"\0", 1)[0]
+                segment_name = section[16:32].split(b"\0", 1)[0]
+                size = struct.unpack_from(endian + "Q", section, 40)[0]
+                offset = struct.unpack_from(endian + "I", section, 48)[0]
+                flags = struct.unpack_from(endian + "I", section, 64)[0]
+                is_code = ((segment_name, section_name) == (b"__TEXT", b"__text") or
+                           flags & (0x80000000 | 0x00000400))
+                if is_code:
+                    ranges.append((base + offset, base + offset + size))
+                section_pos += 80
+        pos += command_size
+    return _normalized_ranges(ranges, file_size)
+
+def _macho_executable_ranges(f, file_size):
+    magic = _read_exact(f, 0, 4)
+    if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+        return _macho_slice_ranges(f, file_size, 0, file_size)
+    fat = {
+        b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+        b"\xca\xfe\xba\xbf": (">", True),  b"\xbf\xba\xfe\xca": ("<", True),
+    }.get(magic)
+    if not fat:
+        raise ValueError("unsupported Mach-O header")
+    endian, is_64 = fat
+    count = struct.unpack(endian + "I", _read_exact(f, 4, 4))[0]
+    entry_size = 32 if is_64 else 20
+    ranges = []
+    for i in range(count):
+        entry = _read_exact(f, 8 + i * entry_size, entry_size)
+        if is_64:
+            offset, size = struct.unpack_from(endian + "QQ", entry, 8)
+        else:
+            offset, size = struct.unpack_from(endian + "II", entry, 8)
+        ranges += _macho_slice_ranges(f, file_size, offset, size)
+    return _normalized_ranges(ranges, file_size)
+
+def executable_ranges(path):
+    """File-offset ranges containing executable instructions in PE, ELF, or Mach-O.
+    Refuse unknown formats instead of falling back to a whole-file signature scan."""
+    with open(path, "rb") as f:
+        file_size = os.fstat(f.fileno()).st_size
+        magic = _read_exact(f, 0, min(4, file_size))
+        if magic[:2] == b"MZ":
+            ranges = _pe_executable_ranges(f, file_size)
+        elif magic == b"\x7fELF":
+            ranges = _elf_executable_ranges(f, file_size)
+        else:
+            ranges = _macho_executable_ranges(f, file_size)
+    if not ranges:
+        raise ValueError("no executable code ranges found")
+    return ranges
 
 # ----------------------------------------------------------------- discovery --
 # Install-location-agnostic search: env roots + Programs/Program Files + registry
@@ -188,54 +345,118 @@ def _posix_find(rel, *launchers):
 # overwriting a few bytes in place. The machinery is shared; only the signatures,
 # replacement bytes, write offset and labels differ, so each target declares a Gate.
 # (Signatures use re.S so a `.` wildcard also matches a 0x0a displacement byte.)
+class SignatureNotFound(LookupError):
+    pass
+
+class SignatureAmbiguous(LookupError):
+    pass
+
+def _unique_match(pattern, data, ranges, label):
+    """The sole regex match inside the supplied file ranges, None if absent."""
+    found = None
+    for start, end in ranges:
+        pos = start
+        while pos < end:
+            match = pattern.search(data, pos, end)
+            if not match:
+                break
+            if found is not None:
+                raise SignatureAmbiguous(f"{label} signature is not unique — refusing to guess")
+            found = match
+            pos = max(match.end(), match.start() + 1)
+    return found
+
 class Gate:
     def __init__(self, sig, patched, fix, offset=0, desc=""):
         self.sig, self.patched = re.compile(sig, re.S), re.compile(patched, re.S)
         self.fix, self.offset, self.desc = fix, offset, desc
-    def find(self, data):
+    def find(self, data, ranges=None):
         """('patched'|'unpatched', file offset to write at), or raise LookupError if
         the signature is missing or not unique (unknown build — refuse to guess)."""
-        m = self.patched.search(data)
-        if m: return ("patched", m.start()+self.offset)
-        m = self.sig.search(data)
-        if not m: raise LookupError("gate signature not found (unsupported version?)")
-        if self.sig.search(data, m.end()): raise LookupError("gate signature is not unique — refusing to guess")
-        return ("unpatched", m.start()+self.offset)
-    def resolve(self, data):
+        search_ranges = ranges or ((0, len(data)),)
+        original = _unique_match(self.sig, data, search_ranges, "unpatched gate")
+        patched = _unique_match(self.patched, data, search_ranges, "patched gate")
+        if original and patched:
+            raise SignatureAmbiguous("both patched and unpatched gate signatures are present")
+        if patched:
+            return ("patched", patched.start() + self.offset)
+        if original:
+            return ("unpatched", original.start() + self.offset)
+        raise SignatureNotFound("gate signature not found (unsupported version?)")
+    def resolve(self, data, ranges=None):
         """(kind, write-offset, concrete-gate). The concrete gate carries the fix bytes
         and label to apply — so a MultiGate can hand back the arch-matching sub-gate."""
-        kind, off = self.find(data)
+        kind, off = self.find(data, ranges)
         return kind, off, self
 
 class MultiGate:
     """One logical gate whose machine code differs per CPU arch (the Manager's auth check
     compiles to distinct amd64 vs arm64 instructions), so it declares one Gate signature
-    per arch. A given binary matches exactly one — different archs share no byte pattern —
-    so there's no ambiguity; the first that finds a match wins."""
+    per arch. A valid binary matches exactly one — matching more than one architecture
+    is treated as ambiguous and refused."""
     def __init__(self, *gates, desc=""):
         self.gates, self.desc = gates, desc
-    def resolve(self, data):
-        err = None
+    def resolve(self, data, ranges=None):
+        matches = []
         for g in self.gates:
-            try: return g.resolve(data)
-            except LookupError as e: err = e
-        raise err or LookupError("no gate signature matched")
+            try:
+                matches.append(g.resolve(data, ranges))
+            except SignatureNotFound:
+                pass
+        if len(matches) > 1:
+            raise SignatureAmbiguous("multiple architecture gate signatures matched")
+        if matches:
+            return matches[0]
+        raise SignatureNotFound("no architecture gate signature matched (unsupported version?)")
 
 def gate_status(path, gate):
-    with mapped(path) as d:
-        try: return (gate.resolve(d)[0], None)
-        except LookupError: return ("unknown", None)
+    try:
+        ranges = executable_ranges(path)
+        with mapped(path) as d:
+            return (gate.resolve(d, ranges)[0], None)
+    except (LookupError, OSError, ValueError):
+        return ("unknown", None)
 
 def gate_patch(path, gate, app, fname):
     if is_locked(path):
         warn(f"{fname} is locked — close {app} first"); return False
-    with mapped(path) as d:                       # zero-copy scan; mmap closed before we write
-        try: kind, off, g = gate.resolve(d)       # g = the arch-specific gate that matched
-        except LookupError as e: warn(str(e)); return False
-        if kind == "patched": ok(f"{app} already patched"); return True
-    make_backup(path)
-    with open(path, "r+b") as f:
-        f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
+    try:
+        ranges = executable_ranges(path)
+        with mapped(path) as d:                   # zero-copy scan; mmap closed before we write
+            kind, off, g = gate.resolve(d, ranges)  # g = the arch-specific gate that matched
+    except (LookupError, OSError, ValueError) as e:
+        warn(str(e)); return False
+    if kind == "patched":
+        ok(f"{app} already patched"); return True
+    bak = make_backup(path)
+    try:
+        if not filecmp.cmp(path, bak, shallow=False):
+            raise OSError("target changed after backup")
+        ranges = executable_ranges(path)
+        with open(path, "r+b") as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                current_kind, current_off, current_gate = gate.resolve(mm, ranges)
+            finally:
+                mm.close()
+            if current_kind != "unpatched" or current_off != off or current_gate is not g:
+                raise OSError("target changed before patch write")
+            f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
+        ranges = executable_ranges(path)
+        with mapped(path) as d:
+            final_kind, final_off, final_gate = gate.resolve(d, ranges)
+        if final_kind != "patched" or final_off != off or final_gate is not g:
+            raise OSError("post-write signature verification failed")
+    except Exception as e:
+        try:
+            shutil.copy2(bak, path)
+            rolled_back = filecmp.cmp(path, bak, shallow=False)
+        except Exception:
+            rolled_back = False
+        warn(f"{app} patch failed: {e}")
+        warn("original restored from backup" if rolled_back else
+             f"automatic rollback failed — restore {os.path.basename(bak)} manually")
+        return False
     ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
     return True
 
@@ -330,6 +551,7 @@ def manager_default_bins():
 # --------------------------------------------------------------------- IDE ----
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
 IDE_DONE = b"resetIsTierGCPTos(),true"
+IDE_DONE_RE = re.compile(re.escape(IDE_DONE))
 
 def ide_default_mains():
     if os.name == "nt":
@@ -339,11 +561,24 @@ def ide_default_mains():
            else os.path.join("resources", "app", "out", "main.js"))
     return _posix_find(rel, "antigravity-ide", "antigravity")   # Linux/mac: VS Code-fork launcher
 
+def _ide_gate_state(data):
+    ranges = ((0, len(data)),)
+    original = _unique_match(IDE_RE, data, ranges, "unpatched IDE gate")
+    patched = _unique_match(IDE_DONE_RE, data, ranges, "patched IDE gate")
+    if original and patched:
+        raise SignatureAmbiguous("both patched and unpatched IDE gates are present")
+    if original:
+        return "unpatched"
+    if patched:
+        return "patched"
+    raise SignatureNotFound("IDE auth-gate pattern not found (unsupported version?)")
+
 def ide_status(path):
-    with mapped(path) as d:
-        gate = IDE_RE.search(d)
-        if d.find(IDE_DONE) != -1 and not gate: return ("patched", None)
-        return ("unpatched" if gate else "unknown", None)
+    try:
+        with mapped(path) as d:
+            return (_ide_gate_state(d), None)
+    except (LookupError, OSError, ValueError):
+        return ("unknown", None)
 
 def _ide_cache_dirs():
     """VS Code CachedData / Code Cache dirs to drop after patching main.js, so the IDE
@@ -368,11 +603,36 @@ def _ide_cache_dirs():
 def ide_patch(path):
     if is_locked(path): warn("main.js is locked — close Antigravity IDE first"); return False
     with open(path, "rb") as f: d = f.read()
-    if IDE_DONE in d and not IDE_RE.search(d): ok("IDE already patched"); return True
-    if not IDE_RE.search(d):
-        warn("isGoogleInternal auth-gate pattern not found (unsupported version?)"); return False
-    make_backup(path)
-    with open(path, "wb") as f: f.write(IDE_RE.sub(rb"\1true", d))
+    try:
+        kind = _ide_gate_state(d)
+    except LookupError as e:
+        warn(str(e)); return False
+    if kind == "patched":
+        ok("IDE already patched"); return True
+    bak = make_backup(path)
+    try:
+        with open(path, "rb") as f:
+            current = f.read()
+        if current != d or _ide_gate_state(current) != "unpatched":
+            raise OSError("target changed before patch write")
+        patched, count = IDE_RE.subn(rb"\1true", current, count=1)
+        if count != 1:
+            raise OSError(f"expected one IDE gate replacement, got {count}")
+        with open(path, "wb") as f:
+            f.write(patched); f.flush(); os.fsync(f.fileno())
+        with mapped(path) as verified:
+            if _ide_gate_state(verified) != "patched":
+                raise OSError("post-write IDE signature verification failed")
+    except Exception as e:
+        try:
+            shutil.copy2(bak, path)
+            rolled_back = filecmp.cmp(path, bak, shallow=False)
+        except Exception:
+            rolled_back = False
+        warn(f"IDE patch failed: {e}")
+        warn("original restored from backup" if rolled_back else
+             f"automatic rollback failed — restore {os.path.basename(bak)} manually")
+        return False
     for c in _ide_cache_dirs(): rmtree_quiet(c)
     ok("IDE patched (isGoogleInternal -> true) + caches cleared")
     return True
@@ -774,7 +1034,7 @@ def run(action, targets, overrides):
                 if not spec["patch"](path): rc = 1
             elif action == "restore":
                 if spec["status"](path)[0] == "patched":
-                    restore_file(path)
+                    if not restore_file(path, spec["status"]): rc = 1
                 else:
                     warn("not patched — skipping restore (backup may be a different build)")
         except Exception as e:

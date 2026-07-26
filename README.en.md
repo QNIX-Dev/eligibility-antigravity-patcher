@@ -39,7 +39,7 @@
 - 👥 **Account Profile Manager:** Safely store and quickly switch between multiple authorization profiles offline, without the need for browser-based re-authentication.
 - 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
 - ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
-- 🛡️ **Safe & Reversible:** Automatically creates file backups (`*.agybak`) before any modification for a quick, one-click rollback.
+- 🛡️ **Safe & Reversible:** The patcher requires exactly one original or patched signature inside PE/ELF/Mach-O executable sections, verifies the backup and every write, and rolls back automatically on failure. Original files are kept as `*.agybak`.
 - ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, Scoop paths, standard Linux installation prefixes (such as `/opt`, `~/.local/share`, etc.), and macOS `.app` bundles (`/Applications`, `~/Applications`) to automatically locate installations.
 - 🧬 **Version- & Arch-Robust Patching:** Locates instruction signatures using regex patterns rather than brittle static file offsets, and carries per-architecture signatures (x86-64 and aarch64) so the same patch works on Intel and ARM builds alike.
 
