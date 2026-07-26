@@ -1,5 +1,9 @@
 # never commit proprietary binaries, archives, or backups
 *.exe
+*.dmg
+*.tar
+*.tar.gz
+*.tgz
 *.asar
 *.bak
 *.agybak

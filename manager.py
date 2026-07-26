@@ -201,23 +201,42 @@ class Gate:
         if not m: raise LookupError("gate signature not found (unsupported version?)")
         if self.sig.search(data, m.end()): raise LookupError("gate signature is not unique — refusing to guess")
         return ("unpatched", m.start()+self.offset)
+    def resolve(self, data):
+        """(kind, write-offset, concrete-gate). The concrete gate carries the fix bytes
+        and label to apply — so a MultiGate can hand back the arch-matching sub-gate."""
+        kind, off = self.find(data)
+        return kind, off, self
+
+class MultiGate:
+    """One logical gate whose machine code differs per CPU arch (the Manager's auth check
+    compiles to distinct amd64 vs arm64 instructions), so it declares one Gate signature
+    per arch. A given binary matches exactly one — different archs share no byte pattern —
+    so there's no ambiguity; the first that finds a match wins."""
+    def __init__(self, *gates, desc=""):
+        self.gates, self.desc = gates, desc
+    def resolve(self, data):
+        err = None
+        for g in self.gates:
+            try: return g.resolve(data)
+            except LookupError as e: err = e
+        raise err or LookupError("no gate signature matched")
 
 def gate_status(path, gate):
     with mapped(path) as d:
-        try: return (gate.find(d)[0], None)
+        try: return (gate.resolve(d)[0], None)
         except LookupError: return ("unknown", None)
 
 def gate_patch(path, gate, app, fname):
     if is_locked(path):
         warn(f"{fname} is locked — close {app} first"); return False
     with mapped(path) as d:                       # zero-copy scan; mmap closed before we write
-        try: kind, off = gate.find(d)
+        try: kind, off, g = gate.resolve(d)       # g = the arch-specific gate that matched
         except LookupError as e: warn(str(e)); return False
         if kind == "patched": ok(f"{app} already patched"); return True
     make_backup(path)
     with open(path, "r+b") as f:
-        f.seek(off); f.write(gate.fix); f.flush(); os.fsync(f.fileno())
-    ok(f"{app} patched ({gate.desc} @ file 0x{off:x})")
+        f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
+    ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
     return True
 
 # ------------------------------------------------------------------- CLI ------
@@ -259,14 +278,33 @@ def cli_default_paths():
 # AND always falling through to the token-attach branch. (Store offset moved +0x40 ->
 # +0x60 vs older builds; displacements wildcarded via re.S to survive recompiles.)
 # cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2
-MANAGER_GATE = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
-                    rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
-                    b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
+#
+# amd64 covers Windows (incl. Windows-on-ARM, which ships the x64 language_server and runs
+# it under x64 emulation), Linux x86_64 and Intel macOS — Go emits byte-identical code there.
+MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
+                        rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
+                        b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
+
+# aarch64 (Linux arm64, Apple-Silicon macOS). Same validator, arm64 codegen:
+#   ldrb w3,[x0,#8]          ; load hasValidAuth        03 20 40 39
+#   tbz  w3,#0,skip          ; if bit0==0 -> skip attach c3 .. .. 36  (branch disp wildcarded)
+#   ldr  x3,[sp,#..] ; ldr x4,[sp,#..]                  (token halves; sp offsets wildcarded)
+#   stp  x3,x4,[x0,#0x60]    ; attach token             03 10 06 a9
+# Fix (same intent as x64): force the byte true AND drop the branch, always attaching:
+#   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
+# w3 is immediately reloaded by the following `ldr x3,[sp,..]`, so clobbering it is safe.
+MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39\xc3..\x36........\x03\x10\x06\xa9",
+                          rb"\x23\x00\x80\x52\x03\x20\x00\x39........\x03\x10\x06\xa9",
+                          b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)")
+
+MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
 
 def manager_default_bins():
-    rel = os.path.join("resources", "bin", _bin("language_server"))
     if os.name == "nt":
-        return find_marker(rel)                            # Windows: shared registry/env discovery
+        return find_marker(os.path.join("resources", "bin", "language_server.exe"))
+    # macOS keeps it inside the .app bundle (Contents/Resources/bin); Linux uses resources/bin.
+    rel = (os.path.join("Contents", "Resources", "bin", "language_server") if sys.platform == "darwin"
+           else os.path.join("resources", "bin", "language_server"))
     return _posix_find(rel, "antigravity")                 # Linux/mac: launcher `antigravity`
 
 # --------------------------------------------------------------------- IDE ----
@@ -274,9 +312,11 @@ IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInt
 IDE_DONE = b"resetIsTierGCPTos(),true"
 
 def ide_default_mains():
-    rel = os.path.join("resources", "app", "out", "main.js")
     if os.name == "nt":
-        return find_marker(rel)                            # Windows: shared registry/env discovery
+        return find_marker(os.path.join("resources", "app", "out", "main.js"))
+    # macOS bundles main.js under the .app (Contents/Resources/app/out); Linux uses resources/app/out.
+    rel = (os.path.join("Contents", "Resources", "app", "out", "main.js") if sys.platform == "darwin"
+           else os.path.join("resources", "app", "out", "main.js"))
     return _posix_find(rel, "antigravity-ide", "antigravity")   # Linux/mac: VS Code-fork launcher
 
 def ide_status(path):

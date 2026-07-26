@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>Легковесный и мощный менеджер окружения Antigravity (обход региональных ограничений на Windows и Linux, управление несколькими аккаунтами на Windows)</b>
+  <b>Легковесный и мощный менеджер окружения Antigravity (обход региональных ограничений на Windows, Linux и macOS — x64 и arm64; управление несколькими аккаунтами на Windows)</b>
 </p>
 
 <p align="center">
@@ -10,6 +10,8 @@
 <p align="center">
   <a href="https://microsoft.com/windows"><img src="https://img.shields.io/badge/OS-Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="OS - Windows"></a>
   <a href="https://www.linux.org"><img src="https://img.shields.io/badge/OS-Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="OS - Linux"></a>
+  <a href="https://www.apple.com/macos"><img src="https://img.shields.io/badge/OS-macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="OS - macOS"></a>
+  <a href="https://en.wikipedia.org/wiki/AArch64"><img src="https://img.shields.io/badge/Arch-x64_%7C_arm64-4B5563?style=flat-square" alt="Arch - x64 | arm64"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python - 3.8+"></a>
   <a href="https://github.com/QNIX-Dev/eligibility-antigravity-patcher"><img src="https://img.shields.io/badge/Core_Deps-None-brightgreen?style=flat-square" alt="Core Dependencies - None"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License - MIT"></a>
@@ -38,8 +40,8 @@
 - 🎨 **Интерактивный TUI:** Удобное консольное меню для управления патчами и аккаунтами на базе библиотек `rich` и `questionary`.
 - ⚡ **Ядро без зависимостей:** Все основные консольные команды работают на стандартной библиотеке Python без необходимости установки сторонних пакетов.
 - 🛡️ **Безопасность и откат:** Автоматическое резервное копирование (`*.agybak`) файлов перед модификацией для безопасного отката изменений в один клик.
-- ⚙️ **Умный автопоиск:** Автоматическое сканирование реестра Windows, системного PATH, переменных окружения и путей Scoop, а также стандартных путей установки в Linux (`/opt`, `~/.local/share` и др.) для динамического обнаружения установленных приложений.
-- 🧬 **Устойчивость к обновлениям:** Поиск уникальных сигнатур и инструкций через регулярные выражения вместо привязки к статическим файловым смещениям.
+- ⚙️ **Умный автопоиск:** Автоматическое сканирование реестра Windows, системного PATH, переменных окружения и путей Scoop, стандартных путей установки в Linux (`/opt`, `~/.local/share` и др.), а также `.app`-бандлов в macOS (`/Applications`, `~/Applications`) для динамического обнаружения установленных приложений.
+- 🧬 **Устойчивость к обновлениям и архитектурам:** Поиск уникальных сигнатур инструкций через регулярные выражения вместо привязки к статическим смещениям, плюс отдельные сигнатуры под каждую архитектуру (x86-64 и aarch64) — один и тот же патч работает и на Intel-, и на ARM-сборках.
 
 ---
 
@@ -98,7 +100,9 @@
 | **`ide`** | **`Antigravity IDE`** (VS Code) | Патч минифицированного скрипта запуска VS Code для принудительного включения флага `isGoogleInternal`. | `resources/app/out/main.js` |
 
 > [!NOTE]
-> **Поддержка платформ:** Все три патча (`cli`, `manager`, `ide`) являются кросс-платформенными и поддерживают Windows и Linux. В Linux автопоиск сканирует стандартные префиксы установки (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, каталог лаунчера `antigravity` и `antigravity-ide` из `PATH`). Для нестандартных путей укажите их вручную с помощью флагов командной строки (например, `--path-cli`). Перед патчем закройте приложения, чтобы избежать блокировок файлов. Управление аккаунтами (`accounts`) на данный момент поддерживается только в Windows.
+> **Поддержка платформ:** Все три патча (`cli`, `manager`, `ide`) кросс-платформенные (Windows, Linux, macOS) и покрывают обе архитектуры — **x86-64 и arm64**. Патч `manager` содержит две сигнатуры машинного кода и автоматически выбирает нужную: x64-сигнатура покрывает Windows (в том числе Windows-on-ARM, где бэкенд поставляется в x64-версии и работает через эмуляцию), Linux x64 и Intel-macOS; отдельная aarch64-сигнатура покрывает Linux arm64 и macOS на Apple Silicon. Патч `ide` — это JavaScript, поэтому от архитектуры не зависит в принципе.
+>
+> В Linux автопоиск сканирует стандартные префиксы установки (`/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, каталог лаунчера `antigravity` и `antigravity-ide` из `PATH`). В macOS сканируются `.app`-бандлы в `/Applications` и `~/Applications` (бинарники лежат внутри `Contents/Resources/`). Для нестандартных путей укажите их вручную с помощью флагов командной строки (например, `--path-cli`). Перед патчем закройте приложения, чтобы избежать блокировок файлов. Управление аккаунтами (`accounts`) на данный момент поддерживается только в Windows.
 
 ---
 
@@ -153,6 +157,7 @@ CLI выводит при запуске косметическую секцию
 1. Патчер ищет в валидаторе сигнатуру проверки: `cmp byte ptr [rax+8], 0` → `je` (уводит выполнение в обход привязки токена).
 2. Проверка вместе с переходом перезаписывается на `mov byte ptr [rax+8], 1` + `NOP`: флаг принудительно выставляется в `true`, а нейтрализованный `je` гарантирует, что выполнение всегда идёт в ветку привязки и сохранения токена.
 3. Именно результат этого валидатора возвращает `GetAuthStatus` и на него же опирается функция логина, поэтому одного патча достаточно для всех сценариев — и первого входа, и последующих перезапусков. Токен сохраняется на диске, а экран ошибки не отображается.
+4. **Сборки arm64** (Linux arm64, macOS на Apple Silicon) содержат идентичную логику в коде AArch64: `ldrb w,[x,#8]` → `tbz w,#0,skip` → `stp` (привязка токена по смещению `+0x60`). Для них у патчера есть вторая сигнатура, которая переписывает `ldrb;tbz` в `mov w,#1 ; strb w,[x,#8]` — принудительно выставляет флаг в `true` и убирает переход, так что токен привязывается всегда. Класс `MultiGate` по очереди пробует x64- и arm64-сигнатуры; любой конкретный бинарник совпадает ровно с одной из них.
 </details>
 
 <details>
