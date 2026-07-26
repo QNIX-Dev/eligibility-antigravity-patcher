@@ -47,14 +47,16 @@
 
 ## <a id="quick-start"></a>🚀 Quick Start
 
-Clone the repository and enter its directory first:
+### 1. Clone the repository and enter the directory
 
 ```bash
 git clone https://github.com/QNIX-Dev/eligibility-antigravity-patcher.git
 cd eligibility-antigravity-patcher
 ```
 
-### Option A: Interactive TUI (Recommended)
+### 2. Choose execution mode
+
+#### Option A: Interactive TUI (Recommended)
 
 Launches the complete terminal dashboard with live status reports for managing both patches and profiles:
 
@@ -71,7 +73,7 @@ Launches the complete terminal dashboard with live status reports for managing b
 
 ---
 
-### Option B: Scriptable CLI (No Dependencies)
+#### Option B: Scriptable CLI (No Dependencies)
 
 Runs purely on the Python Standard Library (no installation required). Ideal for automation or direct execution from standard terminals.
 
