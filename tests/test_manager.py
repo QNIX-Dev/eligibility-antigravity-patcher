@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import sqlite3
 import struct
 import tempfile
 import unittest
@@ -224,6 +225,44 @@ class TransactionTests(unittest.TestCase):
             manager._ide_gate_state(original + b";" + original)
         with self.assertRaises(manager.SignatureAmbiguous):
             manager._ide_gate_state(original + b";" + patched)
+
+
+class LinuxSupportTests(unittest.TestCase):
+    def test_posix_ide_profiles_are_private_and_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_STATE_HOME": tmp}):
+            manager.profile_save("ide", "work", {"version": 1, "ide": {"token": {"s": "x"}}})
+            profile = os.path.join(tmp, "agy-manager", "profiles", "ide", "work.json")
+            self.assertEqual(manager.profile_names("ide"), ["work"])
+            self.assertEqual(manager.profile_load("ide", "work")["version"], 1)
+            self.assertEqual(os.stat(profile).st_mode & 0o777, 0o600)
+            self.assertEqual(manager._profile_delete("ide", "work"), 1)
+
+    def test_linux_ide_database_uses_xdg_config_home(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+            db = os.path.join(tmp, "Antigravity IDE", "User", "globalStorage", "state.vscdb")
+            os.makedirs(os.path.dirname(db))
+            sqlite3.connect(db).close()
+            self.assertEqual(manager._ide_state_db(), db)
+
+    def test_linux_ide_profile_can_be_saved_and_restored(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"XDG_CONFIG_HOME": tmp, "XDG_STATE_HOME": tmp}):
+            db = os.path.join(tmp, "Antigravity", "User", "globalStorage", "state.vscdb")
+            os.makedirs(os.path.dirname(db))
+            con = sqlite3.connect(db)
+            con.execute("create table ItemTable (key text primary key, value)")
+            con.execute("insert into ItemTable values (?, ?)",
+                        ("antigravityUnifiedStateSync.userStatus", "first"))
+            con.commit(); con.close()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manager.acct_save("ide", "work"), 0)
+                manager.ide_write({"antigravityUnifiedStateSync.userStatus": "second"})
+                self.assertEqual(manager.acct_use("ide", "work"), 0)
+            self.assertEqual(manager.ide_read()["antigravityUnifiedStateSync.userStatus"], "first")
+
+    def test_profile_names_reject_path_traversal(self):
+        self.assertFalse(manager._valid_profile_name("../not-a-profile"))
+        self.assertFalse(manager._valid_profile_name("a\\b"))
 
 
 if __name__ == "__main__":

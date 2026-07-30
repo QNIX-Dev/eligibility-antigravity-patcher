@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Patch Antigravity eligibility gates and manage Windows login profiles."""
+"""Patch Antigravity eligibility gates and manage local login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, struct, sys, time
+import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, struct, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
@@ -278,12 +278,18 @@ def find_marker(rel):
     return _dedup_newest(hits)
 
 def _posix_install_roots(*launchers):
+    """Return likely installation prefixes on Linux and macOS."""
     home = os.path.expanduser("~")
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+    data_dirs = [p for p in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if p]
     roots = ["/opt", "/usr/share", "/usr/lib", "/usr/local/share", "/usr/local/lib",
              "/Applications",
-             os.path.join(home, ".local", "share"),
-             os.path.join(home, "Applications"),
-             os.path.join(home, "Downloads"), home]
+             data_home, *data_dirs, os.path.join(home, ".local", "lib"),
+             os.path.join(home, ".local", "opt"), os.path.join(home, ".var", "app"),
+             "/var/lib/flatpak/app", "/snap", os.path.join(home, "snap"),
+             os.path.join(home, "Applications"), os.path.join(home, "Downloads"), home]
+    for var in ("ANTIGRAVITY_HOME", "AGY_HOME"):
+        if os.environ.get(var): roots.append(os.environ[var])
     for launcher in launchers:
         w = shutil.which(launcher)
         if w: roots.append(os.path.dirname(os.path.realpath(w)))
@@ -449,7 +455,7 @@ def cli_default_paths():
         cands += [os.path.join(d, "agy") for d in
                   (os.path.join(home, ".local", "bin"), os.path.join(home, "bin"),
                    "/usr/local/bin", "/usr/bin", "/opt/homebrew/bin")]
-    return _dedup_newest(cands)
+    return _dedup_newest([os.path.realpath(p) for p in cands])
 
 # Manager auth result
 # x64: force hasValidAuth and fall through to token attachment.
@@ -516,7 +522,8 @@ def _ide_cache_dirs():
         bases = [os.path.join(home, "Library", "Application Support", "Antigravity IDE")]
     else:
         cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-        bases = [os.path.join(cfg, "Antigravity IDE")]
+        bases = [os.path.join(cfg, name) for name in
+                 ("Antigravity IDE", "Antigravity", "antigravity-ide", "antigravity")]
     dirs = []
     for base in bases:
         dirs += [os.path.join(base, "CachedData"),
@@ -625,8 +632,17 @@ def cred_enum(prefix):
 def _ide_state_db():
     """Return the newest IDE state database."""
     cands = []
-    for base in (r"%USERPROFILE%\scoop\persist\antigravity-ide\data\user-data",
-                 r"%APPDATA%\Antigravity IDE"):
+    if os.name == "nt":
+        bases = (r"%USERPROFILE%\scoop\persist\antigravity-ide\data\user-data",
+                 r"%APPDATA%\Antigravity IDE")
+    elif sys.platform == "darwin":
+        support = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+        bases = (os.path.join(support, "Antigravity IDE"), os.path.join(support, "Antigravity"))
+    else:
+        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+        bases = tuple(os.path.join(config_home, name) for name in
+                      ("Antigravity IDE", "Antigravity", "antigravity-ide", "antigravity"))
+    for base in bases:
         p = os.path.join(os.path.expandvars(base), "User", "globalStorage", "state.vscdb")
         if os.path.isfile(p): cands.append(p)
     return max(cands, key=os.path.getmtime) if cands else None
@@ -724,11 +740,37 @@ _CHUNK = 2000
 def _acct_prefix(target_type):
     return f"agy-manager:account:{target_type}:"
 
+def _profile_dir(target_type):
+    """Private POSIX profile store; Windows continues to use Credential Manager."""
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state_home, "agy-manager", "profiles", target_type)
+
+def _valid_profile_name(name):
+    return bool(name) and name not in (".", "..") and "/" not in name and "\\" not in name
+
+def _profile_path(target_type, name):
+    if not _valid_profile_name(name):
+        raise ValueError("account name cannot contain path separators")
+    return os.path.join(_profile_dir(target_type), name + ".json")
+
 def profile_names(target_type):
+    if os.name != "nt":
+        directory = _profile_dir(target_type)
+        try:
+            return sorted(p[:-5] for p in os.listdir(directory) if p.endswith(".json") and
+                          os.path.isfile(os.path.join(directory, p)))
+        except FileNotFoundError:
+            return []
     prefix = _acct_prefix(target_type)
     return sorted({t[len(prefix):].rsplit("/", 1)[0] for t in cred_enum(prefix)})
 
 def profile_load(target_type, name):
+    if os.name != "nt":
+        try:
+            with open(_profile_path(target_type, name), encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
     prefix = _acct_prefix(target_type)
     chunks, i = [], 0
     while True:
@@ -738,12 +780,35 @@ def profile_load(target_type, name):
     return json.loads(b"".join(chunks)) if chunks else None
 
 def _profile_delete(target_type, name):
+    if os.name != "nt":
+        try:
+            os.unlink(_profile_path(target_type, name))
+            return 1
+        except FileNotFoundError:
+            return 0
     prefix = _acct_prefix(target_type)
     i = n = 0
     while cred_delete(f"{prefix}{name}/{i}"): n += 1; i += 1
     return n
 
 def profile_save(target_type, name, bundle):
+    if not _valid_profile_name(name):
+        raise ValueError("account name cannot contain path separators")
+    if os.name != "nt":
+        directory = _profile_dir(target_type)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try: os.chmod(directory, 0o700)
+        except OSError: pass
+        fd, temporary = tempfile.mkstemp(prefix=".profile-", suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(bundle, f, separators=(",", ":"))
+                f.flush(); os.fsync(f.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, _profile_path(target_type, name))
+        finally:
+            if os.path.exists(temporary): os.unlink(temporary)
+        return
     prefix = _acct_prefix(target_type)
     _profile_delete(target_type, name)
     data = json.dumps(bundle).encode("utf-8")
@@ -809,8 +874,8 @@ def acct_current(target_type):
     return 0
 
 def acct_save(target_type, name):
-    if "/" in name:
-        warn("account name can't contain '/'"); return 1
+    if not _valid_profile_name(name):
+        warn("account name can't contain path separators"); return 1
     snap = _snapshot(target_type)
     if target_type == "cli-manager":
         if not snap["cred"]:
@@ -846,8 +911,8 @@ def acct_rm(target_type, name):
     warn(f"no saved account '{name}'"); return 1
 
 def acct_rename(target_type, old_name, new_name):
-    if "/" in new_name:
-        warn("new name can't contain '/'"); return 1
+    if not _valid_profile_name(new_name):
+        warn("new account name can't contain path separators"); return 1
     target = profile_load(target_type, old_name)
     if target is None:
         warn(f"no saved account '{old_name}'"); return 1
@@ -882,8 +947,6 @@ def acct_logout(target_type):
     return 0
 
 def run_accounts(argv):
-    if os.name != "nt":
-        warn("account management is Windows-only"); return 2
     if not argv:
         warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
     
@@ -891,6 +954,9 @@ def run_accounts(argv):
     if target_type not in ("cli-manager", "ide"):
         warn(f"unknown account target '{target_type}' (choose: cli-manager | ide)")
         warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
+    if os.name != "nt" and target_type != "ide":
+        warn("CLI + Manager profile switching needs Windows Credential Manager; Linux supports IDE profiles")
+        return 2
 
     sub = (argv[1] if len(argv) > 1 else "list").lower()
     arg = argv[2] if len(argv) > 2 else None
@@ -987,6 +1053,9 @@ def _render(console, paths, status):
             cur_ide = current_account("ide")
         except Exception:
             pass
+    elif _ide_state_db():
+        try: cur_ide = current_account("ide")
+        except Exception: pass
 
     tbl = Table(box=None, expand=True, pad_edge=False)
     tbl.add_column("App", style="bold cyan", no_wrap=True)
@@ -1064,16 +1133,11 @@ def _accounts_submenu(console, qs, target_type):
 
 def _accounts_menu(console, qs):
     import questionary
-    if os.name != "nt":
-        console.print("[yellow]Account management is Windows-only.[/]")
-        questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return
     while True:
         console.clear()
-        act = questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
-            questionary.Choice("CLI + Manager", "cli-manager"),
-            questionary.Choice("IDE", "ide"),
-            questionary.Choice("Back", "back"),
-        ]).ask()
+        choices = [questionary.Choice("IDE", "ide"), questionary.Choice("Back", "back")]
+        if os.name == "nt": choices.insert(0, questionary.Choice("CLI + Manager", "cli-manager"))
+        act = questionary.select("Manage accounts for:", style=qs, qmark="»", choices=choices).ask()
         if act in (None, "back"): return
         _accounts_submenu(console, qs, act)
 

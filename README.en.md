@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; multi-account profile switching on Windows)</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; IDE profiles on Linux)</b>
 </p>
 
 <p align="center">
@@ -56,7 +56,27 @@ cd eligibility-antigravity-patcher
 
 ### 2. Choose execution mode
 
-#### Option A: Interactive TUI (Recommended)
+#### Option A: Standalone runtime (Windows / Linux)
+
+Every GitHub Release publishes verified, dependency-free runtimes. On Linux (x64 and arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/QNIX-Dev/eligibility-antigravity-patcher/main/scripts/install.sh | sh
+agy-manager status
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/QNIX-Dev/eligibility-antigravity-patcher/main/scripts/install.ps1 | iex
+agy-manager status
+```
+
+The installers download the latest release asset and verify it against `SHA256SUMS`. Linux installs to `~/.local/bin` by default (override with `AGY_MANAGER_INSTALL_DIR`); Windows installs to `%LOCALAPPDATA%\agy-manager\bin` and adds it to the user `PATH`.
+
+---
+
+#### Option B: Interactive TUI (Recommended)
 
 Launches the complete terminal dashboard with live status reports for managing both patches and profiles:
 
@@ -73,7 +93,7 @@ Launches the complete terminal dashboard with live status reports for managing b
 
 ---
 
-#### Option B: Scriptable CLI (No Dependencies)
+#### Option C: Scriptable CLI (No Dependencies)
 
 Runs purely on the Python Standard Library (no installation required). Ideal for automation or direct execution from standard terminals.
 
@@ -111,7 +131,7 @@ The tool modifies local eligibility gates, allowing the client applications to r
 > [!NOTE]
 > **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform (Windows, Linux, macOS) and cover both **x86-64 and arm64** architectures. The `manager` patch carries two machine-code signatures and auto-selects the right one: the x64 signature covers Windows (including Windows-on-ARM, which ships the x64 backend and runs it under emulation), Linux x64 and Intel macOS; a dedicated aarch64 signature covers Linux arm64 and Apple-Silicon macOS. The `ide` patch is JavaScript, so it is architecture-independent by nature.
 >
-> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`). For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
+> On Linux, autodetection scans the standard prefixes, XDG data directories, Flatpak/Snap locations, `~/.local`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`. Set `ANTIGRAVITY_HOME` or `AGY_HOME` to add a custom installation root, or specify an exact executable using `--path-cli`, `--path-manager`, or `--path-ide`. Ensure the applications are closed before patching. IDE account profiles also work on Linux: the active IDE state is read from its XDG configuration database and saved profiles are stored atomically with owner-only permissions under `$XDG_STATE_HOME/agy-manager` (default: `~/.local/state/agy-manager`). CLI + Manager account switching still depends on Windows Credential Manager.
 
 ---
 
@@ -185,7 +205,7 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 Profile switching is fully offline and does not call standard logout endpoints (which would revoke tokens on the server).
 
 1. **Storage Separation:** CLI/Manager tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
-2. **Secure Persistence:** On `save`, active credentials are read, encoded, and saved back to Windows Credential Manager under unique prefixed names: `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
+2. **Secure Persistence:** Windows stores profiles in Credential Manager under unique prefixed names. On Linux, IDE profiles are stored as owner-only (`0600`) JSON files under `$XDG_STATE_HOME/agy-manager` (default: `~/.local/state/agy-manager`); writes are atomic.
 3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
 4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.
 </details>
@@ -197,7 +217,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 - **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
 - **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
 - **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
-- **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
+- **Token Security:** All credentials and profiles remain local and are never sent to external services. Windows uses Credential Manager; Linux IDE profiles use owner-only files under `$XDG_STATE_HOME/agy-manager`.
 - **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.
 
 ---
