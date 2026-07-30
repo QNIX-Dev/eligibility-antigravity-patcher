@@ -107,6 +107,35 @@ class GateStateTests(unittest.TestCase):
         with self.assertRaises(manager.SignatureAmbiguous):
             multi.resolve(b"ORIG--ARCH")
 
+    def test_current_cli_x64_signature_and_patch(self):
+        source = (
+            b"\x48\x85\xc0\x0f\x84\xf6\x01\x00\x00"
+            b"\x80\x78\x08\x00\x0f\x85\xec\x01\x00\x00"
+            b"\xe8\x12\x34\x56\x78"
+            b"\x48\x89\x44\x24\x78\x48\x89\x5c\x24\x48"
+            b"\x48\x89\x4c\x24\x68"
+        )
+        state, offset, gate = manager.CLI_GATE.resolve(source)
+        self.assertEqual((state, offset, gate), ("unpatched", 9, manager.CLI_GATE_X64))
+        patched = bytearray(source)
+        patched[offset:offset + len(gate.fix)] = gate.fix
+        self.assertEqual(manager.CLI_GATE.resolve(patched)[:2], ("patched", 9))
+
+    def test_current_cli_arm64_signature_and_patch(self):
+        source = (
+            b"\xe1\x18\x00\xb5"
+            b"\x80\x0d\x00\xb4"
+            b"\x01\x20\x40\x39"
+            b"\x41\x0d\x00\x37"
+            b"\x35\x94\xff\x97"
+            b"\xe0\x43\x00\xf9\xe1\x2b\x00\xf9\xe2\x3b\x00\xf9"
+        )
+        state, offset, gate = manager.CLI_GATE.resolve(source)
+        self.assertEqual((state, offset, gate), ("unpatched", 8, manager.CLI_GATE_ARM64))
+        patched = bytearray(source)
+        patched[offset:offset + len(gate.fix)] = gate.fix
+        self.assertEqual(manager.CLI_GATE.resolve(patched)[:2], ("patched", 8))
+
 
 class ExecutableRangeTests(unittest.TestCase):
     def _ranges(self, payload):
