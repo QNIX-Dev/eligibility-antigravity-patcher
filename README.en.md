@@ -153,10 +153,10 @@ Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]
 
 At startup, the CLI renders an "Eligibility Check" section. The check resides in the `handleAuthResult` routine, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned by the server.
 
-1. The patcher scans the binary for the unique gate instruction signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible).
+1. In the current **agy 1.1.9 x64** build, the patcher scans for the unique gate signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8],0` → `jne` (eligible) → `call failure_builder` → spills of `rax`, `rbx`, and `rcx` to `[rsp+0x80]`, `[rsp+0x50]`, and `[rsp+0x70]`.
 2. If `hasValidAuth` is zero, execution falls through and prints the location error.
-3. The patch rewrites the `cmp byte ptr [rax+8], 0` check to `test rax,rax` (+`NOP`). Since `rax` is always non-null here, the `jne` jump is always taken, resolving the check to "eligible".
-4. In current native **arm64 builds** for Windows, Linux, and macOS, the outer check before the failure builder is emitted as `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder`. The patch replaces the flag load with `mov w1,#1`, so the existing `tbnz` always selects the eligible branch. A `MultiGate` automatically selects the x64 or arm64 signature.
+3. The patch rewrites `cmp byte ptr [rax+8],0` to `test rax,rax` (+`NOP`). Since `rax` is always non-null here, the `jne` jump always selects the “eligible” branch.
+4. In the current **agy 1.1.9 arm64 builds** for Windows, Linux, and macOS, the outer check is emitted as `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder` → spills of `x0`, `x1`, and `x2` to `[sp,#0x90]`, `[sp,#0x60]`, and `[sp,#0x80]`. The patch replaces the flag load with `mov w1,#1`, so the existing `tbnz` always selects the eligible branch. A `MultiGate` automatically selects the x64 or arm64 signature.
 </details>
 
 <details>

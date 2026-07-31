@@ -153,10 +153,10 @@ cd eligibility-antigravity-patcher
 
 CLI выводит при запуске косметическую секцию «Eligibility Check». Решение о её показе принимается в функции `handleAuthResult`, которая читает поле `hasValidAuth` (байт по смещению `+8`) из AuthResult, пришедшего с сервера.
 
-1. Патчер сканирует бинарник в поисках уникальной сигнатуры проверки гейта: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8], 0` → `jne` (eligible).
+1. В актуальной **agy 1.1.9 x64** патчер ищет уникальную сигнатуру проверки гейта: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8],0` → `jne` (eligible) → `call failure_builder` → сохранение `rax`, `rbx` и `rcx` в `[rsp+0x80]`, `[rsp+0x50]` и `[rsp+0x70]`.
 2. При нулевом `hasValidAuth` выполнение проваливается дальше и печатает ошибку.
-3. Патч заменяет `cmp byte ptr [rax+8], 0` на `test rax,rax` (+`NOP`). Так как `rax` здесь гарантированно не равен нулю, переход `jne` всегда уводит выполнение в ветку «eligible».
-4. В актуальных нативных **arm64-сборках** Windows, Linux и macOS внешняя проверка перед построением ошибки выглядит как `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder`. Патч заменяет загрузку флага на `mov w1,#1`, поэтому существующий `tbnz` всегда выбирает ветку «eligible». `MultiGate` автоматически выбирает x64- или arm64-сигнатуру.
+3. Патч заменяет `cmp byte ptr [rax+8],0` на `test rax,rax` (+`NOP`). Так как `rax` здесь гарантированно не равен нулю, переход `jne` всегда уводит выполнение в ветку «eligible».
+4. В актуальных **agy 1.1.9 arm64-сборках** Windows, Linux и macOS внешняя проверка выглядит как `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder` → сохранение `x0`, `x1` и `x2` в `[sp,#0x90]`, `[sp,#0x60]` и `[sp,#0x80]`. Патч заменяет загрузку флага на `mov w1,#1`, поэтому существующий `tbnz` всегда выбирает ветку «eligible». `MultiGate` автоматически выбирает x64- или arm64-сигнатуру.
 </details>
 
 <details>
