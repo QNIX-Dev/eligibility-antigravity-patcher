@@ -153,10 +153,10 @@ Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]
 
 At startup, the CLI renders an "Eligibility Check" section. The check resides in the `handleAuthResult` routine, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned by the server.
 
-1. In the current **agy 1.1.9 x64** build, the patcher scans for the unique gate signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8],0` → `jne` (eligible) → `call failure_builder` → spills of `rax`, `rbx`, and `rcx` to `[rsp+0x80]`, `[rsp+0x50]`, and `[rsp+0x70]`.
-2. If `hasValidAuth` is zero, execution falls through and prints the location error.
-3. The patch rewrites `cmp byte ptr [rax+8],0` to `test rax,rax` (+`NOP`). Since `rax` is always non-null here, the `jne` jump always selects the “eligible” branch.
-4. In the current **agy 1.1.9 arm64 builds** for Windows, Linux, and macOS, the outer check is emitted as `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder` → spills of `x0`, `x1`, and `x2` to `[sp,#0x90]`, `[sp,#0x60]`, and `[sp,#0x80]`. The patch replaces the flag load with `mov w1,#1`, so the existing `tbnz` always selects the eligible branch. A `MultiGate` automatically selects the x64 or arm64 signature.
+1. **x64 builds:** The patcher scans for the unique gate signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8],0` → `jne` (eligible) → `call failure_builder` → spills of `rax`, `rbx`, and `rcx` to `[rsp+0x80]`, `[rsp+0x50]`, and `[rsp+0x70]`.
+2. Without the patch, a zero `hasValidAuth` execution falls through and prints the error. The patch rewrites `cmp byte ptr [rax+8],0` to `test rax,rax` (+`NOP`): since `rax` is non-null here, the `jne` jump always selects the “eligible” branch.
+3. This neutralizes the warning across all scenarios — both initial login and subsequent CLI runs — while all features continue operating normally.
+4. **arm64 builds** (Windows, Linux, and macOS) contain the outer check: `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder` → spills of `x0`, `x1`, and `x2` to `[sp,#0x90]`, `[sp,#0x60]`, and `[sp,#0x80]`. The patch replaces the flag load with `mov w1,#1`, so the existing `tbnz` always selects the eligible branch. The `MultiGate` class automatically selects the x64 or arm64 signature.
 </details>
 
 <details>
@@ -164,10 +164,10 @@ At startup, the CLI renders an "Eligibility Check" section. The check resides in
 
 The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
 
-1. The tool searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
+1. **x64 builds:** The patcher searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
 2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
 3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
-4. **arm64 builds** (Linux arm64, Apple-Silicon macOS) carry the identical logic in AArch64 code: `ldrb w,[x,#8]` → `tbz w,#0,skip` → `stp` (token attach at `+0x60`). The patcher holds a second signature for this and rewrites `ldrb;tbz` into `mov w,#1 ; strb w,[x,#8]` — forcing the flag to `true` and dropping the branch so the token is always attached. A `MultiGate` tries the x64 and arm64 signatures in turn; any given binary matches exactly one.
+4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain identical logic in AArch64 code: `ldrb w,[x,#8]` → `tbz w,#0,skip` → `stp` (token attach at `+0x60`). The patch rewrites `ldrb;tbz` into `mov w,#1 ; strb w,[x,#8]` — forcing the flag to `true` and dropping the branch so the token is always attached. The `MultiGate` class automatically selects the x64 or arm64 signature.
 </details>
 
 <details>
