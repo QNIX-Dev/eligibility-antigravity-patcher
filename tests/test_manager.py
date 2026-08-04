@@ -159,6 +159,38 @@ class GateStateTests(unittest.TestCase):
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(previous)
 
+    def test_manager_arm64_old_and_new_signatures_patch(self):
+        old = (
+            b"\x03\x20\x40\x39"
+            b"\xc3\x01\x00\x36"
+            b"\xe3\x03\x40\xf9\xe4\x13\x48\xa9"
+            b"\x03\x10\x06\xa9"
+        )
+        current = (
+            b"\x03\x20\x40\x39"
+            b"\xa3\x01\x00\x36"
+            b"\xe3\x13\x48\xa9"
+            b"\x03\x10\x06\xa9"
+        )
+        for source in (old, current):
+            with self.subTest(source=source.hex()):
+                state, offset, gate = manager.MANAGER_GATE.resolve(source)
+                self.assertEqual((state, offset, gate),
+                                 ("unpatched", 0, manager.MANAGER_GATE_ARM64))
+                patched = bytearray(source)
+                patched[offset:offset + len(gate.fix)] = gate.fix
+                self.assertEqual(manager.MANAGER_GATE.resolve(patched)[:2], ("patched", 0))
+
+    def test_manager_arm64_signature_requires_tbz_w3(self):
+        wrong_register = (
+            b"\x03\x20\x40\x39"
+            b"\xa4\x01\x00\x36"
+            b"\xe3\x13\x48\xa9"
+            b"\x03\x10\x06\xa9"
+        )
+        with self.assertRaises(manager.SignatureNotFound):
+            manager.MANAGER_GATE.resolve(wrong_register)
+
 
 class ExecutableRangeTests(unittest.TestCase):
     def _ranges(self, payload):

@@ -167,7 +167,7 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 1. **x64 builds:** The patcher searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
 2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
 3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
-4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain identical logic in AArch64 code: `ldrb w,[x,#8]` → `tbz w,#0,skip` → `stp` (token attach at `+0x60`). The patch rewrites `ldrb;tbz` into `mov w,#1 ; strb w,[x,#8]` — forcing the flag to `true` and dropping the branch so the token is always attached. The `MultiGate` class automatically selects the x64 or arm64 signature.
+4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain identical logic in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → one or two setup instructions → `stp x3,x4,[x0,#0x60]` (token attach at `+0x60`). The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]` — forcing the flag to `true` and dropping the branch so the token is always attached. The `MultiGate` class automatically selects the x64 or arm64 signature.
 </details>
 
 <details>
