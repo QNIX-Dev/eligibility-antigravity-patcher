@@ -452,13 +452,11 @@ def _cli_arm64_context(data, match, start, end):
     return ((cbnz_x1 & 0xff00001f) == 0xb5000001 and
             (cbz_x0 & 0xff00001f) == 0xb4000000)
 
-_ARM64_TBNZ_W1_BIT0 = rb"[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
-_ARM64_BL = rb"...[\x94-\x97]"
-_CLI_ARM64_TAIL = (_ARM64_TBNZ_W1_BIT0 + _ARM64_BL +
-                   rb"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9")
 CLI_GATE_ARM64 = Gate(
-    rb"\x01\x20\x40\x39" + _CLI_ARM64_TAIL,
-    rb"\x21\x00\x80\x52" + _CLI_ARM64_TAIL,
+    rb"\x01\x20\x40\x39[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
+    rb"\x21\x00\x80\x52[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
     b"\x21\x00\x80\x52", desc="eligibility screen off (arm64)",
     arch="arm64", accept=_cli_arm64_context)
 
@@ -490,12 +488,12 @@ MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
 
 # arm64: force hasValidAuth and remove the token-attachment branch.
 #   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
-# The branch displacement spans the low byte, so accept every encoding that keeps
-# Rt=w3. Builds use either one or two setup instructions before the token stp.
-_ARM64_TBZ_W3_BIT0 = rb"[\x03\x23\x43\x63\x83\xa3\xc3\xe3]..\x36"
-_ARM64_TOKEN_SETUP = rb"(?:....){1,2}\x03\x10\x06\xa9"
-MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39" + _ARM64_TBZ_W3_BIT0 + _ARM64_TOKEN_SETUP,
-                          rb"\x23\x00\x80\x52\x03\x20\x00\x39" + _ARM64_TOKEN_SETUP,
+# Accept every branch displacement while fixing Rt=w3 and bit #0. Builds use
+# either one or two setup instructions before the token stp.
+MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39[\x03\x23\x43\x63\x83\xa3\xc3\xe3]."
+                          rb"[\x00-\x07]\x36(?:....){1,2}\x03\x10\x06\xa9",
+                          rb"\x23\x00\x80\x52\x03\x20\x00\x39(?:....){1,2}"
+                          rb"\x03\x10\x06\xa9",
                           b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)",
                           arch="arm64")
 
