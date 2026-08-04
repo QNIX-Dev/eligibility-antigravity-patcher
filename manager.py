@@ -98,11 +98,16 @@ def _normalized_ranges(ranges, file_size):
             out.append((start, end))
     return tuple(out)
 
-def _pe_executable_ranges(f, file_size):
+def _machine_arch(machine):
+    return {0x8664: "x64", 0xaa64: "arm64", 0x3e: "x64", 0xb7: "arm64",
+            0x01000007: "x64", 0x0100000c: "arm64"}.get(machine)
+
+def _pe_executable_info(f, file_size):
     pe = struct.unpack("<I", _read_exact(f, 0x3c, 4))[0]
     if _read_exact(f, pe, 4) != b"PE\0\0":
         raise ValueError("invalid PE signature")
     coff = _read_exact(f, pe + 4, 20)
+    arch = _machine_arch(struct.unpack_from("<H", coff, 0)[0])
     section_count = struct.unpack_from("<H", coff, 2)[0]
     optional_size = struct.unpack_from("<H", coff, 16)[0]
     section_table = pe + 24 + optional_size
@@ -113,14 +118,15 @@ def _pe_executable_ranges(f, file_size):
         characteristics = struct.unpack_from("<I", section, 36)[0]
         if characteristics & 0x20000000:
             ranges.append((raw_offset, raw_offset + raw_size))
-    return _normalized_ranges(ranges, file_size)
+    return _normalized_ranges(ranges, file_size), arch
 
-def _elf_executable_ranges(f, file_size):
+def _elf_executable_info(f, file_size):
     ident = _read_exact(f, 0, 16)
     elf_class, data_order = ident[4], ident[5]
     endian = "<" if data_order == 1 else ">" if data_order == 2 else None
     if endian is None:
         raise ValueError("unknown ELF byte order")
+    machine = struct.unpack(endian + "H", _read_exact(f, 18, 2))[0]
     if elf_class == 2:
         header = _read_exact(f, 0, 64)
         phoff = struct.unpack_from(endian + "Q", header, 32)[0]
@@ -143,9 +149,9 @@ def _elf_executable_ranges(f, file_size):
         size = struct.unpack_from(endian + size_fmt, entry, size_off)[0]
         if p_type == 1 and flags & 1:
             ranges.append((offset, offset + size))
-    return _normalized_ranges(ranges, file_size)
+    return _normalized_ranges(ranges, file_size), _machine_arch(machine)
 
-def _macho_slice_ranges(f, file_size, base, slice_size):
+def _macho_slice_info(f, file_size, base, slice_size):
     magic = _read_exact(f, base, 4)
     if magic == b"\xcf\xfa\xed\xfe":
         endian = "<"
@@ -154,6 +160,7 @@ def _macho_slice_ranges(f, file_size, base, slice_size):
     else:
         raise ValueError("unsupported Mach-O slice")
     header = _read_exact(f, base, 32)
+    arch = _machine_arch(struct.unpack_from(endian + "I", header, 4)[0])
     command_count = struct.unpack_from(endian + "I", header, 16)[0]
     pos, ranges = base + 32, []
     for _ in range(command_count):
@@ -180,12 +187,12 @@ def _macho_slice_ranges(f, file_size, base, slice_size):
                     ranges.append((base + offset, base + offset + size))
                 section_pos += 80
         pos += command_size
-    return _normalized_ranges(ranges, file_size)
+    return _normalized_ranges(ranges, file_size), arch
 
-def _macho_executable_ranges(f, file_size):
+def _macho_executable_info(f, file_size):
     magic = _read_exact(f, 0, 4)
     if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
-        return _macho_slice_ranges(f, file_size, 0, file_size)
+        return _macho_slice_info(f, file_size, 0, file_size)
     fat = {
         b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
         b"\xca\xfe\xba\xbf": (">", True),  b"\xbf\xba\xfe\xca": ("<", True),
@@ -195,30 +202,37 @@ def _macho_executable_ranges(f, file_size):
     endian, is_64 = fat
     count = struct.unpack(endian + "I", _read_exact(f, 4, 4))[0]
     entry_size = 32 if is_64 else 20
-    ranges = []
+    ranges, arches = [], []
     for i in range(count):
         entry = _read_exact(f, 8 + i * entry_size, entry_size)
         if is_64:
             offset, size = struct.unpack_from(endian + "QQ", entry, 8)
         else:
             offset, size = struct.unpack_from(endian + "II", entry, 8)
-        ranges += _macho_slice_ranges(f, file_size, offset, size)
-    return _normalized_ranges(ranges, file_size)
+        slice_ranges, arch = _macho_slice_info(f, file_size, offset, size)
+        ranges += slice_ranges
+        arches.append(arch)
+    known_arch = arches[0] if arches and arches[0] and all(a == arches[0] for a in arches) else None
+    return _normalized_ranges(ranges, file_size), known_arch
 
-def executable_ranges(path):
-    """Return executable file ranges for PE, ELF, or Mach-O."""
+def executable_info(path):
+    """Return executable file ranges and architecture for PE, ELF, or Mach-O."""
     with open(path, "rb") as f:
         file_size = os.fstat(f.fileno()).st_size
         magic = _read_exact(f, 0, min(4, file_size))
         if magic[:2] == b"MZ":
-            ranges = _pe_executable_ranges(f, file_size)
+            ranges, arch = _pe_executable_info(f, file_size)
         elif magic == b"\x7fELF":
-            ranges = _elf_executable_ranges(f, file_size)
+            ranges, arch = _elf_executable_info(f, file_size)
         else:
-            ranges = _macho_executable_ranges(f, file_size)
+            ranges, arch = _macho_executable_info(f, file_size)
     if not ranges:
         raise ValueError("no executable code ranges found")
-    return ranges
+    return ranges, arch
+
+def executable_ranges(path):
+    """Return executable file ranges for PE, ELF, or Mach-O."""
+    return executable_info(path)[0]
 
 # Discovery
 @functools.lru_cache(maxsize=1)
@@ -306,7 +320,7 @@ class SignatureNotFound(LookupError):
 class SignatureAmbiguous(LookupError):
     pass
 
-def _unique_match(pattern, data, ranges, label):
+def _unique_match(pattern, data, ranges, label, accept=None):
     found = None
     for start, end in ranges:
         pos = start
@@ -314,6 +328,9 @@ def _unique_match(pattern, data, ranges, label):
             match = pattern.search(data, pos, end)
             if not match:
                 break
+            if accept is not None and not accept(data, match, start, end):
+                pos = max(match.end(), match.start() + 1)
+                continue
             if found is not None:
                 raise SignatureAmbiguous(f"{label} signature is not unique — refusing to guess")
             found = match
@@ -321,14 +338,14 @@ def _unique_match(pattern, data, ranges, label):
     return found
 
 class Gate:
-    def __init__(self, sig, patched, fix, offset=0, desc=""):
+    def __init__(self, sig, patched, fix, offset=0, desc="", arch=None, accept=None):
         self.sig, self.patched = re.compile(sig, re.S), re.compile(patched, re.S)
-        self.fix, self.offset, self.desc = fix, offset, desc
+        self.fix, self.offset, self.desc, self.arch, self.accept = fix, offset, desc, arch, accept
     def find(self, data, ranges=None):
         """Return state and write offset for one unambiguous signature."""
         search_ranges = ranges or ((0, len(data)),)
-        original = _unique_match(self.sig, data, search_ranges, "unpatched gate")
-        patched = _unique_match(self.patched, data, search_ranges, "patched gate")
+        original = _unique_match(self.sig, data, search_ranges, "unpatched gate", self.accept)
+        patched = _unique_match(self.patched, data, search_ranges, "patched gate", self.accept)
         if original and patched:
             raise SignatureAmbiguous("both patched and unpatched gate signatures are present")
         if patched:
@@ -336,7 +353,7 @@ class Gate:
         if original:
             return ("unpatched", original.start() + self.offset)
         raise SignatureNotFound("gate signature not found (unsupported version?)")
-    def resolve(self, data, ranges=None):
+    def resolve(self, data, ranges=None, arch=None):
         kind, off = self.find(data, ranges)
         return kind, off, self
 
@@ -344,11 +361,13 @@ class MultiGate:
     """Select one architecture-specific gate."""
     def __init__(self, *gates, desc=""):
         self.gates, self.desc = gates, desc
-    def resolve(self, data, ranges=None):
+    def resolve(self, data, ranges=None, arch=None):
         matches = []
-        for g in self.gates:
+        gates = [g for g in self.gates
+                 if arch is None or getattr(g, "arch", None) is None or g.arch == arch]
+        for g in gates:
             try:
-                matches.append(g.resolve(data, ranges))
+                matches.append(g.resolve(data, ranges, arch))
             except SignatureNotFound:
                 pass
         if len(matches) > 1:
@@ -359,9 +378,9 @@ class MultiGate:
 
 def gate_status(path, gate):
     try:
-        ranges = executable_ranges(path)
+        ranges, arch = executable_info(path)
         with mapped(path) as d:
-            return (gate.resolve(d, ranges)[0], None)
+            return (gate.resolve(d, ranges, arch)[0], None)
     except (LookupError, OSError, ValueError):
         return ("unknown", None)
 
@@ -369,9 +388,9 @@ def gate_patch(path, gate, app, fname):
     if is_locked(path):
         warn(f"{fname} is locked — close {app} first"); return False
     try:
-        ranges = executable_ranges(path)
+        ranges, arch = executable_info(path)
         with mapped(path) as d:
-            kind, off, g = gate.resolve(d, ranges)
+            kind, off, g = gate.resolve(d, ranges, arch)
     except (LookupError, OSError, ValueError) as e:
         warn(str(e)); return False
     if kind == "patched":
@@ -380,19 +399,19 @@ def gate_patch(path, gate, app, fname):
     try:
         if not filecmp.cmp(path, bak, shallow=False):
             raise OSError("target changed after backup")
-        ranges = executable_ranges(path)
+        ranges, arch = executable_info(path)
         with open(path, "r+b") as f:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                current_kind, current_off, current_gate = gate.resolve(mm, ranges)
+                current_kind, current_off, current_gate = gate.resolve(mm, ranges, arch)
             finally:
                 mm.close()
             if current_kind != "unpatched" or current_off != off or current_gate is not g:
                 raise OSError("target changed before patch write")
             f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
-        ranges = executable_ranges(path)
+        ranges, arch = executable_info(path)
         with mapped(path) as d:
-            final_kind, final_off, final_gate = gate.resolve(d, ranges)
+            final_kind, final_off, final_gate = gate.resolve(d, ranges, arch)
         if final_kind != "patched" or final_off != off or final_gate is not g:
             raise OSError("post-write signature verification failed")
     except Exception as e:
@@ -419,18 +438,29 @@ CLI_GATE_X64 = Gate(
     rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
     rb"\xe8....\x48\x89\x84\x24\x80\x00\x00\x00\x48\x89\x5c\x24\x50"
     rb"\x48\x89\x4c\x24\x70",
-    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)")
+    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
 
 # arm64:
 #   cbnz x1,error ; cbz x0,eligible ; ldrb w1,[x0,#8] ; tbnz w1,#0,eligible
 #   bl failure builder
 # Loading 1 instead makes tbnz always select eligible.
+def _cli_arm64_context(data, match, start, end):
+    off = match.start()
+    if off - 8 < start:
+        return False
+    cbnz_x1, cbz_x0 = struct.unpack_from("<II", data, off - 8)
+    return ((cbnz_x1 & 0xff00001f) == 0xb5000001 and
+            (cbz_x0 & 0xff00001f) == 0xb4000000)
+
+_ARM64_TBNZ_W1_BIT0 = rb"[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
+_ARM64_BL = rb"...[\x94-\x97]"
+_CLI_ARM64_TAIL = (_ARM64_TBNZ_W1_BIT0 + _ARM64_BL +
+                   rb"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9")
 CLI_GATE_ARM64 = Gate(
-    rb"...\xb5...\xb4\x01\x20\x40\x39...\x37...\x97"
-    rb"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
-    rb"...\xb5...\xb4\x21\x00\x80\x52...\x37...\x97"
-    rb"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
-    b"\x21\x00\x80\x52", offset=8, desc="eligibility screen off (arm64)")
+    rb"\x01\x20\x40\x39" + _CLI_ARM64_TAIL,
+    rb"\x21\x00\x80\x52" + _CLI_ARM64_TAIL,
+    b"\x21\x00\x80\x52", desc="eligibility screen off (arm64)",
+    arch="arm64", accept=_cli_arm64_context)
 
 CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, desc="eligibility screen off")
 
@@ -456,7 +486,7 @@ def cli_default_paths():
 # cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2
 MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
                         rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
-                        b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true")
+                        b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true", arch="x64")
 
 # arm64: force hasValidAuth and remove the token-attachment branch.
 #   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
@@ -466,7 +496,8 @@ _ARM64_TBZ_W3_BIT0 = rb"[\x03\x23\x43\x63\x83\xa3\xc3\xe3]..\x36"
 _ARM64_TOKEN_SETUP = rb"(?:....){1,2}\x03\x10\x06\xa9"
 MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39" + _ARM64_TBZ_W3_BIT0 + _ARM64_TOKEN_SETUP,
                           rb"\x23\x00\x80\x52\x03\x20\x00\x39" + _ARM64_TOKEN_SETUP,
-                          b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)")
+                          b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)",
+                          arch="arm64")
 
 MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
 
@@ -573,6 +604,7 @@ IDE_KEYS = ("antigravityUnifiedStateSync.oauthToken",
             "antigravityUnifiedStateSync.profileUrl",
             "antigravityUnifiedStateSync.modelCredits")
 
+@functools.lru_cache(maxsize=1)
 def _advapi():
     """Bind the Windows Credential API."""
     import ctypes
@@ -634,20 +666,19 @@ def _ide_state_db():
         if os.path.isfile(p): cands.append(p)
     return max(cands, key=os.path.getmtime) if cands else None
 
-def ide_read():
-    db = _ide_state_db()
+def ide_read(db=None):
+    db = db or _ide_state_db()
     if not db: return {}
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        cur, out = con.cursor(), {}
-        for k in IDE_KEYS:
-            row = cur.execute("select value from ItemTable where key=?", (k,)).fetchone()
-            if row is not None: out[k] = row[0]
-        return out
+        placeholders = ",".join("?" for _ in IDE_KEYS)
+        rows = con.execute(f"select key,value from ItemTable where key in ({placeholders})",
+                           IDE_KEYS)
+        return dict(rows)
     finally: con.close()
 
-def ide_write(values):
-    db = _ide_state_db()
+def ide_write(values, db=None):
+    db = db or _ide_state_db()
     if not db: raise OSError("IDE state.vscdb not found")
     con = sqlite3.connect(db, timeout=2)
     try:
@@ -665,14 +696,14 @@ def ide_write(values):
 def _enc(v): return {"b": base64.b64encode(v).decode()} if isinstance(v, (bytes, bytearray)) else {"s": v}
 def _dec(d): return base64.b64decode(d["b"]) if "b" in d else d["s"]
 
-def _snapshot(target_type):
+def _snapshot(target_type, ide_db=None):
     if target_type == "cli-manager":
         cred = cred_read(CRED_TARGET)
         return {"version": 1, "type": "cli-manager", "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "cred": base64.b64encode(cred).decode() if cred else None}
     elif target_type == "ide":
         return {"version": 1, "type": "ide", "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "ide": {k: _enc(v) for k, v in ide_read().items()}}
+                "ide": {k: _enc(v) for k, v in ide_read(ide_db).items()}}
     else:
         raise ValueError(f"unknown target type {target_type}")
 
@@ -683,8 +714,9 @@ def _apply(target_type, bundle):
     elif target_type == "ide":
         ide = {k: _dec(v) for k, v in (bundle.get("ide") or {}).items()}
         if ide:
-            if _ide_state_db():
-                ide_write(ide)
+            db = _ide_state_db()
+            if db:
+                ide_write(ide, db)
             else:
                 info("IDE database not found — skipping IDE token restoration")
 
@@ -740,6 +772,10 @@ def profile_load(target_type, name):
         chunks.append(raw); i += 1
     return json.loads(b"".join(chunks)) if chunks else None
 
+def profile_bundles(target_type):
+    """Load every saved profile once for one account operation or UI render."""
+    return {name: profile_load(target_type, name) for name in profile_names(target_type)}
+
 def _profile_delete(target_type, name):
     prefix = _acct_prefix(target_type)
     i = n = 0
@@ -754,7 +790,7 @@ def profile_save(target_type, name, bundle):
     for i, part in enumerate(parts):
         cred_write(f"{prefix}{name}/{i}", part, name)
 
-def current_account(target_type):
+def current_account(target_type, profiles=None):
     """Match the live refresh token to a saved profile."""
     if target_type == "cli-manager":
         live = cred_read(CRED_TARGET)
@@ -764,15 +800,15 @@ def current_account(target_type):
     elif target_type == "ide":
         db = _ide_state_db()
         if not db: return None
-        live = ide_read().get("antigravityUnifiedStateSync.oauthToken")
+        live = ide_read(db).get("antigravityUnifiedStateSync.oauthToken")
         if not live: return None
         rt = _ide_refresh_token(live)
     else:
         return None
 
     if not rt: return None
-    for name in profile_names(target_type):
-        b = profile_load(target_type, name)
+    profiles = profile_bundles(target_type) if profiles is None else profiles
+    for name, b in profiles.items():
         if b and _refresh_token(target_type, b) == rt: return name
     return None
 
@@ -795,12 +831,12 @@ def _accounts_busy(target_type):
     return busy
 
 def acct_list(target_type):
-    names = profile_names(target_type)
-    if not names:
+    profiles = profile_bundles(target_type)
+    if not profiles:
         info(f"no saved accounts yet - use 'accounts {target_type} save <name>'"); return 0
-    cur = current_account(target_type)
-    for n in names:
-        b = profile_load(target_type, n) or {}
+    cur = current_account(target_type, profiles)
+    for n, bundle in profiles.items():
+        b = bundle or {}
         ok(f"{'* ' if n == cur else '  '}{n}   (saved {b.get('saved_at', '?')})")
     if cur is None:
         info("the current live login is not saved as any profile")
@@ -814,26 +850,29 @@ def acct_current(target_type):
 def acct_save(target_type, name):
     if "/" in name:
         warn("account name can't contain '/'"); return 1
-    snap = _snapshot(target_type)
     if target_type == "cli-manager":
+        snap = _snapshot(target_type)
         if not snap["cred"]:
             warn("no active login found to save - log in to Antigravity first"); return 1
     elif target_type == "ide":
-        if not _ide_state_db():
+        db = _ide_state_db()
+        if not db:
             warn("IDE database not found"); return 1
+        snap = _snapshot(target_type, db)
         if not any(snap["ide"].values()):
             warn("no active login found to save - log in to Antigravity IDE first"); return 1
     profile_save(target_type, name, snap)
     ok(f"saved current login as '{name}'"); return 0
 
 def acct_use(target_type, name):
-    target = profile_load(target_type, name)
+    profiles = profile_bundles(target_type)
+    target = profiles.get(name)
     if target is None:
         warn(f"no saved account '{name}' (see 'accounts {target_type} list')"); return 1
     busy = _accounts_busy(target_type)
     if busy:
         warn(f"close {', '.join(busy)} first - the token is cached in memory while running"); return 1
-    cur = current_account(target_type)
+    cur = current_account(target_type, profiles)
     if cur and cur != name:
         try: profile_save(target_type, cur, _snapshot(target_type)); info(f"synced '{cur}' before switching")
         except Exception as e: warn(f"couldn't sync '{cur}': {e}")
@@ -851,10 +890,11 @@ def acct_rm(target_type, name):
 def acct_rename(target_type, old_name, new_name):
     if "/" in new_name:
         warn("new name can't contain '/'"); return 1
-    target = profile_load(target_type, old_name)
+    profiles = profile_bundles(target_type)
+    target = profiles.get(old_name)
     if target is None:
         warn(f"no saved account '{old_name}'"); return 1
-    if profile_load(target_type, new_name) is not None:
+    if new_name in profiles:
         warn(f"account '{new_name}' already exists"); return 1
     profile_save(target_type, new_name, target)
     _profile_delete(target_type, old_name)
@@ -876,8 +916,9 @@ def acct_logout(target_type):
            "sign into the next account, then `accounts cli-manager save <name>`")
     elif target_type == "ide":
         try:
-            if _ide_state_db():
-                ide_write({})
+            db = _ide_state_db()
+            if db:
+                ide_write({}, db)
         except sqlite3.OperationalError:
             warn("IDE database is locked - close Antigravity IDE and retry"); return 1
         ok("live IDE login cleared locally (NOT revoked) - launch Antigravity IDE, "
@@ -1014,7 +1055,8 @@ def _accounts_submenu(console, qs, target_type):
     while True:
         console.clear()
         try:
-            names, cur = profile_names(target_type), current_account(target_type)
+            profiles = profile_bundles(target_type)
+            names, cur = list(profiles), current_account(target_type, profiles)
         except Exception as e:
             console.print(f"[bold red]accounts error:[/] {e}")
             questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return

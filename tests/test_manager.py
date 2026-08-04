@@ -1,6 +1,9 @@
+import base64
 import contextlib
 import io
+import json
 import os
+import sqlite3
 import struct
 import tempfile
 import unittest
@@ -14,12 +17,13 @@ def _write(path, data):
         f.write(data)
 
 
-def _minimal_pe(code=b"", data=b""):
+def _minimal_pe(code=b"", data=b"", machine=0x8664):
     # One executable and one data section.
     image = bytearray(0x400)
     image[:2] = b"MZ"
     struct.pack_into("<I", image, 0x3C, 0x80)
     image[0x80:0x84] = b"PE\0\0"
+    struct.pack_into("<H", image, 0x84, machine)
     struct.pack_into("<H", image, 0x86, 2)
     struct.pack_into("<H", image, 0x94, 0)
     section_table = 0x98
@@ -35,10 +39,11 @@ def _minimal_pe(code=b"", data=b""):
     return bytes(image)
 
 
-def _minimal_elf():
+def _minimal_elf(machine=0x3E):
     # One executable and one read-only segment.
     image = bytearray(0x200)
     image[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", image, 18, machine)
     struct.pack_into("<Q", image, 32, 64)
     struct.pack_into("<HH", image, 54, 56, 2)
     struct.pack_into("<II", image, 64, 1, 5)
@@ -51,10 +56,11 @@ def _minimal_elf():
     return bytes(image)
 
 
-def _minimal_macho():
+def _minimal_macho(cputype=0x01000007):
     # One __TEXT,__text section.
     image = bytearray(0x300)
     image[:4] = b"\xcf\xfa\xed\xfe"
+    struct.pack_into("<I", image, 4, cputype)
     struct.pack_into("<I", image, 16, 1)
     struct.pack_into("<I", image, 20, 152)
     command = 32
@@ -68,13 +74,15 @@ def _minimal_macho():
     struct.pack_into("<I", image, section + 64, 0x80000400)
     return bytes(image)
 
-def _minimal_fat_macho():
-    thin = _minimal_macho()
-    image = bytearray(0x100 + len(thin))
+def _minimal_fat_macho(cputypes=(0x01000007,)):
+    image = bytearray(0x100 + len(cputypes) * 0x400)
     image[:4] = b"\xca\xfe\xba\xbe"
-    struct.pack_into(">I", image, 4, 1)
-    struct.pack_into(">IIIII", image, 8, 0x01000007, 3, 0x100, len(thin), 8)
-    image[0x100:] = thin
+    struct.pack_into(">I", image, 4, len(cputypes))
+    for i, cputype in enumerate(cputypes):
+        thin = _minimal_macho(cputype)
+        offset = 0x100 + i * 0x400
+        struct.pack_into(">IIIII", image, 8 + i * 20, cputype, 3, offset, len(thin), 8)
+        image[offset:offset + len(thin)] = thin
     return bytes(image)
 
 
@@ -106,6 +114,15 @@ class GateStateTests(unittest.TestCase):
         multi = manager.MultiGate(self.gate, other)
         with self.assertRaises(manager.SignatureAmbiguous):
             multi.resolve(b"ORIG--ARCH")
+
+    def test_multigate_scans_only_matching_architecture(self):
+        x64 = manager.Gate(b"X64", b"X64P", b"X64P", arch="x64")
+        arm64 = manager.Gate(b"ARM", b"ARMP", b"ARMP", arch="arm64")
+        multi = manager.MultiGate(x64, arm64)
+        self.assertEqual(multi.resolve(b"X64--ARM", arch="x64"), ("unpatched", 0, x64))
+        self.assertEqual(multi.resolve(b"X64--ARM", arch="arm64"), ("unpatched", 5, arm64))
+        with self.assertRaises(manager.SignatureAmbiguous):
+            multi.resolve(b"X64--ARM")
 
     def test_current_cli_x64_signature_and_patch(self):
         source = (
@@ -159,6 +176,18 @@ class GateStateTests(unittest.TestCase):
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(previous)
 
+    def test_cli_arm64_signature_requires_outer_registers(self):
+        wrong_outer_register = (
+            b"\xe2\x18\x00\xb5"
+            b"\xc0\x0d\x00\xb4"
+            b"\x01\x20\x40\x39"
+            b"\x81\x0d\x00\x37"
+            b"\xbe\x94\xff\x97"
+            b"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9"
+        )
+        with self.assertRaises(manager.SignatureNotFound):
+            manager.CLI_GATE.resolve(wrong_outer_register)
+
     def test_manager_arm64_old_and_new_signatures_patch(self):
         old = (
             b"\x03\x20\x40\x39"
@@ -193,11 +222,25 @@ class GateStateTests(unittest.TestCase):
 
 
 class ExecutableRangeTests(unittest.TestCase):
-    def _ranges(self, payload):
+    def _info(self, payload):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "fixture")
             _write(path, payload)
-            return manager.executable_ranges(path)
+            return manager.executable_info(path)
+
+    def _ranges(self, payload):
+        return self._info(payload)[0]
+
+    def test_executable_architectures(self):
+        fixtures = ((_minimal_pe(), "x64"), (_minimal_pe(machine=0xAA64), "arm64"),
+                    (_minimal_elf(), "x64"), (_minimal_elf(machine=0xB7), "arm64"),
+                    (_minimal_macho(), "x64"),
+                    (_minimal_macho(cputype=0x0100000C), "arm64"),
+                    (_minimal_fat_macho(), "x64"),
+                    (_minimal_fat_macho((0x01000007, 0x0100000C)), None))
+        for payload, expected in fixtures:
+            with self.subTest(expected=expected, magic=payload[:4]):
+                self.assertEqual(self._info(payload)[1], expected)
 
     def test_pe_ranges(self):
         self.assertEqual(self._ranges(_minimal_pe()), ((0x200, 0x240),))
@@ -219,6 +262,47 @@ class ExecutableRangeTests(unittest.TestCase):
             self.assertEqual(manager.gate_status(path, gate)[0], "unknown")
             _write(path, _minimal_pe(code=b"ORIG", data=b"ORIG"))
             self.assertEqual(manager.gate_status(path, gate)[0], "unpatched")
+
+    def test_gate_status_routes_detected_architecture(self):
+        x64 = manager.Gate(b"X64", b"X64P", b"X64P", arch="x64")
+        arm64 = manager.Gate(b"ARM", b"ARMP", b"ARMP", arch="arm64")
+        gate = manager.MultiGate(x64, arm64)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fixture.exe")
+            _write(path, _minimal_pe(code=b"X64--ARM", machine=0x8664))
+            self.assertEqual(manager.gate_status(path, gate)[0], "unpatched")
+            _write(path, _minimal_pe(code=b"X64--ARM", machine=0xAA64))
+            self.assertEqual(manager.gate_status(path, gate)[0], "unpatched")
+
+
+class AccountTests(unittest.TestCase):
+    @staticmethod
+    def _cli_bundle(refresh_token, saved_at="now"):
+        live = json.dumps({"token": {"refresh_token": refresh_token}}).encode()
+        return {"cred": base64.b64encode(live).decode(), "saved_at": saved_at}
+
+    def test_account_list_loads_each_profile_once(self):
+        bundles = {"first": self._cli_bundle("one"), "second": self._cli_bundle("two")}
+        live = json.dumps({"token": {"refresh_token": "one"}}).encode()
+        with (mock.patch.object(manager, "profile_names", return_value=list(bundles)),
+              mock.patch.object(manager, "profile_load", side_effect=lambda _, n: bundles[n]) as load,
+              mock.patch.object(manager, "cred_read", return_value=live),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(manager.acct_list("cli-manager"), 0)
+        self.assertEqual(load.call_count, len(bundles))
+
+    def test_ide_read_fetches_requested_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.vscdb")
+            con = sqlite3.connect(db)
+            try:
+                con.execute("create table ItemTable(key text primary key, value)")
+                con.execute("insert into ItemTable values(?,?)", (manager.IDE_KEYS[0], "token"))
+                con.execute("insert into ItemTable values(?,?)", ("unrelated", "ignored"))
+                con.commit()
+            finally:
+                con.close()
+            self.assertEqual(manager.ide_read(db), {manager.IDE_KEYS[0]: "token"})
 
 
 class TransactionTests(unittest.TestCase):
