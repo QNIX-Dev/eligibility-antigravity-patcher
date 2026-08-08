@@ -723,15 +723,19 @@ def _ide_refresh_token(oauth_token_val):
         return None
     try:
         dec = base64.b64decode(oauth_token_val)
-        match = re.search(rb'(CoQC[a-zA-Z0-9_-]+)', dec)
-        if not match:
-            return None
-        b64_str = match.group(1)
-        raw = base64.urlsafe_b64decode(b64_str + b'===')
-        rt_match = re.search(rb'1//[a-zA-Z0-9_-]+', raw)
-        return rt_match.group(0).decode("utf-8") if rt_match else None
     except Exception:
         return None
+    tokens = set()
+    for match in re.finditer(rb'(?<![a-zA-Z0-9_-])[a-zA-Z0-9_-]{32,}(?![a-zA-Z0-9_-])', dec):
+        encoded = match.group(0)
+        try:
+            raw = base64.urlsafe_b64decode(encoded + b"=" * (-len(encoded) % 4))
+        except Exception:
+            continue
+        tokens.update(m.group(0) for m in re.finditer(rb'1//[a-zA-Z0-9_-]+', raw))
+    if len(tokens) != 1:
+        return None
+    return next(iter(tokens)).decode("utf-8")
 
 def _refresh_token(target_type, bundle):
     """Extract the refresh token used to identify a profile."""

@@ -304,6 +304,23 @@ class AccountTests(unittest.TestCase):
                 con.close()
             self.assertEqual(manager.ide_read(db), {manager.IDE_KEYS[0]: "token"})
 
+    @staticmethod
+    def _ide_oauth_token(*payloads):
+        encoded = [base64.urlsafe_b64encode(payload).rstrip(b"=") for payload in payloads]
+        return base64.b64encode(b"\x00" + b"\x00".join(encoded) + b"\x00").decode()
+
+    def test_ide_refresh_token_accepts_rotated_wrapper_prefix(self):
+        refresh_token = b"1//fixture-refresh-token_123"
+        oauth_token = self._ide_oauth_token(b"new-wrapper-format:" + refresh_token + b"\xff")
+        self.assertNotIn(b"CoQC", base64.b64decode(oauth_token))
+        self.assertEqual(manager._ide_refresh_token(oauth_token), refresh_token.decode())
+
+    def test_ide_refresh_token_rejects_ambiguous_wrapper(self):
+        oauth_token = self._ide_oauth_token(
+            b"first-wrapper:1//fixture-refresh-token_one\xff",
+            b"second-wrapper:1//fixture-refresh-token_two\xff")
+        self.assertIsNone(manager._ide_refresh_token(oauth_token))
+
 
 class TransactionTests(unittest.TestCase):
     def test_binary_patch_is_verified_idempotent_and_restorable(self):
