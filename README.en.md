@@ -95,18 +95,18 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 
 ## <a id="bypass"></a>🔓 Location Restriction Bypass
 
-The tool modifies local eligibility gates, allowing the client applications to run in restricted regions.
+The patcher neutralizes local eligibility checks and directs each client into its corresponding success path.
 
 > [!NOTE]
-> These gates are purely client-side cosmetic restrictions. Once bypassed, all backend models and tools function normally. This utility **does not** bypass server-side authentication or unlock paid features; it simply disables the local restriction screens.
+> The changes affect client-side decision logic only. This utility **does not** create server-side entitlements, bypass server authentication, or unlock paid features: model and feature availability still depends on server responses.
 
 ### Supported Targets
 
 | Target | Application | Patch Vector | Detection Marker |
 | :---: | :--- | :--- | :--- |
-| **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Binary-patches `agy` / `agy.exe` to neutralize the `hasValidAuth` gate check. | `agy` / `agy.exe` |
-| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server` / `language_server.exe` to force the `hasValidAuth` flag to `true`. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
-| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified VS Code launcher script to force the `isGoogleInternal` auth branch to `true`. | `resources/app/out/main.js` |
+| **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Binary-patches `agy` / `agy.exe` to neutralize the local `hasValidAuth` gate and select the `eligible` path. | `agy` / `agy.exe` |
+| **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server` / `language_server.exe` to neutralize the `hasValidAuth` gate and select the success path. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
+| **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified `main.js` to neutralize the local auth gate and select the shortened authentication path. | `resources/app/out/main.js` |
 
 > [!NOTE]
 > **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform (Windows, Linux, macOS) and cover both **x86-64 and arm64** architectures. The `manager` patch carries two machine-code signatures and auto-selects the right one: the x64 signature covers Windows (including Windows-on-ARM, which ships the x64 backend and runs it under emulation), Linux x64 and Intel macOS; a dedicated aarch64 signature covers Linux arm64 and Apple-Silicon macOS. The `ide` patch is JavaScript, so it is architecture-independent by nature.
@@ -151,11 +151,11 @@ Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]
 <details>
 <summary>🛠️ <b>CLI Patch (`agy.exe` Go Binary)</b></summary>
 
-At startup, the CLI renders an "Eligibility Check" section. The check resides in the `handleAuthResult` routine, which reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned by the server.
+At startup, the CLI reads the `hasValidAuth` field (the byte at offset `+8`) of the AuthResult returned by the server. The result selects either the `eligible` path or the local "Eligibility Check" screen.
 
 1. **x64 builds:** The patcher scans for the unique gate signature: `test rax,rax` → `je` (eligible) → `cmp byte ptr [rax+8],0` → `jne` (eligible) → `call failure_builder` → spills of `rax`, `rbx`, and `rcx` to `[rsp+0x80]`, `[rsp+0x50]`, and `[rsp+0x70]`.
 2. Without the patch, a zero `hasValidAuth` execution falls through and prints the error. The patch rewrites `cmp byte ptr [rax+8],0` to `test rax,rax` (+`NOP`): since `rax` is non-null here, the `jne` jump always selects the “eligible” branch.
-3. This neutralizes the warning across all scenarios — both initial login and subsequent CLI runs — while all features continue operating normally.
+3. The local gate consequently selects the `eligible` path during both initial login and subsequent CLI runs; the server response and global product configuration remain unchanged.
 4. **arm64 builds** (Windows, Linux, and macOS) contain the outer check: `cbnz x1,error` → `cbz x0,eligible` → `ldrb w1,[x0,#8]` → `tbnz w1,#0,eligible` → `bl failure_builder` → spills of `x0`, `x1`, and `x2` to `[sp,#0x90]`, `[sp,#0x60]`, and `[sp,#0x80]`. The patch replaces the flag load with `mov w1,#1`, so the existing `tbnz` always selects the eligible branch. The `MultiGate` class automatically selects the x64 or arm64 signature.
 </details>
 
@@ -164,10 +164,10 @@ At startup, the CLI renders an "Eligibility Check" section. The check resides in
 
 The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
 
-1. **x64 builds:** The patcher searches the validator for the check signature: `cmp byte ptr [rax+8], 0` → `je` (skips token binding).
-2. The check together with the jump is overwritten with `mov byte ptr [rax+8], 1` + `NOP`: the flag is forced to `true`, and neutralizing the `je` guarantees execution always falls through into the token-binding/saving branch.
-3. This validator's result is what `GetAuthStatus` returns and what the login routine relies on, so a single patch covers every scenario — both the first login and subsequent restarts. The token is saved to disk and the error screen never appears.
-4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain identical logic in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → one or two setup instructions → `stp x3,x4,[x0,#0x60]` (token attach at `+0x60`). The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]` — forcing the flag to `true` and dropping the branch so the token is always attached. The `MultiGate` class automatically selects the x64 or arm64 signature.
+1. **x64 builds:** The patcher finds the validator's unique gate signature: `cmp byte ptr [rax+8],0` → `je` (skips the success path) → the subsequent instructions in that path.
+2. The check and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP`: the flag is forced to `true` and the conditional jump is removed, so execution continues along the success path.
+3. This validator's result is returned by `GetAuthStatus` and used by the login routine, so both locations receive the same forced-success verdict during initial login and subsequent restarts.
+4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain the same gate in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → one or two context instructions → `stp x3,x4,[x0,#0x60]`. The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]`, forcing the flag to `true`, removing the conditional jump, and continuing along the success path. The `MultiGate` class automatically selects the x64 or arm64 signature.
 </details>
 
 <details>
@@ -175,7 +175,7 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 
 1. The script parses the minified entrypoint `resources/app/out/main.js` using regular expressions.
 2. It looks for the minified auth branch pattern: `resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal`.
-3. Replaces it with `resetIsTierGCPTos(),true` to force Google internal developer privileges.
+3. Replaces it with `resetIsTierGCPTos(),true`, so only this check always selects the shortened internal authentication path; the global `isGoogleInternal` setting remains disabled.
 4. Clears VS Code's system bytecode caches (`CachedData` and `Code Cache/js`) to apply modifications instantly.
 </details>
 
