@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, filecmp, functools, glob, json, mmap, os, re, shutil, sqlite3, struct, sys, time
+import argparse, base64, contextlib, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
@@ -9,6 +9,7 @@ except Exception:
     winreg = None
 
 BAK = ".agybak"
+MAC_SIGNATURE_BAK = ".agysignbak"
 TARGETS = ("cli", "manager", "ide")
 
 # Utilities
@@ -965,13 +966,461 @@ SPEC = {
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
 }
 
+
+# macOS code signing
+def _mac_app_bundle(path):
+    """Return the enclosing .app bundle, if path is inside one."""
+    cur = os.path.realpath(path)
+    if not os.path.isdir(cur):
+        cur = os.path.dirname(cur)
+    while True:
+        if cur.endswith(".app") and os.path.isdir(os.path.join(cur, "Contents")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _mac_bundle_main(app):
+    info_path = os.path.join(app, "Contents", "Info.plist")
+    with open(info_path, "rb") as f:
+        executable = plistlib.load(f).get("CFBundleExecutable")
+    if not isinstance(executable, str) or not executable or os.path.basename(executable) != executable:
+        raise ValueError("invalid CFBundleExecutable in macOS app bundle")
+    path = os.path.join(app, "Contents", "MacOS", executable)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"app bundle executable not found: {path}")
+    return path
+
+
+def _mac_entry_kind(path):
+    if os.path.islink(path):
+        return "symlink"
+    if os.path.isdir(path):
+        return "dir"
+    if os.path.isfile(path):
+        return "file"
+    return "missing"
+
+
+def _mac_entry_digest(path):
+    h = hashlib.sha256()
+
+    def add(cur, rel):
+        kind = _mac_entry_kind(cur)
+        h.update(kind.encode() + b"\0" + rel.encode("utf-8", "surrogateescape") + b"\0")
+        if kind == "symlink":
+            h.update(os.readlink(cur).encode("utf-8", "surrogateescape"))
+        elif kind == "file":
+            h.update(str(os.stat(cur, follow_symlinks=False).st_mode & 0o7777).encode())
+            with open(cur, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+        elif kind == "dir":
+            for name in sorted(os.listdir(cur)):
+                add(os.path.join(cur, name), rel + "/" + name if rel else name)
+
+    add(path, "")
+    return h.hexdigest()
+
+
+def _mac_remove_entry(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _mac_copy_entry(src, dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    kind = _mac_entry_kind(src)
+    if kind == "symlink":
+        os.symlink(os.readlink(src), dst)
+    elif kind == "dir":
+        shutil.copytree(src, dst, symlinks=True, copy_function=shutil.copy2)
+    elif kind == "file":
+        shutil.copy2(src, dst)
+
+
+def _mac_signature_relpaths(app):
+    main = os.path.relpath(_mac_bundle_main(app), app)
+    return (main, os.path.join("Contents", "_CodeSignature"),
+            os.path.join("Contents", "CodeResources"))
+
+
+def _mac_write_signature_snapshot(app, snapshot):
+    app = os.path.abspath(app)
+    payload = os.path.join(snapshot, "payload")
+    os.makedirs(payload, exist_ok=True)
+    items = []
+    for rel in _mac_signature_relpaths(app):
+        src = os.path.join(app, rel)
+        kind = _mac_entry_kind(src)
+        if kind != "missing":
+            _mac_copy_entry(src, os.path.join(payload, rel))
+        items.append({"path": rel.replace(os.sep, "/"), "kind": kind,
+                      "digest": _mac_entry_digest(src)})
+    manifest = {"version": 1, "app": app, "items": items}
+    with open(os.path.join(snapshot, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, sort_keys=True)
+        f.flush(); os.fsync(f.fileno())
+    _mac_validate_signature_snapshot(snapshot, app)
+
+
+def _mac_load_signature_snapshot(snapshot, app):
+    with open(os.path.join(snapshot, "manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    app = os.path.abspath(app)
+    if manifest.get("version") != 1 or os.path.abspath(manifest.get("app", "")) != app:
+        raise OSError("macOS signature backup belongs to a different app bundle")
+    items = manifest.get("items")
+    if not isinstance(items, list) or not items:
+        raise OSError("invalid macOS signature backup manifest")
+    for item in items:
+        rel = item.get("path", "").replace("/", os.sep)
+        dst = os.path.abspath(os.path.join(app, rel))
+        if (not rel or os.path.isabs(rel) or
+                os.path.normcase(os.path.commonpath((app, dst))) != os.path.normcase(app)):
+            raise OSError("unsafe path in macOS signature backup")
+    return manifest
+
+
+def _mac_validate_signature_snapshot(snapshot, app):
+    manifest = _mac_load_signature_snapshot(snapshot, app)
+    for item in manifest["items"]:
+        rel = item["path"].replace("/", os.sep)
+        saved = os.path.join(snapshot, "payload", rel)
+        if _mac_entry_kind(saved) != item["kind"]:
+            raise OSError("macOS signature backup type verification failed")
+        if _mac_entry_digest(saved) != item["digest"]:
+            raise OSError("macOS signature backup content verification failed")
+    return manifest
+
+
+def _mac_restore_signature_snapshot(snapshot, app):
+    manifest = _mac_validate_signature_snapshot(snapshot, app)
+    app = os.path.abspath(app)
+    for item in manifest["items"]:
+        rel = item["path"].replace("/", os.sep)
+        dst = os.path.join(app, rel)
+        _mac_remove_entry(dst)
+        if item["kind"] != "missing":
+            _mac_copy_entry(os.path.join(snapshot, "payload", rel), dst)
+            if _mac_entry_digest(dst) != item["digest"]:
+                raise OSError("restored macOS signature state failed verification")
+
+
+def _mac_bundle_patch_states(app):
+    candidates = {
+        "manager": os.path.join(app, "Contents", "Resources", "bin", "language_server"),
+        "ide": os.path.join(app, "Contents", "Resources", "app", "out", "main.js"),
+    }
+    states = {}
+    for target, path in candidates.items():
+        if os.path.isfile(path):
+            try:
+                states[target] = (SPEC[target]["status"](path)[0], path)
+            except Exception:
+                states[target] = ("unknown", path)
+    return states
+
+
+def _mac_prepare_signature_backup(app):
+    backup = app + MAC_SIGNATURE_BAK
+    states = _mac_bundle_patch_states(app)
+    clean = bool(states) and all(state == "unpatched" for state, _ in states.values())
+    if sys.platform == "darwin":
+        verify = _mac_command(["/usr/bin/codesign", "--verify", "--deep", "--strict",
+                               "--verbose=2", app], check=False)
+        display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=2", app], check=False)
+        details = (display.stdout + display.stderr).lower()
+        clean = verify.returncode == 0 and "signature=adhoc" not in details
+    if os.path.isdir(backup) and not clean:
+        _mac_validate_signature_snapshot(backup, app)
+        return backup
+
+    parent = os.path.dirname(app)
+    temp = tempfile.mkdtemp(prefix=os.path.basename(app) + MAC_SIGNATURE_BAK + ".", dir=parent)
+    old = None
+    try:
+        _mac_write_signature_snapshot(app, temp)
+        if os.path.lexists(backup):
+            old = backup + f".old-{os.getpid()}-{time.time_ns()}"
+            os.replace(backup, old)
+        try:
+            os.replace(temp, backup)
+            temp = None
+        except Exception:
+            if old is not None:
+                os.replace(old, backup)
+                old = None
+            raise
+        if old is not None:
+            _mac_remove_entry(old)
+        info(f"macOS signature backup -> {os.path.basename(backup)}")
+        return backup
+    finally:
+        if temp and os.path.isdir(temp):
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+def _mac_command(args, check=True):
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise OSError(detail[-1] if detail else f"command failed ({result.returncode}): {args[0]}")
+    return result
+
+
+def _mac_codesign(path, bundle=False):
+    display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=2", path], check=False)
+    args = ["/usr/bin/codesign", "--force", "--sign", "-"]
+    if display.returncode == 0:
+        args.append("--preserve-metadata=identifier,entitlements,flags,runtime")
+    args.append(path)
+    _mac_command(args)
+    verify = ["/usr/bin/codesign", "--verify"]
+    if bundle:
+        verify.append("--deep")
+    verify += ["--strict", "--verbose=2", path]
+    _mac_command(verify)
+
+
+def _mac_sign_transaction(entries):
+    binaries = []
+    bundles = []
+    for target, path in entries.items():
+        actual = os.path.realpath(path)
+        if target in ("cli", "manager") and actual not in binaries:
+            binaries.append(actual)
+        app = _mac_app_bundle(path)
+        if app and app not in bundles:
+            bundles.append(app)
+    if not binaries and not bundles:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="agy-macos-sign-") as temp:
+        binary_copies = []
+        bundle_copies = []
+        for i, path in enumerate(binaries):
+            saved = os.path.join(temp, f"binary-{i}")
+            shutil.copy2(path, saved)
+            if not filecmp.cmp(path, saved, shallow=False):
+                raise OSError("temporary macOS signing backup verification failed")
+            binary_copies.append((path, saved))
+        for i, app in enumerate(bundles):
+            saved = os.path.join(temp, f"bundle-{i}")
+            os.makedirs(saved)
+            _mac_write_signature_snapshot(app, saved)
+            bundle_copies.append((app, saved))
+        try:
+            for path in binaries:
+                _mac_codesign(path)
+            for app in bundles:
+                _mac_codesign(app, bundle=True)
+            for path in binaries:
+                ok(f"ad-hoc signed {os.path.basename(path)}")
+            for app in bundles:
+                ok(f"ad-hoc signed {os.path.basename(app)}")
+        except Exception:
+            restore_errors = []
+            for path, saved in binary_copies:
+                try:
+                    shutil.copy2(saved, path)
+                except Exception as e:
+                    restore_errors.append(str(e))
+            for app, saved in bundle_copies:
+                try:
+                    _mac_restore_signature_snapshot(saved, app)
+                except Exception as e:
+                    restore_errors.append(str(e))
+            if restore_errors:
+                raise OSError("macOS signing failed and its temporary state could not be restored: " +
+                              "; ".join(restore_errors))
+            raise
+
+
+def _mac_restore_bundle_signature(app):
+    backup = app + MAC_SIGNATURE_BAK
+    if not os.path.isdir(backup):
+        raise OSError(f"macOS signature backup not found: {backup}")
+    with tempfile.TemporaryDirectory(prefix="agy-macos-restore-") as temp:
+        _mac_write_signature_snapshot(app, temp)
+        try:
+            _mac_restore_signature_snapshot(backup, app)
+            _mac_codesign_verify(app, bundle=True)
+        except Exception:
+            _mac_restore_signature_snapshot(temp, app)
+            raise
+
+
+def _mac_codesign_verify(path, bundle=False):
+    args = ["/usr/bin/codesign", "--verify"]
+    if bundle:
+        args.append("--deep")
+    args += ["--strict", "--verbose=2", path]
+    _mac_command(args)
+
+
+def _mac_remove_quarantine(entries):
+    roots = []
+    for path in entries.values():
+        root = _mac_app_bundle(path) or os.path.realpath(path)
+        if root not in roots:
+            roots.append(root)
+    attribute = "com.apple.quarantine"
+    found = []
+    counts = {root: 0 for root in roots}
+
+    def walk_error(error):
+        raise error
+
+    for root in roots:
+        candidates = [root]
+        if root.endswith(".app"):
+            for base, dirs, files in os.walk(root, onerror=walk_error, followlinks=False):
+                candidates += [os.path.join(base, name) for name in dirs + files
+                               if not os.path.islink(os.path.join(base, name))]
+        for path in candidates:
+            attrs = os.listxattr(path, follow_symlinks=False)
+            if attribute in attrs:
+                found.append((root, path, os.getxattr(path, attribute, follow_symlinks=False)))
+
+    removed = []
+    try:
+        for root, path, value in found:
+            os.removexattr(path, attribute, follow_symlinks=False)
+            removed.append((path, value))
+            counts[root] += 1
+    except Exception:
+        restore_errors = []
+        for path, value in reversed(removed):
+            try:
+                os.setxattr(path, attribute, value, follow_symlinks=False)
+            except Exception as e:
+                restore_errors.append(str(e))
+        if restore_errors:
+            raise OSError("quarantine removal failed and could not be rolled back: " +
+                          "; ".join(restore_errors))
+        raise
+    for root, count in counts.items():
+        if count:
+            ok(f"quarantine removed from {os.path.basename(root)} ({count} item(s))")
+
 def resolve(target, override):
     if override: return override if os.path.exists(override) else None
     for p in SPEC[target]["find"]():
         if p and os.path.exists(p): return p
     return None
 
+
+def _mac_prepare_apps(paths):
+    failures = {}
+    seen = set()
+    for path in paths.values():
+        if not path:
+            continue
+        app = _mac_app_bundle(path)
+        if not app or app in seen:
+            continue
+        seen.add(app)
+        try:
+            _mac_prepare_signature_backup(app)
+        except Exception as e:
+            failures[app] = str(e)
+    return failures
+
+
+def _mac_run_patch(targets, overrides):
+    rc = 0
+    paths = {t: resolve(t, overrides.get(t)) for t in targets}
+    app_failures = _mac_prepare_apps(paths)
+    successful = {}
+    changed = []
+    for t in targets:
+        spec = SPEC[t]; path = paths[t]
+        print(f"\n=== {spec['name']} ({t}) ===")
+        if not path:
+            warn("not found (use --path-%s to point at it)" % t); continue
+        print(f"  target: {path}")
+        app = _mac_app_bundle(path)
+        if app in app_failures:
+            warn(f"macOS signature backup failed: {app_failures[app]}")
+            rc = 1; continue
+        try:
+            before = spec["status"](path)[0]
+            if not spec["patch"](path):
+                rc = 1; continue
+            successful[t] = path
+            if before == "unpatched" and spec["status"](path)[0] == "patched":
+                changed.append((t, path))
+        except Exception as e:
+            warn(f"error: {e}"); rc = 1
+
+    if successful:
+        try:
+            _mac_sign_transaction(successful)
+        except Exception as e:
+            warn(f"macOS code signing failed: {e}")
+            for target, path in reversed(changed):
+                if not restore_file(path, SPEC[target]["status"]):
+                    warn(f"automatic rollback failed for {path}")
+            return 1
+        try:
+            _mac_remove_quarantine(successful)
+        except Exception as e:
+            warn(f"couldn't remove macOS quarantine: {e}"); rc = 1
+    return rc
+
+
+def _mac_run_restore(targets, overrides):
+    rc = 0
+    paths = {t: resolve(t, overrides.get(t)) for t in targets}
+    app_failures = _mac_prepare_apps(paths)
+    touched_apps = []
+    for t in targets:
+        spec = SPEC[t]; path = paths[t]
+        print(f"\n=== {spec['name']} ({t}) ===")
+        if not path:
+            warn("not found (use --path-%s to point at it)" % t); continue
+        print(f"  target: {path}")
+        app = _mac_app_bundle(path)
+        if app in app_failures:
+            warn(f"macOS signature backup failed: {app_failures[app]}")
+            rc = 1; continue
+        try:
+            if spec["status"](path)[0] == "patched":
+                if not restore_file(path, spec["status"]):
+                    rc = 1; continue
+                if app and app not in touched_apps:
+                    touched_apps.append(app)
+            else:
+                warn("not patched — skipping restore (backup may be a different build)")
+        except Exception as e:
+            warn(f"error: {e}"); rc = 1
+
+    for app in touched_apps:
+        states = _mac_bundle_patch_states(app)
+        remaining = {target: path for target, (state, path) in states.items()
+                     if state == "patched"}
+        try:
+            if remaining:
+                _mac_sign_transaction(remaining)
+            else:
+                _mac_restore_bundle_signature(app)
+                ok(f"original signature restored for {os.path.basename(app)}")
+        except Exception as e:
+            warn(f"macOS signature restore failed: {e}"); rc = 1
+    return rc
+
+
 def run(action, targets, overrides):
+    if sys.platform == "darwin" and action == "patch":
+        return _mac_run_patch(targets, overrides)
+    if sys.platform == "darwin" and action == "restore":
+        return _mac_run_restore(targets, overrides)
     rc = 0
     for t in targets:
         spec = SPEC[t]; path = resolve(t, overrides.get(t))

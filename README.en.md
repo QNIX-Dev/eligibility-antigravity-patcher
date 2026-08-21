@@ -39,7 +39,7 @@
 - 👥 **Account Profile Manager:** Safely store and quickly switch between multiple authorization profiles offline, without the need for browser-based re-authentication.
 - 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
 - ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
-- 🛡️ **Safe & Reversible:** The patcher requires exactly one original or patched signature inside PE/ELF/Mach-O executable sections, verifies the backup and every write, and rolls back automatically on failure. Original files are kept as `*.agybak`.
+- 🛡️ **Safe & Reversible:** The patcher requires exactly one original or patched signature inside PE/ELF/Mach-O executable sections, verifies the backup and every write, and rolls back automatically on failure. Original files are kept as `*.agybak`; on macOS, the `.app` signature state is also saved in a sibling `*.app.agysignbak` directory.
 - ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, Scoop paths, standard Linux installation prefixes (such as `/opt`, `~/.local/share`, etc.), and macOS `.app` bundles (`/Applications`, `~/Applications`) to automatically locate installations.
 - 🧬 **Version- & Arch-Robust Patching:** Locates instruction signatures using regex patterns rather than brittle static file offsets, and carries per-architecture signatures (x86-64 and aarch64) so the same patch works on Intel and ARM builds alike.
 
@@ -91,6 +91,11 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 > python manager.py --path-cli "D:\CustomTools\agy.exe" patch cli
 > ```
 
+> [!NOTE]
+> **macOS signing runs automatically only while patching on macOS.** The patcher first applies and verifies all selected changes, then ad-hoc signs each modified Mach-O (`agy` and `language_server`) separately, and finally signs the containing `.app` once. Every signature is verified with `codesign`; a failure rolls back the patches and temporary signature changes. After signing succeeds, the patcher automatically removes `com.apple.quarantine` only from the selected applications (recursively for `.app` bundles), preventing Gatekeeper from blocking the locally modified code. During `restore`, the original bundle signature is returned after the last patched target inside that bundle is restored. Keep `*.app.agysignbak` directories for as long as you need the patch and full restoration support.
+>
+> Removing quarantine does not disable Gatekeeper globally or affect other applications or system settings. The original value of this attribute is not restored by the `restore` command.
+
 ---
 
 ## <a id="bypass"></a>🔓 Location Restriction Bypass
@@ -111,7 +116,7 @@ The patcher neutralizes local eligibility checks and directs each client into it
 > [!NOTE]
 > **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform and support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms.
 >
-> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`). For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
+> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
 
 ---
 

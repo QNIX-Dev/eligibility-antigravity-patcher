@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import plistlib
 import sqlite3
 import struct
 import tempfile
@@ -84,6 +85,24 @@ def _minimal_fat_macho(cputypes=(0x01000007,)):
         struct.pack_into(">IIIII", image, 8 + i * 20, cputype, 3, offset, len(thin), 8)
         image[offset:offset + len(thin)] = thin
     return bytes(image)
+
+
+def _mac_app(tmp):
+    app = os.path.join(tmp, "Antigravity.app")
+    contents = os.path.join(app, "Contents")
+    main = os.path.join(contents, "MacOS", "Antigravity")
+    signature = os.path.join(contents, "_CodeSignature", "CodeResources")
+    language_server = os.path.join(contents, "Resources", "bin", "language_server")
+    main_js = os.path.join(contents, "Resources", "app", "out", "main.js")
+    for path in (main, signature, language_server, main_js):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(os.path.join(contents, "Info.plist"), "wb") as f:
+        plistlib.dump({"CFBundleExecutable": "Antigravity"}, f)
+    _write(main, b"vendor-main-signature")
+    _write(signature, b"vendor-resource-envelope")
+    _write(language_server, _minimal_macho())
+    _write(main_js, b"original-js")
+    return app, main, signature, language_server, main_js
 
 
 class GateStateTests(unittest.TestCase):
@@ -380,6 +399,161 @@ class TransactionTests(unittest.TestCase):
             manager._ide_gate_state(original + b";" + original)
         with self.assertRaises(manager.SignatureAmbiguous):
             manager._ide_gate_state(original + b";" + patched)
+
+
+class MacCodeSigningTests(unittest.TestCase):
+    def test_macos_signature_snapshot_restores_outer_bundle_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, main, signature, _, _ = _mac_app(tmp)
+            snapshot = os.path.join(tmp, "snapshot")
+            os.makedirs(snapshot)
+            manager._mac_write_signature_snapshot(app, snapshot)
+
+            _write(main, b"ad-hoc-main-signature")
+            _write(signature, b"ad-hoc-resource-envelope")
+            manager._mac_restore_signature_snapshot(snapshot, app)
+
+            with open(main, "rb") as f:
+                self.assertEqual(f.read(), b"vendor-main-signature")
+            with open(signature, "rb") as f:
+                self.assertEqual(f.read(), b"vendor-resource-envelope")
+
+    def test_macos_signs_each_binary_then_bundle_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _, _, language_server, main_js = _mac_app(tmp)
+            agy = os.path.join(tmp, "agy")
+            _write(agy, _minimal_macho())
+            calls = []
+
+            def record(path, bundle=False):
+                calls.append((path, bundle))
+
+            with (mock.patch.object(manager, "_mac_codesign", side_effect=record),
+                  contextlib.redirect_stdout(io.StringIO())):
+                manager._mac_sign_transaction(
+                    {"cli": agy, "manager": language_server, "ide": main_js})
+
+            self.assertEqual(calls, [(agy, False), (language_server, False), (app, True)])
+
+    def test_macos_signing_failure_restores_every_modified_signature_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, main, signature, language_server, _ = _mac_app(tmp)
+            originals = {}
+            for path in (main, signature, language_server):
+                with open(path, "rb") as f:
+                    originals[path] = f.read()
+
+            def fail_on_bundle(path, bundle=False):
+                if bundle:
+                    _write(main, b"partially-signed-main")
+                    _write(signature, b"partially-signed-envelope")
+                    raise OSError("fixture signing failure")
+                _write(path, b"partially-signed-binary")
+
+            with (mock.patch.object(manager, "_mac_codesign", side_effect=fail_on_bundle),
+                  self.assertRaises(OSError)):
+                manager._mac_sign_transaction({"manager": language_server})
+
+            for path, original in originals.items():
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_macos_restore_returns_persistent_vendor_bundle_signature(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            app, main, signature, _, _ = _mac_app(tmp)
+            backup = app + manager.MAC_SIGNATURE_BAK
+            os.makedirs(backup)
+            manager._mac_write_signature_snapshot(app, backup)
+            _write(main, b"ad-hoc-main-signature")
+            _write(signature, b"ad-hoc-resource-envelope")
+
+            with mock.patch.object(manager, "_mac_codesign_verify") as verify:
+                manager._mac_restore_bundle_signature(app)
+
+            verify.assert_called_once_with(app, bundle=True)
+            with open(main, "rb") as f:
+                self.assertEqual(f.read(), b"vendor-main-signature")
+            with open(signature, "rb") as f:
+                self.assertEqual(f.read(), b"vendor-resource-envelope")
+
+    def test_macos_patch_signing_failure_rolls_back_new_gate(self):
+        gate = manager.Gate(b"ORIG", b"DONE", b"DONE")
+        spec = {
+            "name": "Fixture CLI",
+            "find": lambda: [],
+            "status": lambda path: manager.gate_status(path, gate),
+            "patch": lambda path: manager.gate_patch(path, gate, "Fixture", "agy"),
+        }
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = os.path.join(tmp, "agy")
+            original = _minimal_macho()
+            image = bytearray(original)
+            image[0x200:0x204] = b"ORIG"
+            _write(path, image)
+            with (mock.patch.dict(manager.SPEC, {"cli": spec}),
+                  mock.patch.object(manager, "_mac_sign_transaction",
+                                    side_effect=OSError("fixture signing failure"))):
+                self.assertEqual(manager._mac_run_patch(
+                    ["cli"], {"cli": path}), 1)
+            self.assertEqual(spec["status"](path)[0], "unpatched")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), bytes(image))
+
+    def test_macos_patch_automatically_removes_quarantine_after_signing(self):
+        gate = manager.Gate(b"ORIG", b"DONE", b"DONE")
+        spec = {
+            "name": "Fixture CLI",
+            "find": lambda: [],
+            "status": lambda path: manager.gate_status(path, gate),
+            "patch": lambda path: manager.gate_patch(path, gate, "Fixture", "agy"),
+        }
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = os.path.join(tmp, "agy")
+            image = bytearray(_minimal_macho())
+            image[0x200:0x204] = b"ORIG"
+            _write(path, image)
+            with (mock.patch.dict(manager.SPEC, {"cli": spec}),
+                  mock.patch.object(manager, "_mac_sign_transaction") as sign,
+                  mock.patch.object(manager, "_mac_remove_quarantine") as quarantine):
+                self.assertEqual(manager._mac_run_patch(["cli"], {"cli": path}), 0)
+            sign.assert_called_once_with({"cli": path})
+            quarantine.assert_called_once_with({"cli": path})
+
+    def test_macos_quarantine_removal_covers_bundle_recursively(self):
+        attribute = "com.apple.quarantine"
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            app, main, _, _, main_js = _mac_app(tmp)
+            values = {app: b"root-value", main: b"nested-value"}
+            removed = []
+
+            def listxattr(path, follow_symlinks=False):
+                return [attribute] if path in values else []
+
+            def getxattr(path, name, follow_symlinks=False):
+                self.assertEqual(name, attribute)
+                return values[path]
+
+            def removexattr(path, name, follow_symlinks=False):
+                self.assertEqual(name, attribute)
+                removed.append(path)
+
+            with (mock.patch.object(manager.os, "listxattr", side_effect=listxattr, create=True),
+                  mock.patch.object(manager.os, "getxattr", side_effect=getxattr, create=True),
+                  mock.patch.object(manager.os, "removexattr", side_effect=removexattr, create=True),
+                  mock.patch.object(manager.os, "setxattr", create=True)):
+                manager._mac_remove_quarantine({"ide": main_js})
+
+            self.assertCountEqual(removed, [app, main])
+
+    def test_macos_flow_is_dispatched_only_on_darwin(self):
+        with (mock.patch.object(manager.sys, "platform", "linux"),
+              mock.patch.object(manager, "_mac_run_patch") as mac_patch):
+            self.assertEqual(manager.run("patch", [], {}), 0)
+            mac_patch.assert_not_called()
+        with (mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager, "_mac_run_patch", return_value=7) as mac_patch):
+            self.assertEqual(manager.run("patch", [], {}), 7)
+            mac_patch.assert_called_once_with([], {})
 
 
 if __name__ == "__main__":
