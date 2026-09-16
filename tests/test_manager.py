@@ -195,6 +195,31 @@ class GateStateTests(unittest.TestCase):
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(previous)
 
+    def test_cli_arm64_stack98_real_build_signature(self):
+        # Mach-O arm64, SHA256 a939016cfb86e3862112ee57124f1bc14f30defdd69e181a8526b6e7c80a4471,
+        # file offset 0x220ac7c. Keep the real branch and call displacements.
+        source = bytes.fromhex(
+            "e11800b5c00d00b401204039810d0037e977ff97"
+            "e04f00f9e13300f9e24700f9e32f00f9")
+        state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
+        self.assertEqual((state, offset, gate),
+                         ("unpatched", 8, manager.CLI_GATE_ARM64_STACK98))
+        patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
+        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="arm64")[:2],
+                         ("patched", 8))
+        for first, second in ((source, source), (patched, patched), (source, patched)):
+            with self.subTest(first=first == source, second=second == source):
+                with self.assertRaises(manager.SignatureAmbiguous):
+                    manager.CLI_GATE.resolve(first + second, arch="arm64")
+        for index in (0, 4, 8, 12, 20, 24, 28, 32):
+            wrong_register = bytearray(source)
+            wrong_register[index] ^= 1
+            with self.subTest(index=index):
+                with self.assertRaises(manager.SignatureNotFound):
+                    manager.CLI_GATE.resolve(wrong_register, arch="arm64")
+        with self.assertRaises(manager.SignatureNotFound):
+            manager.CLI_GATE.resolve(source, arch="x64")
+
     def test_cli_arm64_signature_requires_outer_registers(self):
         wrong_outer_register = (
             b"\xe2\x18\x00\xb5"
@@ -342,6 +367,34 @@ class AccountTests(unittest.TestCase):
 
 
 class TransactionTests(unittest.TestCase):
+    def test_macos_scan_patch_and_restore_never_map_file_pages(self):
+        gate = manager.Gate(rb"ORIG", rb"DONE", b"DONE", arch="arm64")
+        status = lambda path: manager.gate_status(path, gate)
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO()),
+              mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager.mmap, "mmap",
+                                side_effect=AssertionError("unsafe file mapping")) as mapping):
+            path = os.path.join(tmp, "fixture")
+            original = bytearray(_minimal_macho(0x0100000C))
+            original[0x200:0x204] = b"ORIG"
+            _write(path, original)
+            self.assertEqual(status(path)[0], "unpatched")
+            self.assertTrue(manager.gate_patch(path, gate, "Fixture", "fixture"))
+            self.assertEqual(status(path)[0], "patched")
+            self.assertTrue(manager.restore_file(path, status))
+            self.assertEqual(status(path)[0], "unpatched")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+            mapping.assert_not_called()
+
+    def test_macos_failed_verification_still_rolls_back_without_mmap(self):
+        with (mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager.mmap, "mmap",
+                                side_effect=AssertionError("unsafe file mapping")) as mapping):
+            self.test_failed_binary_verification_rolls_back()
+            mapping.assert_not_called()
+
     def test_binary_patch_is_verified_idempotent_and_restorable(self):
         gate = manager.Gate(b"ORIG", b"DONE", b"DONE")
         status = lambda path: manager.gate_status(path, gate)
@@ -554,6 +607,49 @@ class MacCodeSigningTests(unittest.TestCase):
               mock.patch.object(manager, "_mac_run_patch", return_value=7) as mac_patch):
             self.assertEqual(manager.run("patch", [], {}), 7)
             mac_patch.assert_called_once_with([], {})
+
+    def test_macos_xattr_fallback_preserves_bytes_and_checks_errors(self):
+        value = b"\x00\xff\nquarantine"
+        path = os.path.abspath("file with spaces")
+        attr = "com.apple.quarantine"
+        with (mock.patch.object(manager.os, "listxattr", None, create=True),
+              mock.patch.object(manager.os, "getxattr", None, create=True),
+              mock.patch.object(manager.os, "setxattr", None, create=True),
+              mock.patch.object(manager.os, "removexattr", None, create=True),
+              mock.patch.object(manager, "_mac_command") as command):
+            command.return_value.stdout = attr + "\n"
+            self.assertEqual(manager._mac_xattr("list", path), [attr])
+            command.return_value.stdout = value.hex() + "\n"
+            self.assertEqual(manager._mac_xattr("get", path, attr), value)
+            manager._mac_xattr("set", path, attr, value)
+            manager._mac_xattr("remove", path, attr)
+            self.assertEqual(command.call_args_list, [
+                mock.call(["/usr/bin/xattr", "-s", path]),
+                mock.call(["/usr/bin/xattr", "-s", "-p", "-x", attr, path]),
+                mock.call(["/usr/bin/xattr", "-s", "-w", "-x", attr, value.hex(), path]),
+                mock.call(["/usr/bin/xattr", "-s", "-d", attr, path]),
+            ])
+            command.side_effect = OSError("permission denied")
+            with self.assertRaises(OSError):
+                manager._mac_xattr("list", path)
+
+    def test_macos_quarantine_failure_restores_removed_attributes(self):
+        attr = "com.apple.quarantine"
+        value = b"\x00\xff\noriginal"
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [os.path.realpath(os.path.join(tmp, name)) for name in ("one", "two")]
+            for path in paths:
+                _write(path, b"fixture")
+            def operation(action, path, attribute=None, data=None):
+                if action == "list": return [attr]
+                if action == "get": return value
+                if action == "remove" and path == paths[1]:
+                    raise OSError("permission denied")
+            with mock.patch.object(manager, "_mac_xattr", side_effect=operation) as xattr:
+                with self.assertRaises(OSError):
+                    manager._mac_remove_quarantine(dict(zip(("cli", "manager"), paths)))
+                self.assertEqual(xattr.call_args_list[-1],
+                                 mock.call("set", paths[0], attr, value))
 
 
 if __name__ == "__main__":
