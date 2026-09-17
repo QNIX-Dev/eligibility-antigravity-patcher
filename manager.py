@@ -71,13 +71,24 @@ def rmtree_quiet(p):
 
 @contextlib.contextmanager
 def mapped(path):
-    """Yield a read-only mmap."""
+    """Yield scan data without mapping signed file pages on macOS."""
     with open(path, "rb") as f:
-        if os.fstat(f.fileno()).st_size == 0:
-            yield b""; return
-        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        try: yield mm
-        finally: mm.close()
+        with _scan_data(f) as data:
+            yield data
+
+@contextlib.contextmanager
+def _scan_data(f):
+    # Reading a modified signed Mach-O through mmap can cause an uncatchable
+    # CODESIGNING SIGKILL on macOS, including during post-write verification.
+    if sys.platform == "darwin":
+        f.seek(0)
+        yield f.read()
+        return
+    if os.fstat(f.fileno()).st_size == 0:
+        yield b""; return
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    try: yield mm
+    finally: mm.close()
 
 def _read_exact(f, offset, size):
     f.seek(offset)
@@ -402,11 +413,8 @@ def gate_patch(path, gate, app, fname):
             raise OSError("target changed after backup")
         ranges, arch = executable_info(path)
         with open(path, "r+b") as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                current_kind, current_off, current_gate = gate.resolve(mm, ranges, arch)
-            finally:
-                mm.close()
+            with _scan_data(f) as data:
+                current_kind, current_off, current_gate = gate.resolve(data, ranges, arch)
             if current_kind != "unpatched" or current_off != off or current_gate is not g:
                 raise OSError("target changed before patch write")
             f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
@@ -461,7 +469,18 @@ CLI_GATE_ARM64 = Gate(
     b"\x21\x00\x80\x52", desc="eligibility screen off (arm64)",
     arch="arm64", accept=_cli_arm64_context)
 
-CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, desc="eligibility screen off")
+# arm64: same ldrb/tbnz check, followed by bl and stack spills at
+# +0x98/+0x60/+0x88/+0x58; mov w1,#1 makes tbnz select eligible.
+CLI_GATE_ARM64_STACK98 = Gate(
+    rb"\x01\x20\x40\x39[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4f\x00\xf9\xe1\x33\x00\xf9\xe2\x47\x00\xf9\xe3\x2f\x00\xf9",
+    rb"\x21\x00\x80\x52[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4f\x00\xf9\xe1\x33\x00\xf9\xe2\x47\x00\xf9\xe3\x2f\x00\xf9",
+    b"\x21\x00\x80\x52", desc="eligibility screen off (arm64, stack98)",
+    arch="arm64", accept=_cli_arm64_context)
+
+CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98,
+                     desc="eligibility screen off")
 
 def cli_default_paths():
     cands = []
@@ -1264,6 +1283,33 @@ def _mac_codesign_verify(path, bundle=False):
     _mac_command(args)
 
 
+def _mac_xattr(action, path, attribute=None, value=None):
+    """Use Python xattr APIs when available, otherwise the macOS system tool."""
+    native = getattr(os, action + "xattr", None)
+    if native is not None:
+        args = [path]
+        if attribute is not None:
+            args.append(attribute)
+        if value is not None:
+            args.append(value)
+        return native(*args, follow_symlinks=False)
+    # Hex transport preserves arbitrary bytes for rollback; -s never follows links.
+    args = ["/usr/bin/xattr", "-s"]
+    if action == "get":
+        args += ["-p", "-x", attribute]
+    elif action == "remove":
+        args += ["-d", attribute]
+    elif action == "set":
+        args += ["-w", "-x", attribute, value.hex()]
+    elif action != "list":
+        raise ValueError("unsupported xattr operation")
+    result = _mac_command(args + [os.path.abspath(path)])
+    if action == "list":
+        return result.stdout.splitlines()
+    if action == "get":
+        return bytes.fromhex(result.stdout)
+
+
 def _mac_remove_quarantine(entries):
     roots = []
     for path in entries.values():
@@ -1284,21 +1330,21 @@ def _mac_remove_quarantine(entries):
                 candidates += [os.path.join(base, name) for name in dirs + files
                                if not os.path.islink(os.path.join(base, name))]
         for path in candidates:
-            attrs = os.listxattr(path, follow_symlinks=False)
+            attrs = _mac_xattr("list", path)
             if attribute in attrs:
-                found.append((root, path, os.getxattr(path, attribute, follow_symlinks=False)))
+                found.append((root, path, _mac_xattr("get", path, attribute)))
 
     removed = []
     try:
         for root, path, value in found:
-            os.removexattr(path, attribute, follow_symlinks=False)
+            _mac_xattr("remove", path, attribute)
             removed.append((path, value))
             counts[root] += 1
     except Exception:
         restore_errors = []
         for path, value in reversed(removed):
             try:
-                os.setxattr(path, attribute, value, follow_symlinks=False)
+                _mac_xattr("set", path, attribute, value)
             except Exception as e:
                 restore_errors.append(str(e))
         if restore_errors:
