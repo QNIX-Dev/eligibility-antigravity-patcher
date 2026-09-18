@@ -449,6 +449,17 @@ CLI_GATE_X64 = Gate(
     rb"\x48\x89\x4c\x24\x70",
     b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
 
+# x64: same test/je/cmp/jne check, followed by call and stack spills at
+# +0x88/+0x50/+0x78; repeating test rax,rax makes jne select eligible.
+CLI_GATE_X64_STACK88 = Gate(
+    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
+    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
+    rb"\x48\x89\x4c\x24\x78",
+    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
+    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
+    rb"\x48\x89\x4c\x24\x78",
+    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64, stack88)", arch="x64")
+
 # arm64:
 #   cbnz x1,error ; cbz x0,eligible ; ldrb w1,[x0,#8] ; tbnz w1,#0,eligible
 #   bl failure builder
@@ -479,7 +490,7 @@ CLI_GATE_ARM64_STACK98 = Gate(
     b"\x21\x00\x80\x52", desc="eligibility screen off (arm64, stack98)",
     arch="arm64", accept=_cli_arm64_context)
 
-CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98,
+CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_X64_STACK88, CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98,
                      desc="eligibility screen off")
 
 def cli_default_paths():
