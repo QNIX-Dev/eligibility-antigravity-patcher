@@ -88,6 +88,7 @@ def _minimal_fat_macho(cputypes=(0x01000007,)):
 
 
 def _mac_app(tmp):
+    tmp = os.path.realpath(tmp)
     app = os.path.join(tmp, "Antigravity.app")
     contents = os.path.join(app, "Contents")
     main = os.path.join(contents, "MacOS", "Antigravity")
@@ -217,6 +218,29 @@ class GateStateTests(unittest.TestCase):
             with self.subTest(index=index):
                 with self.assertRaises(manager.SignatureNotFound):
                     manager.CLI_GATE.resolve(wrong_register, arch="arm64")
+        with self.assertRaises(manager.SignatureNotFound):
+            manager.CLI_GATE.resolve(source, arch="x64")
+
+    def test_cli_arm64_stack90_real_build_signature(self):
+        # CLI 1.2.7 macOS arm64, file offset 0x22e83d8.
+        source = bytes.fromhex(
+            "811500b5000c00b402204039c20b0037e876ff97"
+            "e04b00f9e12f00f9e23f00f9e32b00f9")
+        state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
+        self.assertEqual((state, offset, gate),
+                         ("unpatched", 8, manager.CLI_GATE_ARM64_STACK90))
+        patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
+        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="arm64")[:2],
+                         ("patched", 8))
+        for first, second in ((source, source), (patched, patched), (source, patched)):
+            with self.assertRaises(manager.SignatureAmbiguous):
+                manager.CLI_GATE.resolve(first + second, arch="arm64")
+        for index in (0, 4, 8, 12, 20, 24, 28, 32):
+            invalid = bytearray(source)
+            invalid[index] ^= 1
+            with self.subTest(index=index):
+                with self.assertRaises(manager.SignatureNotFound):
+                    manager.CLI_GATE.resolve(invalid, arch="arm64")
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(source, arch="x64")
 
@@ -473,6 +497,7 @@ class MacCodeSigningTests(unittest.TestCase):
 
     def test_macos_signs_each_binary_then_bundle_once(self):
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
             app, _, _, language_server, main_js = _mac_app(tmp)
             agy = os.path.join(tmp, "agy")
             _write(agy, _minimal_macho())
