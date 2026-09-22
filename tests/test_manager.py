@@ -193,6 +193,31 @@ class GateStateTests(unittest.TestCase):
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(source, arch="arm64")
 
+    def test_cli_x64_stack88_70_real_build_signature(self):
+        # ELF x64, SHA256 9991515b6d5307bcf701069622b0537b6b206e605f3c891c0cf3a3d208dea8b0,
+        # file offset 0x90bbac0. Keep the real branch and call displacements.
+        source = bytes.fromhex(
+            "4885c00f84d8010000807808000f85ce010000"
+            "e8885ffdff488984248800000048895c245048894c2470")
+        state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
+        self.assertEqual((state, offset, gate),
+                         ("unpatched", 9, manager.CLI_GATE_X64_STACK88_70))
+        patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
+        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="x64")[:2],
+                         ("patched", 9))
+        for first, second in ((source, source), (patched, patched), (source, patched)):
+            with self.subTest(first=first == source, second=second == source):
+                with self.assertRaises(manager.SignatureAmbiguous):
+                    manager.CLI_GATE.resolve(first + second, arch="x64")
+        for index in (0, 9, 19, 24, 32, 37):
+            wrong_opcode = bytearray(source)
+            wrong_opcode[index] ^= 1
+            with self.subTest(index=index):
+                with self.assertRaises(manager.SignatureNotFound):
+                    manager.CLI_GATE.resolve(wrong_opcode, arch="x64")
+        with self.assertRaises(manager.SignatureNotFound):
+            manager.CLI_GATE.resolve(source, arch="arm64")
+
     def test_current_cli_arm64_signature_and_patch(self):
         source = (
             b"\xe1\x18\x00\xb5"
