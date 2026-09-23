@@ -501,8 +501,19 @@ CLI_GATE_ARM64_STACK98 = Gate(
     b"\x21\x00\x80\x52", desc="eligibility screen off (arm64, stack98)",
     arch="arm64", accept=_cli_arm64_context)
 
+# CLI 1.2.7 macOS arm64: ldrb w2,[x0,#8] ; tbnz w2,#0,eligible ;
+# bl IneligibilityFromResult ; spills x0/x1/x2/x3 at +0x90/+0x58/+0x78/+0x50.
+# mov w2,#1 selects the existing eligible branch.
+CLI_GATE_ARM64_STACK90 = Gate(
+    rb"\x02\x20\x40\x39[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x2f\x00\xf9\xe2\x3f\x00\xf9\xe3\x2b\x00\xf9",
+    rb"\x22\x00\x80\x52[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
+    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x2f\x00\xf9\xe2\x3f\x00\xf9\xe3\x2b\x00\xf9",
+    b"\x22\x00\x80\x52", desc="eligibility screen off (arm64, stack90)",
+    arch="arm64", accept=_cli_arm64_context)
+
 CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_X64_STACK88, CLI_GATE_X64_STACK88_70,
-                     CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98,
+                     CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98, CLI_GATE_ARM64_STACK90,
                      desc="eligibility screen off")
 
 def cli_default_paths():
