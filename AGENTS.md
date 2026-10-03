@@ -41,7 +41,8 @@ Do not consider a patching change complete until the entire test suite passes.
 - Use regex wildcards or byte classes only for bytes that genuinely vary, such as relative branch displacements. Keep opcode, register, bit-number, and stable surrounding-instruction bytes constrained.
 - Add a short instruction-level comment above each binary gate explaining what the regex matches and what the replacement does.
 - A context callback such as `accept=` may be used when required to validate bytes immediately outside the regex match, but the signature itself must still remain an inline regex in the `Gate` declaration.
-- When a signature changes, add a regression fixture using bytes from the real build and retain coverage for older supported layouts.
+- Keep only the latest verified signature for each target and architecture; replace obsolete layouts instead of retaining version compatibility.
+- When a signature changes, use bytes from the real build in a minimal regression test covering both `unpatched` and `patched` recognition. Remove tests for obsolete layouts; preserve shared safety and transaction tests.
 
 Example of the required formatting:
 
