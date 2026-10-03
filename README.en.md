@@ -96,6 +96,15 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 >
 > Removing quarantine does not disable Gatekeeper globally or affect other applications or system settings. The original value of this attribute is not restored by the `restore` command.
 
+> [!WARNING]
+> **Electron and Library Validation on macOS.** The app's signing flags and entitlements are inspected before patch writes. If Library Validation is enabled without an exception, the patcher stops: ad-hoc signing removes the main executable's Team ID and may make it incompatible with the Electron Framework signature. Failure to read signing metadata or entitlements also stops the patch. To explicitly allow libraries with other or no signatures in the selected app, use:
+> ```bash
+> python3 manager.py --macos-disable-library-validation patch ide
+> ```
+> The flag applies only to `patch`/`menu` on macOS and adds `com.apple.security.cs.disable-library-validation=true` only to the selected Electron `.app`'s main executable, when needed. Other entitlements, the identifier, signing flags, and Hardened Runtime are preserved; frameworks and helpers are not re-signed. Entitlements are read back and checked after signing; failure triggers rollback. `restore` returns the original signature and entitlements from `*.app.agysignbak` after the last patched target is restored. To repair an already patched copy, rerun the CLI patch command with the flag.
+>
+> The exception weakens library loading checks for this executable only, rather than globally. Successful `codesign --verify` confirms the signature but does not guarantee that the app launches. Test patching, launching, and subsequent restoration on a separate `.app` copy; full launch validation requires macOS.
+
 ---
 
 ## <a id="bypass"></a>🔓 Location Restriction Bypass

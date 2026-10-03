@@ -88,7 +88,7 @@ def _minimal_fat_macho(cputypes=(0x01000007,)):
     return bytes(image)
 
 
-def _mac_app(tmp):
+def _mac_app(tmp, electron=False):
     tmp = os.path.realpath(tmp)
     app = os.path.join(tmp, "Antigravity.app")
     contents = os.path.join(app, "Contents")
@@ -104,6 +104,10 @@ def _mac_app(tmp):
     _write(signature, b"vendor-resource-envelope")
     _write(language_server, _minimal_macho())
     _write(main_js, b"original-js")
+    if electron:
+        framework = os.path.join(contents, "Frameworks", "Electron Framework.framework", "Electron Framework")
+        os.makedirs(os.path.dirname(framework))
+        _write(framework, b"vendor-framework-signature")
     return app, main, signature, language_server, main_js
 
 
@@ -421,6 +425,103 @@ class TransactionTests(unittest.TestCase):
 
 
 class MacCodeSigningTests(unittest.TestCase):
+    def test_electron_preflight_failures_leave_app_untouched(self):
+        for failure in ("conflict", "entitlements", "entitlement_type", "flags", "team", "read"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                app, main, signature, _, main_js = _mac_app(tmp, electron=True)
+                source = b"resetIsTierGCPTos(),this.account.isGoogleInternal"
+                _write(main_js, source)
+                originals = {path: manager._mac_entry_digest(path) for path in (main, signature, main_js)}
+
+                def command(args, check=True):
+                    if failure == "read":
+                        raise OSError("fixture codesign read failure")
+                    if "--entitlements" in args:
+                        values = {manager.MAC_DISABLE_LIBRARY_VALIDATION: "true"} if failure == "entitlement_type" else {}
+                        xml = "<plist>" if failure == "entitlements" else plistlib.dumps(values).decode()
+                        return manager.subprocess.CompletedProcess(args, 0, xml, "")
+                    details = "" if failure == "team" else "TeamIdentifier=GOOGLE\n"
+                    if failure != "flags":
+                        details += "CodeDirectory flags=0x10000(runtime)\n"
+                    return manager.subprocess.CompletedProcess(args, 0, "", details)
+
+                with (mock.patch.object(manager, "_mac_command", side_effect=command),
+                      mock.patch.object(manager, "_mac_prepare_signature_backup") as backup,
+                      mock.patch.object(manager, "_mac_sign_transaction") as sign,
+                      contextlib.redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(manager._mac_run_patch(["ide"], {"ide": main_js}), 1)
+                backup.assert_not_called()
+                sign.assert_not_called()
+                self.assertFalse(os.path.exists(main_js + manager.BAK))
+                for path, digest in originals.items():
+                    self.assertEqual(manager._mac_entry_digest(path), digest)
+                if failure == "conflict":
+                    self.assertIn("--macos-disable-library-validation", output.getvalue())
+
+    def test_electron_without_library_validation_conflict_needs_no_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _, _, _, _ = _mac_app(tmp, electron=True)
+            for flags, entitlements in (("0x0(none)", {}),
+                                        ("0x10000(runtime)", {manager.MAC_DISABLE_LIBRARY_VALIDATION: True})):
+                with self.subTest(flags=flags):
+                    def command(args, check=True):
+                        xml = plistlib.dumps(entitlements).decode() if "--entitlements" in args else ""
+                        return manager.subprocess.CompletedProcess(args, 0, xml, "CodeDirectory flags=" + flags)
+                    with mock.patch.object(manager, "_mac_command", side_effect=command):
+                        self.assertIsNone(manager._mac_library_validation_entitlements(app))
+
+    def test_electron_opt_in_signing_preserves_entitlements_and_rolls_back_failures(self):
+        for failure in (None, "sign", "verify", "entitlements", "metadata"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                app, main, signature, _, main_js = _mac_app(tmp, electron=True)
+                framework = os.path.join(app, "Contents", "Frameworks", "Electron Framework.framework", "Electron Framework")
+                source = b"resetIsTierGCPTos(),this.account.isGoogleInternal"
+                _write(main_js, source)
+                originals = {path: manager._mac_entry_digest(path) for path in (main, signature, main_js, framework)}
+                original_entitlements = {"com.apple.security.cs.allow-jit": True,
+                                         "com.apple.security.cs.allow-unsigned-executable-memory": False}
+                expected = {**original_entitlements, manager.MAC_DISABLE_LIBRARY_VALIDATION: True}
+                signed_paths = []
+
+                def command(args, check=True):
+                    with open(main, "rb") as f:
+                        signed = f.read() != b"vendor-main-signature"
+                    if failure == "metadata" and "-d" in args and "--verbose=2" in args:
+                        if manager.ide_status(main_js)[0] == "patched":
+                            return manager.subprocess.CompletedProcess(args, 1, "", "fixture metadata read failure")
+                    if "--sign" in args:
+                        self.assertEqual(args[-1], app)
+                        self.assertNotIn("--deep", args)
+                        self.assertIn("--preserve-metadata=identifier,flags,runtime", args)
+                        with open(args[args.index("--entitlements") + 1], "rb") as f:
+                            self.assertEqual(plistlib.load(f), expected)
+                        signed_paths.append(args[-1])
+                        _write(main, b"ad-hoc-main-signature")
+                        _write(signature, b"ad-hoc-resource-envelope")
+                        if failure == "sign":
+                            raise OSError("fixture signing failure")
+                    elif "--verify" in args and signed and failure == "verify":
+                        raise OSError("fixture verification failure")
+                    elif "--entitlements" in args:
+                        entitlements = expected if signed and failure != "entitlements" else original_entitlements
+                        return manager.subprocess.CompletedProcess(args, 0, plistlib.dumps(entitlements).decode(), "")
+                    details = "CodeDirectory flags=0x10000(runtime)\n"
+                    details += "Signature=adhoc\nTeamIdentifier=not set\n" if signed else "TeamIdentifier=GOOGLE\n"
+                    return manager.subprocess.CompletedProcess(args, 0, "", details)
+
+                with (mock.patch.object(manager.sys, "platform", "darwin"),
+                      mock.patch.object(manager, "_mac_command", side_effect=command),
+                      mock.patch.object(manager, "_mac_remove_quarantine"),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    result = manager.main(["--macos-disable-library-validation", "--path-ide", main_js, "patch", "ide"])
+                    self.assertEqual(result, 0 if failure is None else 1)
+                    if failure is None:
+                        self.assertEqual(manager.ide_status(main_js)[0], "patched")
+                        self.assertEqual(manager.main(["--path-ide", main_js, "restore", "ide"]), 0)
+                self.assertEqual(signed_paths, [] if failure == "metadata" else [app])
+                for path, digest in originals.items():
+                    self.assertEqual(manager._mac_entry_digest(path), digest)
+
     def test_macos_signature_snapshot_restores_outer_bundle_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, main, signature, _, _ = _mac_app(tmp)

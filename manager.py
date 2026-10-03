@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse, base64, contextlib, errno, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
+from xml.parsers.expat import ExpatError
 try:
     import winreg
 except Exception:
@@ -10,6 +11,7 @@ except Exception:
 
 BAK = ".agybak"
 MAC_SIGNATURE_BAK = ".agysignbak"
+MAC_DISABLE_LIBRARY_VALIDATION = "com.apple.security.cs.disable-library-validation"
 TARGETS = ("cli", "manager", "ide")
 
 # Utilities
@@ -1196,21 +1198,78 @@ def _mac_command(args, check=True):
     return result
 
 
-def _mac_codesign(path, bundle=False):
+def _mac_entitlements(path):
+    result = _mac_command(["/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", path])
+    if not result.stdout.strip():
+        return {}
+    try:
+        entitlements = plistlib.loads(result.stdout.encode("utf-8"))
+    except (ValueError, ExpatError):
+        raise OSError("cannot parse macOS signing entitlements") from None
+    if not isinstance(entitlements, dict):
+        raise OSError("macOS signing entitlements must be a dictionary")
+    return entitlements
+
+
+def _mac_library_validation_entitlements(app, allow_disable=False):
+    """Plan an explicit Electron signing exception before any patch writes."""
+    framework = os.path.join(app, "Contents", "Frameworks", "Electron Framework.framework")
+    if not os.path.isdir(framework):
+        return None
+    _mac_bundle_main(app)  # Validate the executable covered by the bundle signature.
+    display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=4", app])
+    details = display.stdout + display.stderr
+    flags = re.search(r"\bflags=0x([0-9a-fA-F]+)\b", details)
+    if not flags:
+        raise OSError("cannot determine Electron code-signing flags before patching")
+    # CS_RUNTIME enables Library Validation; CS_REQUIRE_LV requests it explicitly.
+    if not int(flags[1], 16) & (0x10000 | 0x2000):
+        return None
+    entitlements = _mac_entitlements(app)
+    exception = entitlements.get(MAC_DISABLE_LIBRARY_VALIDATION, False)
+    if not isinstance(exception, bool):
+        raise OSError("invalid Electron disable-library-validation entitlement")
+    if exception:
+        return None
+    framework_display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=4", framework])
+    framework_details = framework_display.stdout + framework_display.stderr
+    team = re.search(r"^TeamIdentifier=(.*)$", framework_details, re.M)
+    if not team:
+        raise OSError("cannot determine Electron Framework Team ID before patching")
+    if not allow_disable:
+        raise OSError(
+            "Electron Library Validation would reject bundled frameworks after ad-hoc signing "
+            f"(Electron Framework Team ID: {team[1].strip()}; ad-hoc Team ID: none). "
+            "No patch was applied. To permit other/unsigned libraries in this app's main executable, "
+            "rerun patch with --macos-disable-library-validation")
+    return {**entitlements, MAC_DISABLE_LIBRARY_VALIDATION: True}
+
+
+def _mac_codesign(path, bundle=False, entitlements=None):
     display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=2", path], check=False)
+    if entitlements is not None and display.returncode:
+        raise OSError("cannot preserve Electron signing metadata before applying the Library Validation exception")
     args = ["/usr/bin/codesign", "--force", "--sign", "-"]
     if display.returncode == 0:
-        args.append("--preserve-metadata=identifier,entitlements,flags,runtime")
-    args.append(path)
-    _mac_command(args)
-    verify = ["/usr/bin/codesign", "--verify"]
-    if bundle:
-        verify.append("--deep")
-    verify += ["--strict", "--verbose=2", path]
-    _mac_command(verify)
+        metadata = "identifier,flags,runtime" if entitlements is not None else "identifier,entitlements,flags,runtime"
+        args.append("--preserve-metadata=" + metadata)
+    with tempfile.TemporaryDirectory(prefix="agy-macos-entitlements-") as temp:
+        if entitlements is not None:
+            if not bundle:
+                raise ValueError("Library Validation exceptions are limited to the app bundle's main executable")
+            plist = os.path.join(temp, "entitlements.plist")
+            with open(plist, "wb") as f:
+                plistlib.dump(entitlements, f)
+            args += ["--entitlements", plist]
+            warn(f"disabling Library Validation for {os.path.basename(path)} main executable only; "
+                 "this permits libraries with other or no signatures")
+        _mac_command(args + [path])
+        _mac_codesign_verify(path, bundle=bundle)
+        if entitlements is not None and _mac_entitlements(path) != entitlements:
+            raise OSError("signed macOS entitlements do not match the requested entitlements")
 
 
-def _mac_sign_transaction(entries):
+def _mac_sign_transaction(entries, bundle_entitlements=None):
     binaries = []
     bundles = []
     for target, path in entries.items():
@@ -1241,7 +1300,11 @@ def _mac_sign_transaction(entries):
             for path in binaries:
                 _mac_codesign(path)
             for app in bundles:
-                _mac_codesign(app, bundle=True)
+                entitlements = (bundle_entitlements or {}).get(app)
+                if entitlements is None:
+                    _mac_codesign(app, bundle=True)
+                else:
+                    _mac_codesign(app, bundle=True, entitlements=entitlements)
             for path in binaries:
                 ok(f"ad-hoc signed {os.path.basename(path)}")
             for app in bundles:
@@ -1365,7 +1428,7 @@ def resolve(target, override):
     return None
 
 
-def _mac_prepare_apps(paths):
+def _mac_prepare_apps(paths, signing_entitlements=None, disable_library_validation=False):
     failures = {}
     seen = set()
     for path in paths.values():
@@ -1376,16 +1439,22 @@ def _mac_prepare_apps(paths):
             continue
         seen.add(app)
         try:
+            entitlements = None
+            if signing_entitlements is not None:
+                entitlements = _mac_library_validation_entitlements(app, disable_library_validation)
             _mac_prepare_signature_backup(app)
+            if entitlements is not None:
+                signing_entitlements[app] = entitlements
         except Exception as e:
             failures[app] = str(e)
     return failures
 
 
-def _mac_run_patch(targets, overrides):
+def _mac_run_patch(targets, overrides, disable_library_validation=False):
     rc = 0
     paths = {t: resolve(t, overrides.get(t)) for t in targets}
-    app_failures = _mac_prepare_apps(paths)
+    signing_entitlements = {}
+    app_failures = _mac_prepare_apps(paths, signing_entitlements, disable_library_validation)
     successful = {}
     changed = []
     for t in targets:
@@ -1396,7 +1465,7 @@ def _mac_run_patch(targets, overrides):
         print(f"  target: {path}")
         app = _mac_app_bundle(path)
         if app in app_failures:
-            warn(f"macOS signature backup failed: {app_failures[app]}")
+            warn(f"macOS signing preparation failed: {app_failures[app]}")
             rc = 1; continue
         try:
             before = spec["status"](path)[0]
@@ -1410,7 +1479,10 @@ def _mac_run_patch(targets, overrides):
 
     if successful:
         try:
-            _mac_sign_transaction(successful)
+            if signing_entitlements:
+                _mac_sign_transaction(successful, bundle_entitlements=signing_entitlements)
+            else:
+                _mac_sign_transaction(successful)
         except Exception as e:
             warn(f"macOS code signing failed: {e}")
             for target, path in reversed(changed):
@@ -1465,8 +1537,10 @@ def _mac_run_restore(targets, overrides):
     return rc
 
 
-def run(action, targets, overrides):
+def run(action, targets, overrides, macos_disable_library_validation=False):
     if sys.platform == "darwin" and action == "patch":
+        if macos_disable_library_validation:
+            return _mac_run_patch(targets, overrides, disable_library_validation=True)
         return _mac_run_patch(targets, overrides)
     if sys.platform == "darwin" and action == "restore":
         return _mac_run_restore(targets, overrides)
@@ -1622,7 +1696,7 @@ def _accounts_menu(console, qs):
         if act in (None, "back"): return
         _accounts_submenu(console, qs, act)
 
-def interactive(overrides):
+def interactive(overrides, macos_disable_library_validation=False):
     import questionary
     from rich.console import Console
     console = Console()
@@ -1662,7 +1736,7 @@ def interactive(overrides):
         if not sel:
             continue
         console.rule(f"[bold cyan]{action}[/]")
-        run(action, sel, overrides)
+        run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
         for t in sel:
             status[t] = _status_of(t, paths[t])
         console.rule(style="dim")
@@ -1678,7 +1752,12 @@ def main(argv=None):
     ap.add_argument("targets", nargs="*", default=[], metavar="{cli,manager,ide}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
+    ap.add_argument("--macos-disable-library-validation", action="store_true",
+                    help="allow an Electron app's main executable to load other/unsigned libraries after ad-hoc signing (macOS patch/menu only)")
     args = ap.parse_args(argv)
+
+    if args.macos_disable_library_validation and (sys.platform != "darwin" or args.action not in (None, "menu", "patch")):
+        ap.error("--macos-disable-library-validation is only available for patch/menu on macOS")
 
     if args.action == "accounts":
         return run_accounts(args.targets)
@@ -1693,7 +1772,7 @@ def main(argv=None):
             import questionary, rich  # noqa: F401
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 raise RuntimeError("not a terminal")
-            return interactive(overrides)
+            return interactive(overrides, macos_disable_library_validation=args.macos_disable_library_validation)
         except KeyboardInterrupt:
             print(); return 0
         except ImportError:
@@ -1707,7 +1786,7 @@ def main(argv=None):
 
     targets = args.targets if args.targets else list(TARGETS)
     print(f"agy-manager - {args.action}")
-    return run(args.action, targets, overrides)
+    return run(args.action, targets, overrides, macos_disable_library_validation=args.macos_disable_library_validation)
 
 if __name__ == "__main__":
     raise SystemExit(main())
