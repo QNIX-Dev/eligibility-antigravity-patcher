@@ -437,44 +437,18 @@ def gate_patch(path, gate, app, fname):
     return True
 
 # CLI eligibility screen
-# x64:
-#   test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible ; call failure builder
-# Repeating the non-null test keeps ZF=0, so jne always selects eligible.
+# CLI 1.2.16 Windows x64: test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible ;
+# call failure builder ; spill rax/rbx/rcx at +0xd8/+0xe0/+0xe8.
+# Repeating test rax,rax keeps ZF=0, so jne selects eligible.
 CLI_GATE_X64 = Gate(
     rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x80\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x70",
+    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
     rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x80\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x70",
+    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
     b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
 
-# x64: same test/je/cmp/jne check, followed by call and stack spills at
-# +0x88/+0x50/+0x78; repeating test rax,rax makes jne select eligible.
-CLI_GATE_X64_STACK88 = Gate(
-    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x78",
-    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x78",
-    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64, stack88)", arch="x64")
-
-# x64: same test/je/cmp/jne check, followed by call and stack spills at
-# +0x88/+0x50/+0x70; repeating test rax,rax makes jne select eligible.
-CLI_GATE_X64_STACK88_70 = Gate(
-    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x70",
-    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\x88\x00\x00\x00\x48\x89\x5c\x24\x50"
-    rb"\x48\x89\x4c\x24\x70",
-    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64, stack88_70)", arch="x64")
-
-# arm64:
-#   cbnz x1,error ; cbz x0,eligible ; ldrb w1,[x0,#8] ; tbnz w1,#0,eligible
-#   bl failure builder
-# Loading 1 instead makes tbnz always select eligible.
 def _cli_arm64_context(data, match, start, end):
     off = match.start()
     if off - 8 < start:
@@ -483,38 +457,19 @@ def _cli_arm64_context(data, match, start, end):
     return ((cbnz_x1 & 0xff00001f) == 0xb5000001 and
             (cbz_x0 & 0xff00001f) == 0xb4000000)
 
-CLI_GATE_ARM64 = Gate(
-    rb"\x01\x20\x40\x39[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
-    rb"\x21\x00\x80\x52[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9",
-    b"\x21\x00\x80\x52", desc="eligibility screen off (arm64)",
-    arch="arm64", accept=_cli_arm64_context)
-
-# arm64: same ldrb/tbnz check, followed by bl and stack spills at
-# +0x98/+0x60/+0x88/+0x58; mov w1,#1 makes tbnz select eligible.
-CLI_GATE_ARM64_STACK98 = Gate(
-    rb"\x01\x20\x40\x39[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4f\x00\xf9\xe1\x33\x00\xf9\xe2\x47\x00\xf9\xe3\x2f\x00\xf9",
-    rb"\x21\x00\x80\x52[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4f\x00\xf9\xe1\x33\x00\xf9\xe2\x47\x00\xf9\xe3\x2f\x00\xf9",
-    b"\x21\x00\x80\x52", desc="eligibility screen off (arm64, stack98)",
-    arch="arm64", accept=_cli_arm64_context)
-
-# CLI 1.2.7 macOS arm64: ldrb w2,[x0,#8] ; tbnz w2,#0,eligible ;
-# bl IneligibilityFromResult ; spills x0/x1/x2/x3 at +0x90/+0x58/+0x78/+0x50.
+# CLI 1.2.16 macOS/Linux arm64: ldrb w2,[x0,#8] ; tbnz w2,#0,eligible ;
+# bl IneligibilityFromResult ; stp x0-x7 at +0xe0/+0xf0/+0x100/+0x110.
 # mov w2,#1 selects the existing eligible branch.
-CLI_GATE_ARM64_STACK90 = Gate(
+CLI_GATE_ARM64 = Gate(
     rb"\x02\x20\x40\x39[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x2f\x00\xf9\xe2\x3f\x00\xf9\xe3\x2b\x00\xf9",
+    rb"...[\x94-\x97]\xe0\x07\x0e\xa9\xe2\x0f\x0f\xa9\xe4\x17\x10\xa9\xe6\x1f\x11\xa9",
     rb"\x22\x00\x80\x52[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x4b\x00\xf9\xe1\x2f\x00\xf9\xe2\x3f\x00\xf9\xe3\x2b\x00\xf9",
-    b"\x22\x00\x80\x52", desc="eligibility screen off (arm64, stack90)",
+    rb"...[\x94-\x97]\xe0\x07\x0e\xa9\xe2\x0f\x0f\xa9\xe4\x17\x10\xa9\xe6\x1f\x11\xa9",
+    b"\x22\x00\x80\x52", desc="eligibility screen off (arm64)",
     arch="arm64", accept=_cli_arm64_context)
 
-CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_X64_STACK88, CLI_GATE_X64_STACK88_70,
-                     CLI_GATE_ARM64, CLI_GATE_ARM64_STACK98, CLI_GATE_ARM64_STACK90,
-                     desc="eligibility screen off")
+CLI_GATE = MultiGate(CLI_GATE_X64, CLI_GATE_ARM64, desc="eligibility screen off")
+
 
 def cli_default_paths():
     cands = []
@@ -534,19 +489,21 @@ def cli_default_paths():
     return _dedup_newest(cands)
 
 # Manager auth result
-# x64: force hasValidAuth and fall through to token attachment.
-# cmp byte[rax+8],0 ; je short  ->  mov byte[rax+8],1 ; nop*2
-MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b.\x24.\x48\x89.\x60",
-                        rb"\xc6\x40\x08\x01\x90\x90\x48\x8b.\x24.\x48\x89.\x60",
+# Manager 2.19.1 Windows x64: force hasValidAuth and fall through to token attachment.
+# cmp byte[rax+8],0 ; je ; mov rdx,[rsp+0x70] ; mov [rax+0x60],rdx
+# Replacing cmp/je with mov byte[rax+8],1 ; nop*2 selects the success path.
+MANAGER_GATE_X64 = Gate(rb"\x80\x78\x08\x00\x74.\x48\x8b\x54\x24\x70\x48\x89\x50\x60",
+                        rb"\xc6\x40\x08\x01\x90\x90\x48\x8b\x54\x24\x70\x48\x89\x50\x60",
                         b"\xc6\x40\x08\x01\x90\x90", desc="hasValidAuth=true", arch="x64")
 
-# arm64: force hasValidAuth and remove the token-attachment branch.
+# Manager 2.19.1 Linux arm64: verified against the archive's language_server.
+# Force hasValidAuth and remove the token-attachment branch.
 #   ldrb w3,[x0,#8] ; tbz w3,#0,skip  ->  mov w3,#1 ; strb w3,[x0,#8]
-# Accept every branch displacement while fixing Rt=w3 and bit #0. Builds use
-# either one or two setup instructions before the token stp.
+# Keep the current ldp x3,x4,[sp,#0x80] ; stp x3,x4,[x0,#0x60] context.
+# Only the tbz displacement varies; Rt=w3 and bit #0 stay fixed.
 MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39[\x03\x23\x43\x63\x83\xa3\xc3\xe3]."
-                          rb"[\x00-\x07]\x36(?:....){1,2}\x03\x10\x06\xa9",
-                          rb"\x23\x00\x80\x52\x03\x20\x00\x39(?:....){1,2}"
+                          rb"[\x00-\x07]\x36\xe3\x13\x48\xa9\x03\x10\x06\xa9",
+                          rb"\x23\x00\x80\x52\x03\x20\x00\x39\xe3\x13\x48\xa9"
                           rb"\x03\x10\x06\xa9",
                           b"\x23\x00\x80\x52\x03\x20\x00\x39", desc="hasValidAuth=true (arm64)",
                           arch="arm64")
@@ -561,6 +518,8 @@ def manager_default_bins():
     return _posix_find(rel, "antigravity")
 
 # IDE
+# IDE 2.5.5 macOS arm64: gate recognition reported in issue #8; JavaScript is arch-independent.
+# Replace this.<minified field>.isGoogleInternal with true after resetIsTierGCPTos().
 IDE_RE = re.compile(rb"(resetIsTierGCPTos\(\),)this\.[A-Za-z_$0-9]+\.isGoogleInternal")
 IDE_DONE = b"resetIsTierGCPTos(),true"
 IDE_DONE_RE = re.compile(re.escape(IDE_DONE))

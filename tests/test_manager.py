@@ -145,198 +145,63 @@ class GateStateTests(unittest.TestCase):
             multi.resolve(b"X64--ARM")
 
     def test_current_cli_x64_signature_and_patch(self):
-        source = (
-            b"\x48\x85\xc0\x0f\x84\x0d\x02\x00\x00"
-            b"\x80\x78\x08\x00\x0f\x85\x03\x02\x00\x00"
-            b"\xe8\x68\xf1\xfd\xff"
-            b"\x48\x89\x84\x24\x80\x00\x00\x00"
-            b"\x48\x89\x5c\x24\x50\x48\x89\x4c\x24\x70"
-        )
-        state, offset, gate = manager.CLI_GATE.resolve(source)
+        # CLI 1.2.16 Windows x64, file offset 0x29fa500, SHA256
+        # 871e1eeb205dd3269b762e81808b7a86fe7cf73b59da51b14e3d8ac005581bfe.
+        source = bytes.fromhex(
+            "4885c00f8498020000807808000f858e020000"
+            "e8284afdff48898424d800000048899c24e000000048898c24e8000000")
+        state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
         self.assertEqual((state, offset, gate), ("unpatched", 9, manager.CLI_GATE_X64))
-        patched = bytearray(source)
-        patched[offset:offset + len(gate.fix)] = gate.fix
-        self.assertEqual(manager.CLI_GATE.resolve(patched)[:2], ("patched", 9))
-
-    def test_previous_cli_x64_signature_is_not_supported(self):
-        previous = (
-            b"\x48\x85\xc0\x0f\x84\xf6\x01\x00\x00"
-            b"\x80\x78\x08\x00\x0f\x85\xec\x01\x00\x00"
-            b"\xe8\x12\x34\x56\x78"
-            b"\x48\x89\x44\x24\x78\x48\x89\x5c\x24\x48"
-            b"\x48\x89\x4c\x24\x68"
-        )
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(previous)
-
-    def test_cli_x64_stack88_real_build_signature(self):
-        # ELF x64, SHA256 84808e105f643f135d9b347b36005d5bbe6cfe09c5ffc61e3311700adb5a3286,
-        # file offset 0x8db7480. Keep the real branch and call displacements.
-        source = bytes.fromhex(
-            "4885c00f8413020000807808000f8509020000"
-            "e8a862fdff488984248800000048895c245048894c2478")
-        state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
-        self.assertEqual((state, offset, gate),
-                         ("unpatched", 9, manager.CLI_GATE_X64_STACK88))
         patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
-        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="x64")[:2],
-                         ("patched", 9))
-        for first, second in ((source, source), (patched, patched), (source, patched)):
-            with self.subTest(first=first == source, second=second == source):
-                with self.assertRaises(manager.SignatureAmbiguous):
-                    manager.CLI_GATE.resolve(first + second, arch="x64")
-        for index in (0, 9, 19, 24, 32, 37):
-            wrong_opcode = bytearray(source)
-            wrong_opcode[index] ^= 1
-            with self.subTest(index=index):
-                with self.assertRaises(manager.SignatureNotFound):
-                    manager.CLI_GATE.resolve(wrong_opcode, arch="x64")
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(source, arch="arm64")
-
-    def test_cli_x64_stack88_70_real_build_signature(self):
-        # ELF x64, SHA256 9991515b6d5307bcf701069622b0537b6b206e605f3c891c0cf3a3d208dea8b0,
-        # file offset 0x90bbac0. Keep the real branch and call displacements.
-        source = bytes.fromhex(
-            "4885c00f84d8010000807808000f85ce010000"
-            "e8885ffdff488984248800000048895c245048894c2470")
-        state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
-        self.assertEqual((state, offset, gate),
-                         ("unpatched", 9, manager.CLI_GATE_X64_STACK88_70))
-        patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
-        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="x64")[:2],
-                         ("patched", 9))
-        for first, second in ((source, source), (patched, patched), (source, patched)):
-            with self.subTest(first=first == source, second=second == source):
-                with self.assertRaises(manager.SignatureAmbiguous):
-                    manager.CLI_GATE.resolve(first + second, arch="x64")
-        for index in (0, 9, 19, 24, 32, 37):
-            wrong_opcode = bytearray(source)
-            wrong_opcode[index] ^= 1
-            with self.subTest(index=index):
-                with self.assertRaises(manager.SignatureNotFound):
-                    manager.CLI_GATE.resolve(wrong_opcode, arch="x64")
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(source, arch="arm64")
+        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="x64"),
+                         ("patched", 9, gate))
 
     def test_current_cli_arm64_signature_and_patch(self):
-        source = (
-            b"\xe1\x18\x00\xb5"
-            b"\xc0\x0d\x00\xb4"
-            b"\x01\x20\x40\x39"
-            b"\x81\x0d\x00\x37"
-            b"\xbe\x94\xff\x97"
-            b"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9"
-        )
-        state, offset, gate = manager.CLI_GATE.resolve(source)
+        # CLI 1.2.16 ARM64: identical gate bytes in macOS and Linux builds.
+        # macOS Mach-O: ldrb at 0x223bca8, SHA256
+        # 7dca095cfc1df2c057a385ed88a76c7ba98dc103258a80be87a8f42e484cb3aa.
+        # Linux ELF: ldrb at 0x7d05738, SHA256
+        # d0c06173f4ab2d6da7c17ba8d52a688234f30a79a7f65e25ace15863a295695f.
+        source = bytes.fromhex(
+            "a11800b5200f00b402204039e20e0037d472ff97"
+            "e0070ea9e20f0fa9e41710a9e61f11a9")
+        state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
         self.assertEqual((state, offset, gate), ("unpatched", 8, manager.CLI_GATE_ARM64))
-        patched = bytearray(source)
-        patched[offset:offset + len(gate.fix)] = gate.fix
-        self.assertEqual(manager.CLI_GATE.resolve(patched)[:2], ("patched", 8))
-
-    def test_previous_cli_arm64_signature_is_not_supported(self):
-        previous = (
-            b"\xe1\x18\x00\xb5"
-            b"\x80\x0d\x00\xb4"
-            b"\x01\x20\x40\x39"
-            b"\x41\x0d\x00\x37"
-            b"\x35\x94\xff\x97"
-            b"\xe0\x43\x00\xf9\xe1\x2b\x00\xf9\xe2\x3b\x00\xf9"
-        )
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(previous)
-
-    def test_cli_arm64_stack98_real_build_signature(self):
-        # Mach-O arm64, SHA256 a939016cfb86e3862112ee57124f1bc14f30defdd69e181a8526b6e7c80a4471,
-        # file offset 0x220ac7c. Keep the real branch and call displacements.
-        source = bytes.fromhex(
-            "e11800b5c00d00b401204039810d0037e977ff97"
-            "e04f00f9e13300f9e24700f9e32f00f9")
-        state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
-        self.assertEqual((state, offset, gate),
-                         ("unpatched", 8, manager.CLI_GATE_ARM64_STACK98))
         patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
-        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="arm64")[:2],
-                         ("patched", 8))
-        for first, second in ((source, source), (patched, patched), (source, patched)):
-            with self.subTest(first=first == source, second=second == source):
-                with self.assertRaises(manager.SignatureAmbiguous):
-                    manager.CLI_GATE.resolve(first + second, arch="arm64")
-        for index in (0, 4, 8, 12, 20, 24, 28, 32):
-            wrong_register = bytearray(source)
-            wrong_register[index] ^= 1
-            with self.subTest(index=index):
-                with self.assertRaises(manager.SignatureNotFound):
-                    manager.CLI_GATE.resolve(wrong_register, arch="arm64")
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(source, arch="x64")
-
-    def test_cli_arm64_stack90_real_build_signature(self):
-        # CLI 1.2.7 macOS arm64, file offset 0x22e83d8.
-        source = bytes.fromhex(
-            "811500b5000c00b402204039c20b0037e876ff97"
-            "e04b00f9e12f00f9e23f00f9e32b00f9")
-        state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
-        self.assertEqual((state, offset, gate),
-                         ("unpatched", 8, manager.CLI_GATE_ARM64_STACK90))
-        patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
-        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="arm64")[:2],
-                         ("patched", 8))
-        for first, second in ((source, source), (patched, patched), (source, patched)):
-            with self.assertRaises(manager.SignatureAmbiguous):
-                manager.CLI_GATE.resolve(first + second, arch="arm64")
-        for index in (0, 4, 8, 12, 20, 24, 28, 32):
-            invalid = bytearray(source)
-            invalid[index] ^= 1
-            with self.subTest(index=index):
-                with self.assertRaises(manager.SignatureNotFound):
-                    manager.CLI_GATE.resolve(invalid, arch="arm64")
-        with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(source, arch="x64")
+        self.assertEqual(manager.CLI_GATE.resolve(patched, arch="arm64"),
+                         ("patched", 8, gate))
 
     def test_cli_arm64_signature_requires_outer_registers(self):
-        wrong_outer_register = (
-            b"\xe2\x18\x00\xb5"
-            b"\xc0\x0d\x00\xb4"
-            b"\x01\x20\x40\x39"
-            b"\x81\x0d\x00\x37"
-            b"\xbe\x94\xff\x97"
-            b"\xe0\x4b\x00\xf9\xe1\x33\x00\xf9\xe2\x43\x00\xf9"
-        )
+        wrong_outer_register = bytes.fromhex(
+            "a21800b5200f00b402204039e20e0037d472ff97"
+            "e0070ea9e20f0fa9e41710a9e61f11a9")
         with self.assertRaises(manager.SignatureNotFound):
-            manager.CLI_GATE.resolve(wrong_outer_register)
+            manager.CLI_GATE.resolve(wrong_outer_register, arch="arm64")
 
-    def test_manager_arm64_old_and_new_signatures_patch(self):
-        old = (
-            b"\x03\x20\x40\x39"
-            b"\xc3\x01\x00\x36"
-            b"\xe3\x03\x40\xf9\xe4\x13\x48\xa9"
-            b"\x03\x10\x06\xa9"
-        )
-        current = (
-            b"\x03\x20\x40\x39"
-            b"\xa3\x01\x00\x36"
-            b"\xe3\x13\x48\xa9"
-            b"\x03\x10\x06\xa9"
-        )
-        for source in (old, current):
-            with self.subTest(source=source.hex()):
-                state, offset, gate = manager.MANAGER_GATE.resolve(source)
-                self.assertEqual((state, offset, gate),
-                                 ("unpatched", 0, manager.MANAGER_GATE_ARM64))
-                patched = bytearray(source)
-                patched[offset:offset + len(gate.fix)] = gate.fix
-                self.assertEqual(manager.MANAGER_GATE.resolve(patched)[:2], ("patched", 0))
+    def test_current_manager_x64_signature_and_patch(self):
+        # Installed Windows PE x64 backup, file offset 0x29890ca, SHA256
+        # d569b7a0fb5c2e3eb6dc867be17e6cde1ad1fac94c7dcda2909d6612c7c31532.
+        source = bytes.fromhex("80780800743b488b54247048895060")
+        state, offset, gate = manager.MANAGER_GATE.resolve(source, arch="x64")
+        self.assertEqual((state, offset, gate), ("unpatched", 0, manager.MANAGER_GATE_X64))
+        patched = gate.fix + source[len(gate.fix):]
+        self.assertEqual(manager.MANAGER_GATE.resolve(patched, arch="x64"),
+                         ("patched", 0, gate))
+
+    def test_current_manager_arm64_signature_and_patch(self):
+        # Manager 2.19.1 Linux ELF ARM64, file offset 0x6bd13e0, SHA256
+        # 6f738eba385f68d66c83dfd50546346a30688422d364fa398d2f9155586853da.
+        source = bytes.fromhex("03204039a3010036e31348a9031006a9")
+        state, offset, gate = manager.MANAGER_GATE.resolve(source, arch="arm64")
+        self.assertEqual((state, offset, gate), ("unpatched", 0, manager.MANAGER_GATE_ARM64))
+        patched = gate.fix + source[len(gate.fix):]
+        self.assertEqual(manager.MANAGER_GATE.resolve(patched, arch="arm64"),
+                         ("patched", 0, gate))
 
     def test_manager_arm64_signature_requires_tbz_w3(self):
-        wrong_register = (
-            b"\x03\x20\x40\x39"
-            b"\xa4\x01\x00\x36"
-            b"\xe3\x13\x48\xa9"
-            b"\x03\x10\x06\xa9"
-        )
+        wrong_register = bytes.fromhex("03204039a4010036e31348a9031006a9")
         with self.assertRaises(manager.SignatureNotFound):
-            manager.MANAGER_GATE.resolve(wrong_register)
+            manager.MANAGER_GATE.resolve(wrong_register, arch="arm64")
 
 
 class ExecutableRangeTests(unittest.TestCase):
