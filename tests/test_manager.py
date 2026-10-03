@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import errno
 import io
 import json
 import os
@@ -306,6 +307,32 @@ class AccountTests(unittest.TestCase):
 
 
 class TransactionTests(unittest.TestCase):
+    def test_write_access_errors_are_reported_without_modifying_target(self):
+        sharing_error = PermissionError(errno.EACCES, "sharing violation")
+        sharing_error.winerror = 32
+        cases = (
+            (PermissionError(errno.EACCES, "Permission denied"), "permission denied", False),
+            (OSError(errno.ETXTBSY, "Text file busy"), "is in use", True),
+            (OSError(errno.EROFS, "Read-only file system"), "cannot open", False),
+            (sharing_error, "is in use", True),
+        )
+        gate = manager.Gate(rb"ORIG", rb"DONE", b"DONE")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "language_server")
+            original = _minimal_pe(code=b"ORIG")
+            _write(path, original)
+            for error, message, in_use in cases:
+                with self.subTest(error=str(error)), contextlib.redirect_stdout(io.StringIO()) as output:
+                    with (mock.patch("builtins.open", side_effect=error),
+                          mock.patch.object(manager, "make_backup") as backup):
+                        self.assertFalse(manager.gate_patch(path, gate, "Manager", "language_server"))
+                    backup.assert_not_called()
+                    self.assertIn(message, output.getvalue())
+                    self.assertIn(str(error), output.getvalue())
+                    self.assertEqual("close Manager" in output.getvalue(), in_use)
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), original)
+
     def test_macos_scan_patch_and_restore_never_map_file_pages(self):
         gate = manager.Gate(rb"ORIG", rb"DONE", b"DONE", arch="arm64")
         status = lambda path: manager.gate_status(path, gate)

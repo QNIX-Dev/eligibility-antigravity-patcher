@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
+import argparse, base64, contextlib, errno, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
@@ -21,11 +21,21 @@ def warn(m): _say("!!", m)
 def _bin(name):
     return name + (".exe" if os.name == "nt" else "")
 
-def is_locked(path):
+def is_locked(path, app=None):
+    """Check write access, optionally reporting why the file cannot be opened."""
     try:
         with open(path, "r+b"):
             return False
-    except OSError:
+    except OSError as e:
+        if app:
+            if e.errno == errno.ETXTBSY or getattr(e, "winerror", None) in (32, 33):
+                warn(f"{os.path.basename(path)} is in use — close {app} and its background processes first")
+            elif e.errno in (errno.EACCES, errno.EPERM):
+                warn(f"permission denied writing {path} — use an account with write access to the installation")
+                info("check file permissions and directory permissions for the backup")
+            else:
+                warn(f"cannot open {path} for writing")
+            warn(f"system error: {e}")
         return True
 
 def make_backup(path):
@@ -47,8 +57,8 @@ def restore_file(path, status=None):
     if not os.path.exists(b):
         warn(f"no backup for {os.path.basename(path)} (nothing to restore)")
         return False
-    if is_locked(path):
-        warn("file is locked — close the app first"); return False
+    if is_locked(path, "the app"):
+        return False
     if status:
         try:
             if status(b)[0] != "unpatched":
@@ -397,8 +407,8 @@ def gate_status(path, gate):
         return ("unknown", None)
 
 def gate_patch(path, gate, app, fname):
-    if is_locked(path):
-        warn(f"{fname} is locked — close {app} first"); return False
+    if is_locked(path, app):
+        return False
     try:
         ranges, arch = executable_info(path)
         with mapped(path) as d:
@@ -569,7 +579,7 @@ def _ide_cache_dirs():
     return dirs
 
 def ide_patch(path):
-    if is_locked(path): warn("main.js is locked — close Antigravity IDE first"); return False
+    if is_locked(path, "Antigravity IDE"): return False
     with open(path, "rb") as f: d = f.read()
     try:
         kind = _ide_gate_state(d)
