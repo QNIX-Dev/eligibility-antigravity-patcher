@@ -310,7 +310,405 @@ class AccountTests(unittest.TestCase):
         self.assertIsNone(manager._ide_refresh_token(oauth_token))
 
 
+class DesktopProfileTests(unittest.TestCase):
+    @staticmethod
+    def token_binary():
+        # Real ARM64 2.19.1 constructor bytes; relocate only its ADRP for this
+        # minimal Mach-O fixture. The fallback string is code, not a credential.
+        code = bytes.fromhex("03000090 63c83d91 a40380d2 e39306a9 e0230191 e10740b2 e20301aa 4791ac97 e18303a9")
+        image = bytearray(_minimal_macho(0x0100000C))
+        image.extend(b"\0" * (0x1000 - len(image)))
+        struct.pack_into("<QQQQ", image, 32 + 24, 0, len(image), 0, len(image))
+        struct.pack_into("<Q", image, 32 + 72 + 40, len(code))
+        image[0x200:0x200 + len(code)] = code
+        image[0xf72:0xf72 + 29] = b"jetski-standalone-oauth-token"
+        return image
+
+    @staticmethod
+    def fixture(tmp):
+        app, _, _, server, _ = _mac_app(tmp)
+        _write(server, DesktopProfileTests.token_binary())
+        info = os.path.join(app, "Contents", "Info.plist")
+        with open(info, "rb") as f:
+            plist = plistlib.load(f)
+        plist["CFBundleShortVersionString"] = "2.19.1"
+        plist["CFBundleIdentifier"] = "com.google.antigravity"
+        plist["CFBundleName"] = "Antigravity"
+        with open(info, "wb") as f:
+            plistlib.dump(plist, f)
+        header = {"files": {"dist": {"files": {}}}}
+        scripts = {
+            "dist/main.js": 'const lock = electron_1.app.requestSingleInstanceLock();',
+            "dist/paths.js": "\n".join("path_1.default.join(os_1.default.homedir(), '.gemini', 'fixture');" for _ in range(5)),
+            "dist/languageServer.js": "        // Point the LS at the main process' host bridge server.\n"
+                                      "        env['AGY_BROWSER_ACTIVE_PORT_FILE'] = (0, paths_1.getActivePortFilePath)();",
+            "dist/updater.js": "\n".join("function " + name + "() {}" for name in
+                ("initAutoUpdater", "checkForUpdates", "quitAndInstall", "applyHostUpdate", "setAutoUpdateChecking")),
+        }
+        for name in scripts:
+            header["files"]["dist"]["files"][name.split("/")[1]] = {"offset": "0", "size": 0}
+        archive = os.path.join(app, "Contents", "Resources", "app.asar")
+        manager._asar_write(archive, header, b"", scripts)
+        return app, server, archive
+
+    def test_create_profiles_preserves_source_and_separates_all_storage(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO()),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager, "_desktop_profile_sign") as sign):
+            source, server, archive = self.fixture(tmp)
+            with open(archive, "rb") as f:
+                original = f.read()
+            for name in ("work", "personal"):
+                self.assertEqual(manager.desktop_profile_create(name, {"manager": server}), 0)
+                profile = manager._desktop_profile_path(name)
+                self.assertEqual(os.stat(profile).st_mode & 0o777, 0o700)
+                copied = os.path.join(profile, "Antigravity.app")
+                with open(os.path.join(copied, "Contents", "Info.plist"), "rb") as f:
+                    plist = plistlib.load(f)
+                self.assertEqual(plist["CFBundleIdentifier"], "com.parsa.agy-profile." + name)
+                self.assertEqual(plist["CFBundleName"], "Antigravity")
+                self.assertEqual(plist["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["antigravity-profile-" + name])
+                header, payload = manager._asar_read(os.path.join(copied, "Contents", "Resources", "app.asar"))
+                main = manager._asar_content(header, payload, "dist/main.js")
+                self.assertLess(main.index("setPath"), main.index("requestSingleInstanceLock"))
+                paths = manager._asar_content(header, payload, "dist/paths.js")
+                self.assertNotIn("os_1.default.homedir()", paths)
+                ls = manager._asar_content(header, payload, "dist/languageServer.js")
+                self.assertIn('"--gemini_dir"', ls)
+                self.assertIn('"--local_chrome_user_data_dir"', ls)
+                self.assertIn('env["SSH_CONNECTION"]', ls)
+                self.assertEqual(manager._asar_content(header, payload, "dist/updater.js").count("return; // Profile"), 5)
+            self.assertEqual(sign.call_count, 2)
+            with open(archive, "rb") as f:
+                self.assertEqual(f.read(), original)
+            with self.assertRaises(ValueError):
+                manager.desktop_profile_create("work", {"manager": server})
+
+    def test_failed_signing_never_publishes_profile_and_cleans_temporary_copy(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO()),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager, "_desktop_profile_sign", side_effect=OSError("fixture signing failure"))):
+            _, server, _ = self.fixture(tmp)
+            with self.assertRaises(OSError):
+                manager.desktop_profile_create("work", {"manager": server})
+            self.assertEqual(os.listdir(manager._desktop_profiles_root()), [])
+
+    def test_unknown_build_and_archive_layout_fail_before_copying(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager.shutil, "copytree") as copy):
+            app, server, archive = self.fixture(tmp)
+            header, payload = manager._asar_read(archive)
+            manager._asar_write(archive, header, payload, {"dist/main.js": "unsupported fixture"})
+            with self.assertRaises(ValueError):
+                manager.desktop_profile_create("work", {"manager": server})
+            copy.assert_not_called()
+            self.assertFalse(os.path.exists(manager._desktop_profiles_root()))
+
+    def test_profile_names_and_symlinks_cannot_escape_storage_root(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp)):
+            for name in ("../escape", "", "Work", "/absolute", "has space", "a" * 49):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    manager._desktop_profile_path(name)
+            os.symlink(os.path.dirname(tmp), os.path.join(tmp, "work"))
+            with self.assertRaises(ValueError):
+                manager._desktop_profile_path("work")
+
+    def test_open_uses_profile_executable_and_private_process_permissions(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO()),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "Popen") as launch):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            app, _, _, _, _ = _mac_app(profile)
+            path = os.path.join(app, "Contents", "Resources", "bin", "language_server")
+            _write(path, self.token_binary())
+            manager._desktop_namespace_credentials(path, profile)
+            launch.return_value.wait.return_value = 0
+            self.assertEqual(manager.desktop_profile_open("work"), 0)
+            self.assertEqual(os.path.realpath(launch.call_args.args[0][0]), manager._mac_bundle_main(app))
+            self.assertEqual(launch.call_args.kwargs["umask"], 0o077)
+            self.assertTrue(launch.call_args.kwargs["start_new_session"])
+
+    def test_root_is_refused_and_macos_route_preserves_override(self):
+        with (contextlib.redirect_stdout(io.StringIO()), mock.patch.object(manager.os, "geteuid", return_value=0)):
+            self.assertEqual(manager.run_desktop_accounts(["list"]), 2)
+        with (mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager, "run_desktop_accounts", return_value=0) as run):
+            overrides = {"manager": "/custom/server"}
+            self.assertEqual(manager.run_accounts(["manager", "open", "work"], overrides), 0)
+            run.assert_called_once_with(["open", "work"], overrides)
+
+    def test_profile_signing_uses_matching_bundle_identifiers_and_skips_main_until_last(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_mac_codesign") as sign,
+              mock.patch.object(manager, "_mac_library_validation_entitlements", return_value=None)):
+            app, server, _ = self.fixture(tmp)
+            _write(server, _minimal_macho())
+            manager._desktop_profile_sign(app)
+            self.assertEqual(sign.call_args_list, [mock.call(server),
+                mock.call(app, bundle=True, entitlements=None, identifier="com.google.antigravity")])
+
+    def test_copied_helper_identity_and_loading_entitlements_remain_compatible(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO()),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager, "_mac_codesign") as sign,
+              mock.patch.object(manager, "_mac_entitlements", return_value={}),
+              mock.patch.object(manager, "_mac_library_validation_entitlements", return_value=None)):
+            app, server, _ = self.fixture(tmp)
+            framework_dir = os.path.join(app, "Contents", "Frameworks")
+            os.mkdir(framework_dir)
+            helper, _, _, _, _ = _mac_app(framework_dir)
+            helper_info = os.path.join(helper, "Contents", "Info.plist")
+            with open(helper_info, "rb") as f:
+                plist = plistlib.load(f)
+            plist.update(CFBundleIdentifier="com.google.antigravity.helper.GPU", ElectronTeamID="fixture-team")
+            with open(helper_info, "wb") as f:
+                plistlib.dump(plist, f)
+            self.assertEqual(manager.desktop_profile_create("work", {"manager": server}), 0)
+            copied_helper = os.path.join(manager._desktop_profile_path("work"), "Antigravity.app", "Contents", "Frameworks", "Antigravity.app")
+            with open(os.path.join(copied_helper, "Contents", "Info.plist"), "rb") as f:
+                plist = plistlib.load(f)
+            self.assertEqual(plist["CFBundleIdentifier"], "com.parsa.agy-profile.work.helper.GPU")
+            self.assertNotIn("ElectronTeamID", plist)
+            helper_call = next(c for c in sign.call_args_list if c.kwargs.get("identifier", "").endswith("helper.GPU"))
+            self.assertTrue(helper_call.kwargs["entitlements"][manager.MAC_DISABLE_LIBRARY_VALIDATION])
+            self.assertTrue(helper_call.kwargs["entitlements"]["com.apple.security.cs.allow-jit"])
+
+    def test_archive_corruption_is_rejected_before_script_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, archive = self.fixture(tmp)
+            header, payload = manager._asar_read(archive)
+            damaged = bytearray(payload)
+            damaged[0] ^= 1
+            with self.assertRaises(ValueError):
+                manager._asar_content(header, damaged, "dist/main.js")
+
+    def test_real_token_constructor_recognizes_both_states(self):
+        original = bytes.fromhex("c39400d0 63c83d91 a40380d2 e39306a9 e0230191 e10740b2 e20301aa 4791ac97 e18303a9")
+        gate = manager.DESKTOP_TOKEN_GATE_ARM64
+        self.assertEqual(gate.find(original)[0], "unpatched")
+        patched = original[:8] + gate.fix + original[12:]
+        self.assertEqual(gate.find(patched)[0], "patched")
+        with self.assertRaises(manager.SignatureAmbiguous):
+            gate.find(original + original)
+
+    def test_credentials_are_namespaced_without_touching_shared_login_or_user_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "server")
+            _write(path, self.token_binary())
+            profile = os.path.join(tmp, "work")
+            manager._desktop_namespace_credentials(path, profile)
+            manager._desktop_namespace_credentials(path, profile, check_only=True)
+            with open(path, "rb") as f:
+                data = f.read()
+            self.assertEqual(data[0xf72:0xf72 + 29], manager._desktop_token_name(profile) + b"\0")
+            with self.assertRaises(ValueError):
+                manager._desktop_namespace_credentials(path, os.path.join(tmp, "personal"), check_only=True)
+            self.assertEqual(manager.gate_status(path, manager.DESKTOP_TOKEN_GATE_ARM64)[0], "patched")
+
+    def test_credential_constructor_failures_do_not_write(self):
+        for change in ("missing", "duplicate", "wrong_literal", "nonexecutable"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                data = self.token_binary()
+                if change == "missing":
+                    data[0x200] = 0
+                elif change == "duplicate":
+                    data[0x224:0x248] = data[0x200:0x224]
+                    struct.pack_into("<Q", data, 32 + 72 + 40, 72)
+                elif change == "wrong_literal":
+                    data[0xf72] = 0
+                else:
+                    struct.pack_into("<Q", data, 32 + 72 + 40, 0)
+                path = os.path.join(tmp, "server")
+                _write(path, data)
+                with self.assertRaises((ValueError, manager.SignatureNotFound, manager.SignatureAmbiguous)):
+                    manager._desktop_namespace_credentials(path, tmp)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), data)
+
+    def test_repair_rolls_back_app_swap_when_final_verification_fails(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout="")),
+              mock.patch.object(manager, "_desktop_profile_sign")):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            app, _, _, server, _ = _mac_app(profile)
+            original = self.token_binary()
+            _write(server, original)
+            real = manager._desktop_namespace_credentials
+
+            def fail_final(path, profile, check_only=False):
+                if os.path.realpath(path) == server and check_only:
+                    raise ValueError("final app verification failed")
+                return real(path, profile, check_only)
+
+            with mock.patch.object(manager, "_desktop_namespace_credentials", side_effect=fail_final):
+                with self.assertRaisesRegex(ValueError, "final app verification"):
+                    manager.desktop_profile_repair("work")
+            with open(server, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertEqual(os.listdir(profile), ["Antigravity.app"])
+
+    def test_credential_patch_rolls_back_failed_final_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "server")
+            original = self.token_binary()
+            _write(path, original)
+            real = manager._desktop_token_location
+            calls = 0
+
+            def fail_final(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 5:
+                    raise ValueError("final verification failed")
+                return real(*args)
+
+            with mock.patch.object(manager, "_desktop_token_location", side_effect=fail_final):
+                with self.assertRaisesRegex(ValueError, "final verification"):
+                    manager._desktop_namespace_credentials(path, tmp)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_repair_preserves_profile_data_and_original_on_sign_failure(self):
+        for fail in (False, True):
+            with (self.subTest(sign_failure=fail), tempfile.TemporaryDirectory() as tmp,
+                  mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+                  mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout="")),
+                  mock.patch.object(manager, "_desktop_profile_sign", side_effect=OSError("sign failed") if fail else None),
+                  contextlib.redirect_stdout(io.StringIO())):
+                profile = os.path.join(tmp, "work")
+                os.mkdir(profile)
+                app, _, _, server, _ = _mac_app(profile)
+                original = self.token_binary()
+                _write(server, original)
+                data = os.path.join(profile, "user-data")
+                os.mkdir(data)
+                marker = os.path.join(data, "history")
+                _write(marker, b"private fixture history")
+                if fail:
+                    with self.assertRaisesRegex(OSError, "sign failed"):
+                        manager.desktop_profile_repair("work")
+                    with open(server, "rb") as f:
+                        self.assertEqual(f.read(), original)
+                else:
+                    self.assertEqual(manager.desktop_profile_repair("work"), 0)
+                    manager._desktop_namespace_credentials(server, profile, check_only=True)
+                with open(marker, "rb") as f:
+                    self.assertEqual(f.read(), b"private fixture history")
+                self.assertEqual(sorted(os.listdir(profile)), ["Antigravity.app", "user-data"])
+
+    def test_repair_refuses_running_profile_before_copying(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.shutil, "copytree") as copy):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            app, executable, _, _, _ = _mac_app(profile)
+            with mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout=os.path.join(profile, "Antigravity.app", "Contents", "MacOS", "Antigravity"))):
+                with self.assertRaisesRegex(ValueError, "close this extra"):
+                    manager.desktop_profile_repair("work")
+            copy.assert_not_called()
+
+    def test_legacy_profile_open_refuses_to_load_shared_credentials(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "Popen") as launch):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            app, _, _, _, _ = _mac_app(profile)
+            _write(os.path.join(app, "Contents", "Resources", "bin", "language_server"), self.token_binary())
+            with self.assertRaisesRegex(ValueError, "repair"):
+                manager.desktop_profile_open("work")
+            launch.assert_not_called()
+
+
 class TransactionTests(unittest.TestCase):
+    def test_macos_signed_inode_denial_uses_replacement_for_patch_and_restore(self):
+        gate = manager.Gate(rb"ORIG", rb"DONE", b"DONE", arch="arm64")
+        status = lambda path: manager.gate_status(path, gate)
+        real_open = open
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager.sys, "platform", "darwin"),
+              contextlib.redirect_stdout(io.StringIO())):
+            path = os.path.realpath(os.path.join(tmp, "language_server"))
+            original = bytearray(_minimal_macho(0x0100000C))
+            original[0x200:0x204] = b"ORIG"
+            _write(path, original)
+            os.chmod(path, 0o755)
+            link = os.path.join(tmp, "linked-server")
+            os.symlink(path, link)
+
+            def deny_installed_write(filename, mode="r", *args, **kwargs):
+                if os.path.realpath(filename) == path and any(c in mode for c in "+wa"):
+                    raise PermissionError(errno.EPERM, "Operation not permitted", path)
+                return real_open(filename, mode, *args, **kwargs)
+
+            inode = os.stat(path).st_ino
+            with mock.patch("builtins.open", side_effect=deny_installed_write):
+                self.assertTrue(manager.gate_patch(link, gate, "Fixture", "language_server"))
+                self.assertEqual(status(link)[0], "patched")
+                self.assertNotEqual(os.stat(path).st_ino, inode)
+                self.assertTrue(manager.restore_file(link, status))
+                self.assertEqual(status(link)[0], "unpatched")
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o755)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertFalse(any(name.startswith(".agy-write-") for name in os.listdir(tmp)))
+
+    def test_macos_directory_denial_does_not_attempt_patch_or_backup(self):
+        with (mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch("builtins.open", side_effect=PermissionError(errno.EPERM, "denied")),
+              mock.patch.object(manager.tempfile, "mkstemp", side_effect=PermissionError(errno.EACCES, "denied")),
+              mock.patch.object(manager, "make_backup") as backup,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertFalse(manager.gate_patch("/fixture", manager.Gate(rb"ORIG", rb"DONE", b"DONE"),
+                                                "Fixture", "fixture"))
+        backup.assert_not_called()
+
+    def test_macos_app_management_denial_explains_privacy_permission_even_as_root(self):
+        with (mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager.os, "geteuid", return_value=0),
+              mock.patch.object(manager, "_mac_app_bundle", return_value="/Applications/Fixture.app"),
+              mock.patch("builtins.open", side_effect=PermissionError(errno.EPERM, "Operation not permitted")),
+              mock.patch.object(manager.tempfile, "mkstemp", side_effect=PermissionError(errno.EPERM, "directory denied")),
+              mock.patch.object(manager, "make_backup") as backup,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertFalse(manager.gate_patch("/Applications/Fixture.app/Contents/MacOS/fixture",
+                                                manager.Gate(rb"ORIG", rb"DONE", b"DONE"), "Fixture", "fixture"))
+        backup.assert_not_called()
+        self.assertIn("Privacy & Security > App Management", output.getvalue())
+        self.assertIn("sudo does not grant", output.getvalue())
+        self.assertIn("directory denied", output.getvalue())
+        self.assertNotIn("use an account with write access", output.getvalue())
+
+    def test_macos_staging_and_replacement_failures_preserve_installed_inode(self):
+        for fix in (b"FAIL", b"DONE"):
+            with (self.subTest(fix=fix), tempfile.TemporaryDirectory() as tmp,
+                  mock.patch.object(manager.sys, "platform", "darwin"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "language_server")
+                original = bytearray(_minimal_macho(0x0100000C))
+                original[0x200:0x204] = b"ORIG"
+                _write(path, original)
+                inode = os.stat(path).st_ino
+                gate = manager.Gate(rb"ORIG", rb"DONE", fix, arch="arm64")
+                with mock.patch.object(manager.os, "replace", side_effect=PermissionError(errno.EPERM, "denied")) as replace:
+                    self.assertFalse(manager.gate_patch(path, gate, "Fixture", "language_server"))
+                self.assertEqual(replace.call_count, int(fix == b"DONE"))
+                self.assertEqual(os.stat(path).st_ino, inode)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertFalse(any(name.startswith(".agy-write-") for name in os.listdir(tmp)))
+
     def test_write_access_errors_are_reported_without_modifying_target(self):
         sharing_error = PermissionError(errno.EACCES, "sharing violation")
         sharing_error.winerror = 32
