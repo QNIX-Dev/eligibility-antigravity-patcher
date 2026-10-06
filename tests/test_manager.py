@@ -252,6 +252,155 @@ class ExecutableRangeTests(unittest.TestCase):
             self.assertEqual(manager.gate_status(path, gate)[0], "unpatched")
 
 
+class ExtensionTests(unittest.TestCase):
+    @staticmethod
+    def hub_code():
+        # agy 1.3.0 Windows x64, PersonalAuthValidator.Validate at 0x289100a.
+        # Original SHA256: c1b0001989c4051a41f5104484de182db5014fa155053c8088baacf1663063bf.
+        return bytes.fromhex("80780800743b488b54247048895060")
+
+    @classmethod
+    def binary(cls, shared=False):
+        code = cls.hub_code()
+        if shared:
+            # Ordinary CLI gate from the same real agy 1.3.0 executable.
+            code = bytes.fromhex(
+                "4885c00f8498020000807808000f858e020000e82845fdff"
+                "48898424d800000048899c24e000000048898c24e8000000") + b"\x90" * 7 + code
+        image = bytearray(_minimal_pe(code=code))
+        struct.pack_into("<I", image, 0x98 + 16, 0x80)
+        return image
+
+    def test_discovery_uses_extension_install_directory_on_each_platform(self):
+        with tempfile.TemporaryDirectory() as home:
+            directory = os.path.join(home, ".gemini", "bin")
+            os.makedirs(directory)
+            for platform in ("nt", "posix"):
+                with self.subTest(platform=platform), mock.patch.object(manager.os, "name", platform):
+                    path = os.path.join(directory, manager._bin("agy"))
+                    _write(path, b"fixture")
+                    with (mock.patch.object(manager.os.path, "expanduser", return_value=home),
+                          mock.patch.object(manager.shutil, "which") as which):
+                        self.assertEqual(manager.resolve("extension", None), path)
+                    which.assert_not_called()
+
+    def test_extension_refuses_unverified_arm64_before_write(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = os.path.join(tmp, "agy.exe")
+            original = _minimal_pe(code=self.hub_code(), machine=0xAA64)
+            _write(path, original)
+            self.assertEqual(manager.main(["patch", "extension", "--path-extension", path]), 1)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original)
+            self.assertFalse(os.path.exists(path + manager.BAK))
+
+    def test_shared_cli_extension_backup_stays_pristine_in_both_orders(self):
+        for order in (("cli", "extension"), ("extension", "cli")):
+            with (self.subTest(order=order), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "agy.exe")
+                original = self.binary(shared=True)
+                _write(path, original)
+                args = ["--path-cli", path, "--path-extension", path]
+                for target in order:
+                    self.assertEqual(manager.SPEC[target]["status"](path)[0], "unpatched")
+                self.assertEqual(manager.main(["patch", *order, *args]), 0)
+                for target in order:
+                    self.assertEqual(manager.SPEC[target]["status"](path)[0], "patched")
+                self.assertEqual(manager.gate_status(path, manager.MANAGER_GATE)[0], "patched")
+                self.assertEqual(manager.main(["status", "extension", *args]), 0)
+                self.assertEqual(manager.main(["patch", "extension", *args]), 0)
+                with open(path + manager.BAK, "rb") as f:
+                    self.assertEqual(f.read(), original)
+                self.assertEqual(manager.main(["restore", order[0], *args]), 0)
+                for target in order:
+                    self.assertEqual(manager.SPEC[target]["status"](path)[0], "unpatched")
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_failed_second_gate_restores_first_gate_and_preserves_clean_backup(self):
+        for first, second, gate in (("cli", "extension", manager.MANAGER_GATE_X64),
+                                    ("extension", "cli", manager.CLI_GATE_X64)):
+            with (self.subTest(first=first), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "agy.exe")
+                original = self.binary(shared=True)
+                _write(path, original)
+                overrides = {first: path, second: path}
+                self.assertEqual(manager.run("patch", [first], overrides), 0)
+                with open(path, "rb") as f:
+                    before = f.read()
+                with mock.patch.object(gate, "fix", b"\x90" * len(gate.fix)):
+                    self.assertEqual(manager.run("patch", [second], overrides), 1)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+                with open(path + manager.BAK, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_shared_binary_rejects_missing_or_mismatched_backup(self):
+        for backup_kind in ("missing", "mismatched", "already_patched"):
+            with (self.subTest(backup=backup_kind), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "agy.exe")
+                original = self.binary(shared=True)
+                _write(path, original)
+                overrides = {"cli": path, "extension": path}
+                self.assertEqual(manager.run("patch", ["cli"], overrides), 0)
+                if backup_kind == "missing":
+                    os.unlink(path + manager.BAK)
+                elif backup_kind == "mismatched":
+                    with open(path, "r+b") as f:
+                        f.seek(-1, os.SEEK_END); f.write(b"X")
+                with open(path, "rb") as f:
+                    before = f.read()
+                if backup_kind == "already_patched":
+                    _write(path + manager.BAK, before)
+                self.assertEqual(manager.run("patch", ["extension"], overrides), 1)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+                if backup_kind == "missing":
+                    self.assertFalse(os.path.exists(path + manager.BAK))
+                else:
+                    with open(path + manager.BAK, "rb") as f:
+                        self.assertEqual(f.read(), before if backup_kind == "already_patched" else original)
+
+    def test_changed_target_after_backup_is_rejected_before_write(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = os.path.join(tmp, "agy.exe")
+            original = self.binary()
+            _write(path, original)
+            real_backup = manager.make_backup
+            def change_after_backup(*args, **kwargs):
+                bak = real_backup(*args, **kwargs)
+                with open(path, "r+b") as f:
+                    f.seek(-1, os.SEEK_END); f.write(b"X")
+                return bak
+            with mock.patch.object(manager, "make_backup", side_effect=change_after_backup):
+                self.assertEqual(manager.run("patch", ["extension"], {"extension": path}), 1)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), original[:-1] + b"X")
+            with open(path + manager.BAK, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_updated_unpatched_binary_refreshes_stale_backup(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            path = os.path.join(tmp, "agy.exe")
+            original = self.binary(shared=True)
+            updated = original[:-1] + b"X"
+            _write(path + manager.BAK, original)
+            _write(path, updated)
+            # Equal sizes and timestamps must not reuse a cached comparison
+            # after refreshing the backup's contents.
+            for filename in (path, path + manager.BAK):
+                os.utime(filename, (1_000_000_000, 1_000_000_000))
+            overrides = {"extension": path}
+            self.assertEqual(manager.run("patch", ["extension"], overrides), 0)
+            with open(path + manager.BAK, "rb") as f:
+                self.assertEqual(f.read(), updated)
+            self.assertEqual(manager.run("restore", ["extension"], overrides), 0)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), updated)
+
 class AccountTests(unittest.TestCase):
     @staticmethod
     def _cli_bundle(refresh_token, saved_at="now"):
@@ -532,7 +681,9 @@ class MacCodeSigningTests(unittest.TestCase):
             tmp = os.path.realpath(tmp)
             app, _, _, language_server, main_js = _mac_app(tmp)
             agy = os.path.join(tmp, "agy")
+            extension = os.path.join(tmp, "hub-agy")
             _write(agy, _minimal_macho())
+            _write(extension, _minimal_macho())
             calls = []
 
             def record(path, bundle=False):
@@ -541,9 +692,9 @@ class MacCodeSigningTests(unittest.TestCase):
             with (mock.patch.object(manager, "_mac_codesign", side_effect=record),
                   contextlib.redirect_stdout(io.StringIO())):
                 manager._mac_sign_transaction(
-                    {"cli": agy, "manager": language_server, "ide": main_js})
+                    {"cli": agy, "manager": language_server, "ide": main_js, "extension": extension})
 
-            self.assertEqual(calls, [(agy, False), (language_server, False), (app, True)])
+            self.assertEqual(calls, [(agy, False), (language_server, False), (extension, False), (app, True)])
 
     def test_macos_signing_failure_restores_every_modified_signature_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -594,20 +745,20 @@ class MacCodeSigningTests(unittest.TestCase):
             "status": lambda path: manager.gate_status(path, gate),
             "patch": lambda path: manager.gate_patch(path, gate, "Fixture", "agy"),
         }
-        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
-            path = os.path.join(tmp, "agy")
-            original = _minimal_macho()
-            image = bytearray(original)
-            image[0x200:0x204] = b"ORIG"
-            _write(path, image)
-            with (mock.patch.dict(manager.SPEC, {"cli": spec}),
-                  mock.patch.object(manager, "_mac_sign_transaction",
-                                    side_effect=OSError("fixture signing failure"))):
-                self.assertEqual(manager._mac_run_patch(
-                    ["cli"], {"cli": path}), 1)
-            self.assertEqual(spec["status"](path)[0], "unpatched")
-            with open(path, "rb") as f:
-                self.assertEqual(f.read(), bytes(image))
+        for target in ("cli", "extension"):
+            with (self.subTest(target=target), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "agy")
+                image = bytearray(_minimal_macho())
+                image[0x200:0x204] = b"ORIG"
+                _write(path, image)
+                with (mock.patch.dict(manager.SPEC, {target: spec}),
+                      mock.patch.object(manager, "_mac_sign_transaction",
+                                        side_effect=OSError("fixture signing failure"))):
+                    self.assertEqual(manager._mac_run_patch([target], {target: path}), 1)
+                self.assertEqual(spec["status"](path)[0], "unpatched")
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), bytes(image))
 
     def test_macos_patch_automatically_removes_quarantine_after_signing(self):
         gate = manager.Gate(b"ORIG", b"DONE", b"DONE")

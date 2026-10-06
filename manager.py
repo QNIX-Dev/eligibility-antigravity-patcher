@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, errno, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
+import argparse, base64, contextlib, errno, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from xml.parsers.expat import ExpatError
 try:
@@ -12,7 +12,7 @@ except Exception:
 BAK = ".agybak"
 MAC_SIGNATURE_BAK = ".agysignbak"
 MAC_DISABLE_LIBRARY_VALIDATION = "com.apple.security.cs.disable-library-validation"
-TARGETS = ("cli", "manager", "ide")
+TARGETS = ("cli", "manager", "ide", "extension")
 
 # Utilities
 def _say(tag, msg): print(f"  [{tag}] {msg}")
@@ -40,17 +40,72 @@ def is_locked(path, app=None):
             warn(f"system error: {e}")
         return True
 
-def make_backup(path):
+def _files_equal(first, second):
+    """Read actual bytes on every check, including same-size/mtime rewrites."""
+    with open(first, "rb") as a, open(second, "rb") as b:
+        while True:
+            chunk = a.read(1024 * 1024)
+            if chunk != b.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+def _binary_backup_matches(path, bak):
+    """Recognize a pristine backup plus only our known binary replacements."""
+    replacements = []
+    try:
+        ranges, arch = executable_info(bak)
+        current_ranges, current_arch = executable_info(path)
+        if arch != current_arch or os.path.getsize(path) != os.path.getsize(bak):
+            return False
+        with mapped(bak) as saved, mapped(path) as current:
+            for gate in (CLI_GATE, MANAGER_GATE):
+                try:
+                    state, off, g = gate.resolve(saved, ranges, arch)
+                except SignatureNotFound:
+                    continue
+                if state != "unpatched":
+                    return False
+                current_state, current_off, current_gate = gate.resolve(current, current_ranges, current_arch)
+                if current_off != off or current_gate is not g:
+                    return False
+                if current_state == "patched":
+                    replacements.append((off, g.fix))
+        if not replacements:
+            return False
+        pos = 0
+        with open(bak, "rb") as saved, open(path, "rb") as current:
+            while chunk := saved.read(1024 * 1024):
+                expected = bytearray(chunk)
+                for off, fix in replacements:
+                    start, end = max(off, pos), min(off + len(fix), pos + len(chunk))
+                    if start < end:
+                        expected[start - pos:end - pos] = fix[start - off:end - off]
+                if current.read(len(chunk)) != expected:
+                    return False
+                pos += len(chunk)
+        return True
+    except (LookupError, OSError, ValueError):
+        return False
+
+def make_backup(path, binary=False):
     """Create or refresh a verified clean backup."""
     bak = path + BAK
     if os.path.exists(bak):
-        if filecmp.cmp(path, bak, shallow=False):
+        if _files_equal(path, bak):
+            if not binary or not any(gate_status(bak, gate)[0] == "patched" for gate in (CLI_GATE, MANAGER_GATE)):
+                return bak
+            raise OSError("backup already contains a binary patch; restore a pristine original before applying another target")
+        if binary and _binary_backup_matches(path, bak):
             return bak
+    if binary and any(gate_status(path, gate)[0] == "patched" for gate in (CLI_GATE, MANAGER_GATE)):
+        raise OSError("cannot verify a pristine backup for the existing binary patch; restore the original before applying another target")
+    if os.path.exists(bak):
         info(f"backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK}")
     else:
         info(f"backup -> {os.path.basename(path)}{BAK}")
     shutil.copy2(path, bak)
-    if not filecmp.cmp(path, bak, shallow=False):
+    if not _files_equal(path, bak):
         raise OSError("backup verification failed")
     return bak
 
@@ -419,9 +474,25 @@ def gate_patch(path, gate, app, fname):
         warn(str(e)); return False
     if kind == "patched":
         ok(f"{app} already patched"); return True
-    bak = make_backup(path)
+    bak = make_backup(path, binary=True)
     try:
-        if not filecmp.cmp(path, bak, shallow=False):
+        # A CLI and extension can share agy. Preserve the pristine disk backup;
+        # use a separate snapshot to rescan and roll back this operation only.
+        with tempfile.TemporaryDirectory(prefix="agy-patch-") as temp:
+            before = os.path.join(temp, "before")
+            shutil.copy2(path, before)
+            if not _files_equal(path, before):
+                raise OSError("patch snapshot verification failed")
+            if not _files_equal(before, bak) and not _binary_backup_matches(before, bak):
+                raise OSError("target changed after backup")
+            return _gate_write(path, gate, off, g, before, app)
+    except Exception as e:
+        warn(f"{app} patch failed: {e}")
+        return False
+
+def _gate_write(path, gate, off, g, before, app):
+    try:
+        if not _files_equal(path, before):
             raise OSError("target changed after backup")
         ranges, arch = executable_info(path)
         with open(path, "r+b") as f:
@@ -437,13 +508,13 @@ def gate_patch(path, gate, app, fname):
             raise OSError("post-write signature verification failed")
     except Exception as e:
         try:
-            shutil.copy2(bak, path)
-            rolled_back = filecmp.cmp(path, bak, shallow=False)
+            shutil.copy2(before, path)
+            rolled_back = _files_equal(path, before)
         except Exception:
             rolled_back = False
         warn(f"{app} patch failed: {e}")
-        warn("original restored from backup" if rolled_back else
-             f"automatic rollback failed — restore {os.path.basename(bak)} manually")
+        warn("state before this patch restored" if rolled_back else
+             f"automatic rollback failed — restore {os.path.basename(path)}{BAK} manually")
         return False
     ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
     return True
@@ -521,6 +592,14 @@ MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39[\x03\x23\x43\x63\x83\xa3\xc3\xe3].
                           arch="arm64")
 
 MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
+
+# Extension 1.7.0 uses agy 1.3.0 --hub: its verified Windows x64 validator
+# has the same cmp/je and token-attachment instructions as Manager 2.19.1.
+# ARM64 extension builds require their own verification before enabling them.
+EXTENSION_GATE = MultiGate(MANAGER_GATE_X64, desc="hub hasValidAuth=true")
+
+def extension_default_paths():
+    return _dedup_newest([os.path.join(os.path.expanduser("~"), ".gemini", "bin", _bin("agy"))])
 
 def manager_default_bins():
     if os.name == "nt":
@@ -606,7 +685,7 @@ def ide_patch(path):
     except Exception as e:
         try:
             shutil.copy2(bak, path)
-            rolled_back = filecmp.cmp(path, bak, shallow=False)
+            rolled_back = _files_equal(path, bak)
         except Exception:
             rolled_back = False
         warn(f"IDE patch failed: {e}")
@@ -988,6 +1067,9 @@ SPEC = {
     "manager": dict(name="Antigravity Manager",  find=manager_default_bins,  status=functools.partial(gate_status, gate=MANAGER_GATE),
                     patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname=_bin("language_server"))),
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
+    "extension": dict(name="Antigravity IDE Extension", find=extension_default_paths,
+                      status=functools.partial(gate_status, gate=EXTENSION_GATE),
+                      patch=functools.partial(gate_patch, gate=EXTENSION_GATE, app="IDE Extension", fname=_bin("agy"))),
 }
 
 
@@ -1274,7 +1356,7 @@ def _mac_sign_transaction(entries, bundle_entitlements=None):
     bundles = []
     for target, path in entries.items():
         actual = os.path.realpath(path)
-        if target in ("cli", "manager") and actual not in binaries:
+        if target in ("cli", "manager", "extension") and actual not in binaries:
             binaries.append(actual)
         app = _mac_app_bundle(path)
         if app and app not in bundles:
@@ -1288,7 +1370,7 @@ def _mac_sign_transaction(entries, bundle_entitlements=None):
         for i, path in enumerate(binaries):
             saved = os.path.join(temp, f"binary-{i}")
             shutil.copy2(path, saved)
-            if not filecmp.cmp(path, saved, shallow=False):
+            if not _files_equal(path, saved):
                 raise OSError("temporary macOS signing backup verification failed")
             binary_copies.append((path, saved))
         for i, app in enumerate(bundles):
@@ -1614,7 +1696,7 @@ def _render(console, paths, status):
     
     for t in TARGETS:
         path, st = paths[t], status[t]
-        acct = cur_cli_manager if t in ("cli", "manager") else cur_ide
+        acct = cur_cli_manager if t in ("cli", "manager") else cur_ide if t == "ide" else None
         acct_str = acct if acct else "[white dim]—[/]"
         tbl.add_row(SPEC[t]["name"], f"[{_STYLE[st]}]{_ICON[st]} {st}[/]", acct_str, path or "—")
         
@@ -1737,7 +1819,8 @@ def interactive(overrides, macos_disable_library_validation=False):
             continue
         console.rule(f"[bold cyan]{action}[/]")
         run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
-        for t in sel:
+        # Restoring a shared agy also changes the other target's status.
+        for t in TARGETS:
             status[t] = _status_of(t, paths[t])
         console.rule(style="dim")
         questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs).ask()
@@ -1749,7 +1832,7 @@ def main(argv=None):
     ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts"), nargs="?",
                     help="menu (default) | status | patch | restore | "
                          "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]")
-    ap.add_argument("targets", nargs="*", default=[], metavar="{cli,manager,ide}",
+    ap.add_argument("targets", nargs="*", default=[], metavar="{" + ",".join(TARGETS) + "}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
     ap.add_argument("--macos-disable-library-validation", action="store_true",
