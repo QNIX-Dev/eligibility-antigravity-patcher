@@ -119,17 +119,10 @@ class GateStateTests(unittest.TestCase):
         self.assertEqual(self.gate.find(b"xxORIGyy"), ("unpatched", 2))
         self.assertEqual(self.gate.find(b"xxDONEyy"), ("patched", 2))
 
-    def test_duplicate_original_is_ambiguous(self):
-        with self.assertRaises(manager.SignatureAmbiguous):
-            self.gate.find(b"ORIG--ORIG")
-
-    def test_duplicate_patched_is_ambiguous(self):
-        with self.assertRaises(manager.SignatureAmbiguous):
-            self.gate.find(b"DONE--DONE")
-
-    def test_mixed_original_and_patched_is_ambiguous(self):
-        with self.assertRaises(manager.SignatureAmbiguous):
-            self.gate.find(b"ORIG--DONE")
+    def test_duplicate_and_mixed_signatures_are_ambiguous(self):
+        for data in (b"ORIG--ORIG", b"DONE--DONE", b"ORIG--DONE"):
+            with self.subTest(data=data), self.assertRaises(manager.SignatureAmbiguous):
+                self.gate.find(data)
 
     def test_ranges_exclude_data_matches(self):
         self.assertEqual(self.gate.find(b"ORIG--ORIG", ((0, 4),)), ("unpatched", 0))
@@ -230,17 +223,13 @@ class ExecutableRangeTests(unittest.TestCase):
             with self.subTest(expected=expected, magic=payload[:4]):
                 self.assertEqual(self._info(payload)[1], expected)
 
-    def test_pe_ranges(self):
-        self.assertEqual(self._ranges(_minimal_pe()), ((0x200, 0x240),))
-
-    def test_elf_ranges(self):
-        self.assertEqual(self._ranges(_minimal_elf()), ((0x100, 0x120),))
-
-    def test_macho_ranges(self):
-        self.assertEqual(self._ranges(_minimal_macho()), ((0x200, 0x220),))
-
-    def test_fat_macho_ranges(self):
-        self.assertEqual(self._ranges(_minimal_fat_macho()), ((0x300, 0x320),))
+    def test_executable_ranges_by_format(self):
+        for payload, expected in ((_minimal_pe(), ((0x200, 0x240),)),
+                                  (_minimal_elf(), ((0x100, 0x120),)),
+                                  (_minimal_macho(), ((0x200, 0x220),)),
+                                  (_minimal_fat_macho(), ((0x300, 0x320),))):
+            with self.subTest(magic=payload[:4]):
+                self.assertEqual(self._ranges(payload), expected)
 
     def test_gate_status_ignores_non_executable_match(self):
         gate = manager.Gate(b"ORIG", b"DONE", b"DONE")
