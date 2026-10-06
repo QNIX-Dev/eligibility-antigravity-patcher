@@ -35,7 +35,7 @@
 
 `agy-manager` combines two essential tools for a seamless development experience in the Antigravity ecosystem:
 
-- 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all three core applications (CLI, Manager, IDE).
+- 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all core components (CLI, Manager, IDE, and the IDE extension).
 - 👥 **Account Profile Manager:** Safely store and quickly switch between multiple authorization profiles offline, without the need for browser-based re-authentication.
 - 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
 - ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
@@ -82,28 +82,25 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 | `python manager.py status` | Scan and display the patch status of all applications. |
 | `python manager.py patch` | Patch all detected applications. |
 | `python manager.py restore` | Revert all changes and restore original files. |
-| `python manager.py patch <cli\|manager\|ide>` | Patch only the specified applications. |
+| `python manager.py patch <cli\|manager\|ide\|extension>` | Patch only the specified applications. |
 | `python manager.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles (see details below). |
 
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
 > ```bash
 > python manager.py --path-cli "D:\CustomTools\agy.exe" patch cli
+> # Or for the extension backend:
+> python manager.py --path-extension "D:\CustomTools\agy.exe" patch extension
 > ```
 
 > [!NOTE]
-> **macOS signing runs automatically only while patching on macOS.** The patcher first applies and verifies all selected changes, then ad-hoc signs each modified Mach-O (`agy` and `language_server`) separately, and finally signs the containing `.app` once. Every signature is verified with `codesign`; a failure rolls back the patches and temporary signature changes. When Python lacks extended-attribute APIs, the patcher uses the built-in `/usr/bin/xattr` tool; no extra Python package is needed. After signing succeeds, the patcher automatically removes `com.apple.quarantine` only from the selected applications (recursively for `.app` bundles), preventing Gatekeeper from blocking the locally modified code. During `restore`, the original bundle signature is returned after the last patched target inside that bundle is restored. Keep `*.app.agysignbak` directories for as long as you need the patch and full restoration support.
->
-> Removing quarantine does not disable Gatekeeper globally or affect other applications or system settings. The original value of this attribute is not restored by the `restore` command.
-
-> [!WARNING]
-> **Electron and Library Validation on macOS.** The app's signing flags and entitlements are inspected before patch writes. If Library Validation is enabled without an exception, the patcher stops: ad-hoc signing removes the main executable's Team ID and may make it incompatible with the Electron Framework signature. Failure to read signing metadata or entitlements also stops the patch. To explicitly allow libraries with other or no signatures in the selected app, use:
-> ```bash
-> python3 manager.py --macos-disable-library-validation patch ide
-> ```
-> The flag applies only to `patch`/`menu` on macOS and adds `com.apple.security.cs.disable-library-validation=true` only to the selected Electron `.app`'s main executable, when needed. Other entitlements, the identifier, signing flags, and Hardened Runtime are preserved; frameworks and helpers are not re-signed. Entitlements are read back and checked after signing; failure triggers rollback. `restore` returns the original signature and entitlements from `*.app.agysignbak` after the last patched target is restored. To repair an already patched copy, rerun the CLI patch command with the flag.
->
-> The exception weakens library loading checks for this executable only, rather than globally. Successful `codesign --verify` confirms the signature but does not guarantee that the app launches. Test patching, launching, and subsequent restoration on a separate `.app` copy; full launch validation requires macOS.
+> **macOS Notes (Code Signing & Gatekeeper):**
+> - **Automatic Ad-hoc Signing:** On macOS, modified Mach-O binaries (`agy`, `language_server`) and the `.app` bundle are automatically ad-hoc signed via `codesign`, and the `com.apple.quarantine` attribute is removed. Original signatures are saved in `*.app.agysignbak` for complete rollback via `restore`.
+> - **Electron & Library Validation:** If application launch is blocked due to Electron's Library Validation (ad-hoc signatures lack a Team ID), run the patch with the exception flag:
+>   ```bash
+>   python3 manager.py --macos-disable-library-validation patch ide
+>   ```
+>   This safely adds the `disable-library-validation=true` entitlement only to the selected `.app`'s main executable. See [technical details](#details) for full mechanics.
 
 ---
 
@@ -121,11 +118,12 @@ The patcher neutralizes local eligibility checks and directs each client into it
 | **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Binary-patches `agy` / `agy.exe` to neutralize the local `hasValidAuth` gate and select the `eligible` path. | `agy` / `agy.exe` |
 | **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server` / `language_server.exe` to neutralize the `hasValidAuth` gate and select the success path. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
 | **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified `main.js` to neutralize the local auth gate and select the shortened authentication path. | `resources/app/out/main.js` |
+| **`extension`** | **Antigravity Extension** (Extension) | Binary-patches the extension's Go backend `agy` (`--hub`) to neutralize the `hasValidAuth` gate and select the success path. | `.gemini/bin/agy` / `.gemini/bin/agy.exe` |
 
 > [!NOTE]
-> **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform and support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms.
+> **Platform Support:** The `cli`, `manager`, `ide`, and `extension` patches support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms. The `extension` patch uses the verified x64 backend signature (ARM64 is deliberately excluded pending signature verification in real-world builds).
 >
-> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
+> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For `extension`, autodetection scans `~/.gemini/bin/`, ignoring `PATH`. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli` or `--path-extension`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) remains Windows-only for now.
 
 ---
 
@@ -179,9 +177,21 @@ At startup, the CLI reads the `hasValidAuth` field (the byte at offset `+8`) of 
 The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
 
 1. **x64 builds:** The patcher finds the validator's unique gate signature: `cmp byte ptr [rax+8],0` → `je` (skips the success path) → `mov rdx,[rsp+0x70]` → `mov [rax+0x60],rdx`. The context instructions are fixed; only the branch displacement may vary.
+   The same instruction sequence is verified in the Windows x64 agy 1.3.0 hub backend and reused by the `extension` target without maintaining duplicate signatures.
 2. The check and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP`: the flag is forced to `true` and the conditional jump is removed, so execution continues along the success path.
 3. This validator's result is returned by `GetAuthStatus` and used by the login routine, so both locations receive the same forced-success verdict during initial login and subsequent restarts.
 4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain the same gate in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → `ldp x3,x4,[sp,#0x80]` → `stp x3,x4,[x0,#0x60]`. The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]`, forcing the flag to `true`, removing the conditional jump, and continuing along the success path. The signature fixes the current context instructions and allows only the branch displacement to vary. The `MultiGate` class automatically selects the x64 or arm64 signature.
+</details>
+
+<details>
+<summary>🧩 <b>Extension Patch (`agy --hub` Go Backend)</b></summary>
+
+The Google Antigravity extension runs the downloaded `agy` binary with `--hub` and serves its UI from a local HTTP server. The web UI invokes the `Login` and `GetAuthStatus` connect-rpc endpoints, verifies `authResult.hasValidAuth`, and displays an eligibility failure screen if the account is marked ineligible.
+
+1. **x64 builds:** The patcher locates the verified validator gate in `authclient.(*PersonalAuthValidator).Validate`: `cmp byte ptr [rax+8],0` → `je` → `mov rdx,[rsp+0x70]` → `mov [rax+0x60],rdx`. Surrounding context instructions remain untouched.
+2. The comparison and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP` + `NOP`: the validity flag is forced to `true` and execution proceeds down the success path.
+3. As a result, both `Login` and `GetAuthStatus` deliver a forced-success verdict directly to the hub UI, independent of the standard CLI's terminal gate.
+4. **Architecture support:** The target is architecture-aware and strictly matches x64 builds. ARM64 extension support is deliberately excluded until verified against real-world builds.
 </details>
 
 <details>
@@ -201,7 +211,17 @@ Profile switching is fully offline and does not call standard logout endpoints (
 1. **Storage Separation:** CLI/Manager tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
 2. **Secure Persistence:** On `save`, active credentials are read, encoded, and saved back to Windows Credential Manager under unique prefixed names: `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
 3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
-4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.
+</details>
+
+<details>
+<summary>🍎 <b>macOS Code Signing & Library Validation</b></summary>
+
+The patcher fully automates the signing pipeline and entitlement management required to run modified applications on macOS:
+
+1. **Signing Order:** Binary patches are applied and verified first, followed by ad-hoc Mach-O signing (`agy` and `language_server`), and finally the outer `.app` bundle is signed inside-out. Each step is validated with `codesign --verify`; any failure triggers an immediate rollback.
+2. **Quarantine Removal:** Upon successful signing, `com.apple.quarantine` is recursively stripped from the target `.app` (using Python APIs or the built-in `/usr/bin/xattr`), preventing Gatekeeper from blocking the modified bundle.
+3. **Electron & Library Validation:** Signing flags and entitlements are preflight-checked before writing. When Library Validation is active, ad-hoc signing drops the Team ID and conflicts with the Electron Framework. The `--macos-disable-library-validation` flag injects `com.apple.security.cs.disable-library-validation=true` into the main executable's entitlements while preserving Hardened Runtime and existing entitlements.
+4. **Backup & Rollback:** Original signing metadata and entitlements are saved in the sibling `*.app.agysignbak` directory. Running `restore` reinstates the original bundle signature once the last patched target is restored.
 </details>
 
 ---
@@ -210,7 +230,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 - **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
 - **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
-- **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
+- **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, IDE, or the editor with the extension) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
 - **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
 - **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.
 
