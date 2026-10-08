@@ -435,17 +435,294 @@ class AccountTests(unittest.TestCase):
         encoded = [base64.urlsafe_b64encode(payload).rstrip(b"=") for payload in payloads]
         return base64.b64encode(b"\x00" + b"\x00".join(encoded) + b"\x00").decode()
 
-    def test_ide_refresh_token_accepts_rotated_wrapper_prefix(self):
-        refresh_token = b"1//fixture-refresh-token_123"
-        oauth_token = self._ide_oauth_token(b"new-wrapper-format:" + refresh_token + b"\xff")
-        self.assertNotIn(b"CoQC", base64.b64decode(oauth_token))
-        self.assertEqual(manager._ide_refresh_token(oauth_token), refresh_token.decode())
+    def test_ide_refresh_token_requires_one_token_regardless_of_wrapper(self):
+        cases = [((b"new-wrapper-format:1//fixture-refresh-token_123\xff",), "1//fixture-refresh-token_123"),
+                 ((b"first-wrapper:1//fixture-refresh-token_one\xff",
+                   b"second-wrapper:1//fixture-refresh-token_two\xff"), None)]
+        for index, (payloads, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertEqual(manager._ide_refresh_token(self._ide_oauth_token(*payloads)), expected)
 
-    def test_ide_refresh_token_rejects_ambiguous_wrapper(self):
-        oauth_token = self._ide_oauth_token(
-            b"first-wrapper:1//fixture-refresh-token_one\xff",
-            b"second-wrapper:1//fixture-refresh-token_two\xff")
-        self.assertIsNone(manager._ide_refresh_token(oauth_token))
+
+class UsageTests(unittest.TestCase):
+    @staticmethod
+    def _bundle(**fields):
+        token = {"access_token": "fixture-access", "refresh_token": "fixture-refresh",
+                 "expiry": "2030-01-01T00:00:00Z"}
+        token.update(fields)
+        return {"cred": base64.b64encode(json.dumps({"token": token}).encode()).decode()}
+
+    @staticmethod
+    def _summary():
+        # Field names and grouping verified in both Windows binaries and a live summary.
+        return {"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": .9,
+                 "resetTime": "2026-10-08T20:42:48Z"},
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": .75,
+                 "resetTime": "2026-10-05T14:39:31Z"}]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1,
+                 "resetTime": "2026-10-12T10:54:57Z"},
+                {"bucketId": "3p-5h", "window": "5h", "remainingFraction": 0,
+                 "resetTime": "2026-10-05T15:54:57Z"}]}]}
+
+    def test_quota_schema_and_unknown_values(self):
+        for response in (self._summary(), {"response": self._summary()}):
+            groups = manager._parse_usage(response)
+            self.assertEqual([g["windows"][w]["fraction"] for g in groups for w in ("5h", "weekly")],
+                             [.75, .9, 0, 1])
+            self.assertEqual(groups[0]["windows"]["weekly"]["reset"],
+                             manager._usage_timestamp("2026-10-08T23:42:48+03:00"))
+        self.assertIsNone(manager._usage_timestamp("2026-10-08T23:42:48"))
+        for value in (None, True, "0.5", float("nan"), float("inf"), -.1, 1.1, 10 ** 500):
+            with self.subTest(invalid_fraction=value):
+                group = manager._parse_usage({"groups": [{"buckets": [
+                    {"window": "5h", "remainingFraction": value, "remainingAmount": "100"}]}]})[0]
+                for window in ("5h", "weekly"):
+                    self.assertEqual(manager._usage_cells(group["windows"][window], 0), ("no data", "not reported"))
+        for count in (2, 3):
+            with self.subTest(duplicate_windows=count):
+                group = manager._parse_usage({"groups": [{"buckets": [
+                    {"window": "5h", "remainingFraction": .5}] * count}]})[0]
+                self.assertIsNone(group["windows"]["5h"])
+        group = manager._parse_usage({"groups": [{"buckets": [
+            {"window": "5h", "disabled": True}, {"window": "weekly", "remainingFraction": 0}]}]})[0]
+        self.assertEqual(manager._usage_cells(group["windows"]["5h"], 0)[0], "unavailable")
+        self.assertEqual(manager._usage_cells(group["windows"]["weekly"], 0)[0], "0% [RATE-LIMITED]")
+        quota, reset = manager._usage_cells({"fraction": .25, "reset": 1, "disabled": False}, 60)
+        self.assertEqual(quota, "25.0%")
+        self.assertIn("refresh to confirm", reset)
+        self.assertEqual(manager._parse_usage({"groups": [], "buckets": [{"remainingFraction": 1}]}), [])
+        for response in ({}, {"groups": None}, {"groups": {}}, [], {"response": None}):
+            with self.subTest(invalid_response=response), self.assertRaises(manager.UsageError):
+                manager._parse_usage(response)
+
+    def test_oauth_refresh_modes_and_safe_failures(self):
+        oauth = AccountTests._ide_oauth_token(b"wrapper:1//fixture-refresh_123\xff")
+        ide = {"ide": {manager.IDE_KEYS[0]: manager._enc(oauth)}}
+        refreshed = {"access_token": "fixture-new-access"}
+        cases = [
+            ("expired CLI", "cli-manager", self._bundle(expiry="2000-01-01T00:00:00Z"), [refreshed, self._summary()], False),
+            ("saved IDE", "ide", ide, [refreshed, self._summary()], False),
+            ("401 retry", "cli-manager", self._bundle(), [manager._UsageHTTPError(401), refreshed, self._summary()], False),
+            ("401 repeated", "cli-manager", self._bundle(), [manager._UsageHTTPError(401), refreshed, manager._UsageHTTPError(401)], True)]
+        cases.extend((str(status), "cli-manager", self._bundle(), [manager._UsageHTTPError(status)], True)
+                     for status in (403, 429, 500))
+        with (mock.patch.object(manager, "cred_write", side_effect=AssertionError("unexpected credential write")),
+              mock.patch.object(manager, "profile_save", side_effect=AssertionError("unexpected profile save")),
+              mock.patch.object(manager, "ide_write", side_effect=AssertionError("unexpected IDE write")),
+              mock.patch.object(manager, "ide_read", side_effect=AssertionError("unexpected live IDE read"))):
+            for name, target, bundle, responses, failed in cases:
+                with self.subTest(case=name), mock.patch.object(manager, "_usage_post", side_effect=responses) as post:
+                    before = json.dumps(bundle)
+                    if failed:
+                        with self.assertRaises(manager.UsageError): manager._profile_usage(target, bundle)
+                    else:
+                        self.assertEqual(len(manager._profile_usage(target, bundle)), 2)
+                        self.assertEqual(post.call_args, mock.call(manager._USAGE_URL, {}, "fixture-new-access"))
+                        refresh_call = next(call for call in post.call_args_list if call.args[0] == "https://oauth2.googleapis.com/token")
+                        payload = manager.urllib.parse.parse_qs(refresh_call.args[1].decode())
+                        self.assertEqual(payload["grant_type"], ["refresh_token"])
+                        if target == "ide": self.assertEqual(payload["refresh_token"], ["1//fixture-refresh_123"])
+                    self.assertEqual(post.call_count, len(responses))
+                    self.assertEqual(json.dumps(bundle), before)
+            for bundle in ({}, {"cred": "not-base64"}, {"cred": base64.b64encode(b'[]').decode()},
+                           self._bundle(access_token=None, refresh_token=None),
+                           self._bundle(access_token="bad\nheader", refresh_token=None)):
+                with mock.patch.object(manager, "_usage_post") as post:
+                    with self.assertRaises(manager.UsageError): manager._profile_usage("cli-manager", bundle)
+                    post.assert_not_called()
+
+    def test_http_transport_and_credential_redaction(self):
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b'{"groups":[]}'
+        with mock.patch.object(manager.urllib.request, "build_opener", return_value=opener) as build:
+            self.assertEqual(manager._usage_post(manager._USAGE_URL, {}, "fixture-access"), {"groups": []})
+            request = opener.open.call_args.args[0]
+            self.assertEqual((request.get_method(), request.data, request.get_header("Authorization")),
+                             ("POST", b"{}", "Bearer fixture-access"))
+            self.assertEqual(opener.open.call_args.kwargs["timeout"], manager._USAGE_TIMEOUT)
+            self.assertIsInstance(build.call_args.args[0], manager._UsageNoRedirect)
+        self.assertIsNone(manager._UsageNoRedirect().redirect_request(None, None, 302, "", {}, "https://example.com"))
+        marker = "fixture-private-marker"
+        cases = [manager.urllib.error.URLError(marker), ValueError(marker),
+                 manager.urllib.error.HTTPError(manager._USAGE_URL, 401, marker, {}, io.BytesIO(marker.encode())),
+                 b'[]', b'not JSON', b'x' * (manager._USAGE_MAX_RESPONSE + 1)]
+        for index, response in enumerate(cases):
+            with self.subTest(case=index):
+                opener = mock.MagicMock()
+                if isinstance(response, Exception): opener.open.side_effect = response
+                else: opener.open.return_value.__enter__.return_value.read.return_value = response
+                with mock.patch.object(manager.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaises(manager.UsageError) as caught:
+                        manager._usage_post(manager._USAGE_URL, {}, marker)
+                    self.assertNotIn(marker, str(caught.exception))
+
+    def test_live_account_sources_and_deduplication(self):
+        cli = self._bundle()
+        access_only = self._bundle(refresh_token=None)
+        oauth = AccountTests._ide_oauth_token(b"wrapper:1//fixture-refresh_123\xff")
+        ide = {"ide": {manager.IDE_KEYS[0]: manager._enc(oauth)}}
+        cases = [("cli-manager", cli, {}, {None}), ("ide", ide, {}, {None}),
+                 ("cli-manager", cli, {"personal": cli}, {"personal"}),
+                 ("ide", ide, {"personal": ide}, {"personal"}),
+                 ("cli-manager", access_only, {"personal": access_only}, {"personal"}),
+                 ("cli-manager", cli, {"Current · unsaved": self._bundle(refresh_token="another-refresh")},
+                  {None, "Current · unsaved"}),
+                 ("cli-manager", None, {}, set()), ("ide", None, {}, set())]
+        for index, (target, live, profiles, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                raw_cli = base64.b64decode(live["cred"]) if live and target == "cli-manager" else None
+                raw_ide = {key: manager._dec(value) for key, value in live["ide"].items()} if live and target == "ide" else {}
+                with (mock.patch.object(manager, "profile_bundles", return_value=profiles) as load,
+                      mock.patch.object(manager, "cred_read", return_value=raw_cli) as credentials,
+                      mock.patch.object(manager, "_ide_state_db", return_value="fixture.db" if raw_ide else None),
+                      mock.patch.object(manager, "ide_read", return_value=raw_ide) as read_ide,
+                      mock.patch.object(manager, "_profile_usage", return_value=[]) as fetch,
+                      mock.patch.object(manager, "cred_write", side_effect=AssertionError("unexpected write")),
+                      mock.patch.object(manager, "ide_write", side_effect=AssertionError("unexpected write")),
+                      mock.patch.object(manager, "profile_save", side_effect=AssertionError("unexpected save"))):
+                    results = manager._check_usage(target)
+                self.assertEqual(set(results), expected)
+                self.assertTrue(all(row["error"] is None for row in results.values()))
+                self.assertEqual(sum(row["active"] for row in results.values()), int(live is not None))
+                self.assertEqual(fetch.call_count, len(expected))
+                self.assertEqual(credentials.call_count, int(target == "cli-manager"))
+                self.assertEqual(read_ide.call_count, int(bool(raw_ide)))
+                load.assert_called_once_with(target)
+
+    def test_usage_cli_selection_failures_and_redaction(self):
+        good, bad = self._bundle(), self._bundle(refresh_token=None)
+        cases = [(None, {"good": good, "bad": bad}, None, 1),
+                 ("good", {"good": good}, None, 0),
+                 (None, {}, good, 0)]
+        for name, profiles, live, expected_code in cases:
+            with self.subTest(named=name, unsaved=live is not None):
+                output = io.StringIO()
+                def fetch(_, bundle):
+                    if bundle is bad: raise manager.UsageError("OAuth refresh rejected; sign in again")
+                    return manager._parse_usage(self._summary())
+                with (mock.patch.object(manager, "profile_names", return_value=list(profiles)) as names,
+                      mock.patch.object(manager, "profile_load", side_effect=lambda _, key: profiles[key]) as load,
+                      mock.patch.object(manager, "_usage_live_bundle", return_value=live) as read,
+                      mock.patch.object(manager, "current_account", return_value=None),
+                      mock.patch.object(manager, "_profile_usage", side_effect=fetch),
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(manager.acct_usage("cli-manager", name), expected_code)
+                self.assertEqual(load.call_count, len(profiles))
+                self.assertEqual(names.call_count, int(name is None))
+                self.assertEqual(read.call_count, int(name is None))
+                self.assertIn("75.0%", output.getvalue())
+                if expected_code: self.assertIn("OAuth refresh rejected", output.getvalue())
+                if live: self.assertIn("Current · unsaved", output.getvalue())
+                for token in ("fixture-access", "fixture-refresh"): self.assertNotIn(token, output.getvalue())
+        with (mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.object(manager, "acct_usage", return_value=1) as usage):
+            self.assertEqual(manager.main(["accounts", "ide", "usage", "one"]), 1)
+            usage.assert_called_once_with("ide", "one")
+
+    def test_startup_scope_isolation_and_platform_guard(self):
+        with (mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.object(manager, "_usage_live_bundle", return_value=None),
+              mock.patch.object(manager, "profile_bundles", return_value={"one": self._bundle()}) as load,
+              mock.patch.object(manager, "_collect_usage", return_value={}) as collect):
+            manager._startup_usage()
+            self.assertEqual(load.call_args_list, [mock.call("cli-manager"), mock.call("ide")])
+            self.assertEqual(collect.call_count, 2)
+        with (mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.object(manager, "profile_bundles", side_effect=ValueError("fixture-private-marker"))):
+            result = manager._startup_usage()
+            self.assertEqual(len(result["_errors"]), 2)
+            self.assertNotIn("fixture-private-marker", str(result))
+        with (mock.patch.object(manager.os, "name", "posix"),
+              mock.patch.object(manager, "profile_bundles") as load):
+            self.assertEqual(manager._startup_usage(), {}); load.assert_not_called()
+
+    def test_tui_terminal_cleanup(self):
+        import ctypes
+        import sys
+        kernel, console = mock.MagicMock(), mock.MagicMock()
+        kernel.GetStdHandle.return_value = 42
+        kernel.SetConsoleMode.return_value = 1
+        def read_mode(handle, pointer):
+            pointer._obj.value = 3
+            return 1
+        kernel.GetConsoleMode.side_effect = read_mode
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                kernel.reset_mock(); console.reset_mock()
+                with (mock.patch.dict(sys.modules, {"rich.console": mock.Mock(Console=mock.Mock(return_value=console))}),
+                      mock.patch.object(manager.os, "name", "nt"),
+                      mock.patch.object(manager.sys.stdout, "isatty", return_value=True),
+                      mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True)):
+                    try:
+                        with manager._tui_console():
+                            if interrupted: raise KeyboardInterrupt
+                    except KeyboardInterrupt: self.assertTrue(interrupted)
+                self.assertEqual(kernel.SetConsoleMode.call_args_list, [mock.call(42, 7), mock.call(42, 3)])
+                console.screen.return_value.__exit__.assert_called_once()
+        clear = mock.Mock()
+        console = mock.Mock(legacy_windows=True)
+        with (mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.dict(sys.modules, {"prompt_toolkit.shortcuts": mock.Mock(clear=clear)})):
+            manager._clear_tui(console)
+            clear.assert_called_once(); console.clear.assert_not_called()
+        console.legacy_windows = False
+        manager._clear_tui(console)
+        console.clear.assert_called_once()
+
+    def test_account_menu_snapshot_lifecycle(self):
+        import sys
+        bundle = self._bundle()
+        result = {"groups": [], "error": None, "checked_at": 1, "fingerprint": manager._usage_fingerprint(bundle)}
+        cases = [("changed", {"one": bundle}, bundle,
+                  {"one": {"fingerprint": manager._usage_fingerprint(self._bundle(refresh_token="changed"))}},
+                  ["usage", "back"], {"one"}, True),
+                 ("saved", {"one": dict(bundle, saved_at="new")}, dict(bundle, saved_at="old"),
+                  {None: dict(result)}, ["back"], {"one"}, False),
+                 ("logged out", {}, None, {None: dict(result)}, ["back"], set(), False)]
+        for name, profiles, live, usage, answers, expected, refresh in cases:
+            with self.subTest(case=name):
+                console, questionary = mock.MagicMock(), mock.MagicMock()
+                questionary.select.return_value.ask.side_effect = answers
+                rendered = []
+                with (mock.patch.dict(sys.modules, {"questionary": questionary,
+                        "rich.table": mock.MagicMock(), "rich.panel": mock.MagicMock()}),
+                      mock.patch.object(manager, "profile_bundles", return_value=profiles),
+                      mock.patch.object(manager, "_usage_live_bundle", return_value=live),
+                      mock.patch.object(manager, "_collect_usage", return_value={"one": dict(result)}) as collect,
+                      mock.patch.object(manager, "_render_usage",
+                                        side_effect=lambda _, rows, *args: rendered.append(set(rows)))):
+                    manager._accounts_submenu(console, None, "cli-manager", usage)
+                self.assertEqual(set(usage), expected)
+                self.assertEqual(collect.call_count, int(refresh))
+                if refresh: self.assertEqual(rendered, [set(), {"one"}, {"one"}])
+                if usage:
+                    self.assertTrue(usage["one"]["active"])
+                    self.assertEqual(usage["one"]["checked_at"], 1)
+
+    def test_main_refresh_preserves_menu_and_does_not_repeat_quota_checks(self):
+        import sys
+        console, questionary = mock.MagicMock(), mock.MagicMock()
+        questionary.select.return_value.ask.side_effect = ["refresh", "refresh-quotas", "quit"]
+        usage, refreshed = {"cli-manager": {"one": {"checked_at": 1}}}, {"cli-manager": {"one": {"checked_at": 2}}}
+        rendered, clears_at_refresh = [], []
+        def refresh_results():
+            clears_at_refresh.append(console.clear.call_count)
+            return usage if len(clears_at_refresh) == 1 else refreshed
+        with (mock.patch.dict(sys.modules, {"questionary": questionary}),
+              mock.patch.object(manager, "scan", return_value=({}, {})) as scan,
+              mock.patch.object(manager, "_render"),
+              mock.patch.object(manager, "_render_usage", side_effect=lambda _, rows, *args: rendered.append(dict(rows))),
+              mock.patch.object(manager, "_startup_usage", side_effect=refresh_results) as refresh):
+            self.assertEqual(manager._interactive(console, {}), 0)
+        self.assertEqual([rows["one"]["checked_at"] for rows in rendered if rows], [1, 1, 2])
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(clears_at_refresh, [0, 2])
+        self.assertEqual(console.status.call_count, 1)
+        questionary.press_any_key_to_continue.assert_not_called()
 
 
 class TransactionTests(unittest.TestCase):

@@ -22,6 +22,12 @@ git diff --check
 
 Do not consider a patching change complete until the entire test suite passes.
 
+Keep the test suite minimal: add a separate test only for a distinct behavior or
+regression. Extend existing table-driven tests with `subTest` for related cases
+instead of duplicating setup and assertions. Avoid tests for cosmetic TUI changes
+or checks that merely mirror implementation details; preserve shared safety and
+transaction coverage.
+
 ## Binary patch safety
 
 - Preserve the safe-failure behavior: unsupported, missing, duplicate, mixed, or ambiguous signatures must not modify a target.
