@@ -98,7 +98,7 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 > - **Automatic Ad-hoc Signing:** On macOS, modified Mach-O binaries (`agy`, `language_server`) and the `.app` bundle are automatically ad-hoc signed via `codesign`, and the `com.apple.quarantine` attribute is removed. Original signatures are saved in `*.app.agysignbak` for complete rollback via `restore`.
 > - **Electron & Library Validation:** If application launch is blocked due to Electron's Library Validation (ad-hoc signatures lack a Team ID), run the patch with the exception flag:
 >   ```bash
->   python3 manager.py --macos-disable-library-validation patch ide
+>   python manager.py --macos-disable-library-validation patch ide
 >   ```
 >   This safely adds the `disable-library-validation=true` entitlement only to the selected `.app`'s main executable. See [technical details](#details) for full mechanics.
 

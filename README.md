@@ -98,7 +98,7 @@ cd eligibility-antigravity-patcher
 > - **Автоматическая ad-hoc подпись:** Патчер автоматически переподписывает изменённые Mach-O бинарники (`agy`, `language_server`) и внешний `.app`-бандл через `codesign`, а также снимает атрибут `com.apple.quarantine`. Исходное состояние сохраняется в `*.app.agysignbak` для отката при `restore`.
 > - **Electron и Library Validation:** Если запуск приложения блокируется из-за проверки библиотек Electron (ad-hoc подпись не имеет Team ID), запустите патч с флагом исключения:
 >   ```bash
->   python3 manager.py --macos-disable-library-validation patch ide
+>   python manager.py --macos-disable-library-validation patch ide
 >   ```
 >   Флаг безопасно добавляет исключение `disable-library-validation=true` в entitlements основного исполняемого файла выбранного `.app`. Подробнее см. в [деталях реализации](#details).
 
