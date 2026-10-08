@@ -362,7 +362,8 @@ class DesktopProfileTests(unittest.TestCase):
             for name in ("work", "personal"):
                 self.assertEqual(manager.desktop_profile_create(name, {"manager": server}), 0)
                 profile = manager._desktop_profile_path(name)
-                self.assertEqual(os.stat(profile).st_mode & 0o777, 0o700)
+                if os.name == "posix":
+                    self.assertEqual(os.stat(profile).st_mode & 0o777, 0o700)
                 copied = os.path.join(profile, "Antigravity.app")
                 with open(os.path.join(copied, "Contents", "Info.plist"), "rb") as f:
                     plist = plistlib.load(f)
@@ -435,7 +436,7 @@ class DesktopProfileTests(unittest.TestCase):
             self.assertTrue(launch.call_args.kwargs["start_new_session"])
 
     def test_root_is_refused_and_macos_route_preserves_override(self):
-        with (contextlib.redirect_stdout(io.StringIO()), mock.patch.object(manager.os, "geteuid", return_value=0)):
+        with (contextlib.redirect_stdout(io.StringIO()), mock.patch.object(manager.os, "geteuid", return_value=0, create=True)):
             self.assertEqual(manager.run_desktop_accounts(["list"]), 2)
         with (mock.patch.object(manager.sys, "platform", "darwin"),
               mock.patch.object(manager, "run_desktop_accounts", return_value=0) as run):
@@ -659,7 +660,8 @@ class TransactionTests(unittest.TestCase):
                 self.assertTrue(manager.restore_file(link, status))
                 self.assertEqual(status(link)[0], "unpatched")
             self.assertTrue(os.path.islink(link))
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o755)
+            if os.name == "posix":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o755)
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), original)
             self.assertFalse(any(name.startswith(".agy-write-") for name in os.listdir(tmp)))
@@ -676,7 +678,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_macos_app_management_denial_explains_privacy_permission_even_as_root(self):
         with (mock.patch.object(manager.sys, "platform", "darwin"),
-              mock.patch.object(manager.os, "geteuid", return_value=0),
+              mock.patch.object(manager.os, "geteuid", return_value=0, create=True),
               mock.patch.object(manager, "_mac_app_bundle", return_value="/Applications/Fixture.app"),
               mock.patch("builtins.open", side_effect=PermissionError(errno.EPERM, "Operation not permitted")),
               mock.patch.object(manager.tempfile, "mkstemp", side_effect=PermissionError(errno.EPERM, "directory denied")),
