@@ -133,7 +133,7 @@ Safely saves the active Antigravity session under a unique profile name, allows 
 
 ### Management Scopes
 Sessions and quota checks are isolated into two independent scopes:
-1. **CLI + Manager** (share a common credential stored in Windows Credential Manager).
+1. **CLI + Manager + Extension** (share a common credential stored in Windows Credential Manager).
 2. **IDE** (uses its own authorization keys in the SQLite database `state.vscdb` inside VS Code).
 
 This separation avoids database locking conflicts, lets you query quotas and switch accounts for different tools independently.
@@ -150,12 +150,14 @@ The TUI runs on a separate terminal screen and clears between menu transitions t
 1. **Automatic Startup Summary:** Launching `python manager.py` (or `python manager.py menu`) automatically queries quotas for all profiles and active logins across both scopes, rendering compact summary tables directly on the main dashboard.
 2. **On-Demand Refresh:** The **Refresh quotas** option in the main menu updates data across both scopes on demand.
 3. **Accounts Menu Operations:**
-   - Select **Manage accounts** in the main menu, then choose the scope: **CLI + Manager** or **IDE**.
+   - Select **Manage accounts** in the main menu, then choose the scope: **CLI + Manager + Extension** or **IDE**.
    - Displays saved profiles and the live quota table (one row per account: 5-hour and weekly remaining amounts, percentages, and check timestamp).
    - Available actions: **Check usage / quota** (refresh quotas for the chosen scope), **Save current login as…** (save active session), **Switch to…** (switch profile), **Rename…**, **Sign out locally** (local logout), and **Remove…** (delete profile).
 
 ### Usage via the Command Line (CLI)
 Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]`
+
+The `cli-manager` scope includes CLI, Manager, and Extension, which share the same login.
 
 | Action | Example Command | Description |
 | :--- | :--- | :--- |
@@ -220,7 +222,7 @@ The Google Antigravity extension runs the downloaded `agy` binary with `--hub` a
 
 Profile switching is fully offline and does not call standard logout endpoints (which would revoke tokens on the server).
 
-1. **Storage Separation:** CLI/Manager tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
+1. **Storage Separation:** CLI + Manager + Extension tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
 2. **Secure Persistence:** On `save`, active credentials are read, encoded, and saved back to Windows Credential Manager under unique prefixed names: `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
 3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
 4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.

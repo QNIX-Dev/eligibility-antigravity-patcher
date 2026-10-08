@@ -698,7 +698,7 @@ def ide_patch(path):
     return True
 
 # Accounts
-# Live logins remain opaque: CLI/Manager use Credential Manager; IDE uses state.vscdb.
+# Live logins remain opaque: CLI + Manager + Extension use Credential Manager; IDE uses state.vscdb.
 ACCT_PREFIX = "agy-manager:account:"
 CRED_TARGET = "gemini:antigravity"
 CRED_USER   = "antigravity"
@@ -1314,7 +1314,7 @@ def acct_logout(target_type):
     
     if target_type == "cli-manager":
         cred_delete(CRED_TARGET)
-        ok("live CLI/Manager login cleared locally (NOT revoked) - launch Antigravity, "
+        ok("live CLI + Manager + Extension login cleared locally (NOT revoked) - launch Antigravity, "
            "sign into the next account, then `accounts cli-manager save <name>`")
     elif target_type == "ide":
         try:
@@ -1994,9 +1994,9 @@ def _render(console, paths, status):
     tbl.add_column("Account", style="bold green", no_wrap=True)
     tbl.add_column("Location", style="dim", overflow="fold")
     
-    for t in TARGETS:
+    for t in ("cli", "manager", "extension", "ide"):
         path, st = paths[t], status[t]
-        acct = cur_cli_manager if t in ("cli", "manager") else cur_ide if t == "ide" else None
+        acct = cur_cli_manager if t in ("cli", "manager", "extension") else cur_ide if t == "ide" else None
         acct_str = acct if acct else "[white dim]—[/]"
         tbl.add_row(SPEC[t]["name"], f"[{_STYLE[st]}]{_ICON[st]} {st}[/]", acct_str, path or "—")
         
@@ -2058,7 +2058,7 @@ def _accounts_submenu(console, qs, target_type, usage=None):
     import questionary
     from rich.table import Table
     from rich.panel import Panel
-    label = "CLI + Manager" if target_type == "cli-manager" else "IDE"
+    label = "CLI + Manager + Extension" if target_type == "cli-manager" else "IDE"
     if usage is None:
         usage = {}
     while True:
@@ -2150,7 +2150,7 @@ def _accounts_menu(console, qs, usage=None):
     while True:
         _clear_tui(console)
         act = questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
-            questionary.Choice("CLI + Manager", "cli-manager"),
+            questionary.Choice("CLI + Manager + Extension", "cli-manager"),
             questionary.Choice("IDE", "ide"),
             questionary.Choice("Back", "back"),
         ]).ask()
@@ -2213,7 +2213,7 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
     while True:
         _clear_tui(console)
         _render(console, paths, status)
-        for target_type, label in (("cli-manager", "CLI + Manager"), ("ide", "IDE")):
+        for target_type, label in (("cli-manager", "CLI + Manager + Extension"), ("ide", "IDE")):
             _render_usage(console, usage.get(target_type, {}), label)
         for error in usage.get("_errors", []):
             console.print(error, style="yellow", markup=False)
