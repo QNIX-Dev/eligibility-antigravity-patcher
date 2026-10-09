@@ -19,6 +19,16 @@ def _write(path, data):
         f.write(data)
 
 
+def _try_symlink(source, target, target_is_directory=False):
+    try:
+        os.symlink(source, target, target_is_directory=target_is_directory)
+    except OSError as e:
+        if getattr(e, "winerror", None) == 1314 or e.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS, errno.ENOTSUP):
+            return False
+        raise
+    return True
+
+
 def _minimal_pe(code=b"", data=b"", machine=0x8664):
     # One executable and one data section.
     image = bytearray(0x400)
@@ -386,6 +396,99 @@ class DesktopProfileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 manager.desktop_profile_create("work", {"manager": server})
 
+    def test_create_from_patched_source_preserves_isolation_after_restore(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager, "_desktop_profile_sign"),
+              contextlib.redirect_stdout(io.StringIO())):
+            _, server, _ = self.fixture(tmp)
+            original = self.token_binary()
+            # Real Manager ARM64 gate, separate from the credential constructor.
+            original[0x240:0x250] = bytes.fromhex("03204039a3010036e31348a9031006a9")
+            struct.pack_into("<Q", original, 32 + 72 + 40, 0x50)
+            patched = bytearray(original)
+            patched[0x240:0x248] = manager.MANAGER_GATE_ARM64.fix
+            _write(server, patched)
+            _write(server + manager.BAK, original)
+            self.assertEqual(manager.desktop_profile_create("work", {"manager": server}), 0)
+            profile = manager._desktop_profile_path("work")
+            copied = os.path.join(profile, "Antigravity.app", "Contents", "Resources", "bin", "language_server")
+            manager._desktop_namespace_credentials(copied + manager.BAK, profile, check_only=True)
+            self.assertEqual(manager.gate_status(copied, manager.MANAGER_GATE)[0], "patched")
+            self.assertTrue(manager.restore_file(copied, lambda p: manager.gate_status(p, manager.MANAGER_GATE)))
+            self.assertEqual(manager.gate_status(copied, manager.MANAGER_GATE)[0], "unpatched")
+            manager._desktop_namespace_credentials(copied, profile, check_only=True)
+            with open(server, "rb") as f:
+                self.assertEqual(f.read(), patched)
+            with open(server + manager.BAK, "rb") as f:
+                self.assertEqual(f.read(), original)
+            # Legacy or externally replaced unsafe backups must be refused.
+            _write(copied + manager.BAK, original)
+            with open(copied, "rb") as f:
+                before = f.read()
+            self.assertFalse(manager.restore_file(copied))
+            with open(copied, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+    def test_repair_namespaces_inherited_backup(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout="")),
+              mock.patch.object(manager, "_desktop_profile_sign"),
+              contextlib.redirect_stdout(io.StringIO())):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            _, server, _ = self.fixture(profile)
+            _write(server + manager.BAK, self.token_binary())
+            self.assertEqual(manager.desktop_profile_repair("work"), 0)
+            manager._desktop_namespace_credentials(server, profile, check_only=True)
+            manager._desktop_namespace_credentials(server + manager.BAK, profile, check_only=True)
+
+    def test_namespaced_backend_backup_is_signed_with_profile(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_mac_codesign") as sign,
+              mock.patch.object(manager, "_mac_library_validation_entitlements", return_value=None)):
+            app, server, _ = self.fixture(tmp)
+            _write(server + manager.BAK, self.token_binary())
+            manager._desktop_profile_namespace_credentials(app, tmp)
+            manager._desktop_profile_sign(app)
+            sign.assert_any_call(server + manager.BAK)
+
+    def test_repair_retains_original_when_install_and_rollback_both_fail(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout="")),
+              mock.patch.object(manager, "_desktop_profile_sign")):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            app, server, _ = self.fixture(profile)
+            original = self.token_binary()
+            data = os.path.join(profile, "user-data")
+            os.mkdir(data)
+            marker = os.path.join(data, "history")
+            _write(marker, b"private fixture history")
+            rename = os.rename
+
+            def fail_final_rename(src, dst):
+                if os.path.realpath(dst) == app:
+                    raise OSError("fixture final rename denied")
+                return rename(src, dst)
+
+            with mock.patch.object(manager.os, "rename", side_effect=fail_final_rename):
+                with self.assertRaisesRegex(OSError, "original app retained at") as failure:
+                    manager.desktop_profile_repair("work")
+            recoveries = [n for n in os.listdir(profile) if n.startswith(".recovery-")]
+            self.assertEqual(len(recoveries), 1)
+            saved = os.path.join(profile, recoveries[0], "Antigravity.app")
+            self.assertIn(saved, str(failure.exception))
+            self.assertFalse(os.path.exists(app))
+            with open(os.path.join(saved, "Contents", "Resources", "bin", "language_server"), "rb") as f:
+                self.assertEqual(f.read(), original)
+            with open(marker, "rb") as f:
+                self.assertEqual(f.read(), b"private fixture history")
+            self.assertFalse(any(n.startswith(".repair-") for n in os.listdir(profile)))
+
     def test_failed_signing_never_publishes_profile_and_cleans_temporary_copy(self):
         with (tempfile.TemporaryDirectory() as tmp,
               contextlib.redirect_stdout(io.StringIO()),
@@ -414,9 +517,9 @@ class DesktopProfileTests(unittest.TestCase):
             for name in ("../escape", "", "Work", "/absolute", "has space", "a" * 49):
                 with self.subTest(name=name), self.assertRaises(ValueError):
                     manager._desktop_profile_path(name)
-            os.symlink(os.path.dirname(tmp), os.path.join(tmp, "work"))
-            with self.assertRaises(ValueError):
-                manager._desktop_profile_path("work")
+            if _try_symlink(os.path.dirname(tmp), os.path.join(tmp, "work"), target_is_directory=True):
+                with self.assertRaises(ValueError):
+                    manager._desktop_profile_path("work")
 
     def test_open_uses_profile_executable_and_private_process_permissions(self):
         with (tempfile.TemporaryDirectory() as tmp,
@@ -645,7 +748,9 @@ class TransactionTests(unittest.TestCase):
             _write(path, original)
             os.chmod(path, 0o755)
             link = os.path.join(tmp, "linked-server")
-            os.symlink(path, link)
+            linked = _try_symlink(path, link)
+            if not linked:
+                link = path
 
             def deny_installed_write(filename, mode="r", *args, **kwargs):
                 if os.path.realpath(filename) == path and any(c in mode for c in "+wa"):
@@ -659,7 +764,8 @@ class TransactionTests(unittest.TestCase):
                 self.assertNotEqual(os.stat(path).st_ino, inode)
                 self.assertTrue(manager.restore_file(link, status))
                 self.assertEqual(status(link)[0], "unpatched")
-            self.assertTrue(os.path.islink(link))
+            if linked:
+                self.assertTrue(os.path.islink(link))
             if os.name == "posix":
                 self.assertEqual(os.stat(path).st_mode & 0o777, 0o755)
             with open(path, "rb") as f:

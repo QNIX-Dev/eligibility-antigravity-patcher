@@ -108,6 +108,17 @@ def restore_file(path, status=None):
     if not os.path.exists(b):
         warn(f"no backup for {os.path.basename(path)} (nothing to restore)")
         return False
+    if sys.platform == "darwin":
+        app = _mac_app_bundle(path)
+        if app and os.path.basename(path) == "language_server":
+            with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+                profile_app = plistlib.load(f).get("CFBundleIdentifier", "").startswith("com.parsa.agy-profile.")
+            if profile_app:
+                try:
+                    _desktop_namespace_credentials(b, os.path.dirname(app), check_only=True)
+                except (OSError, ValueError, LookupError) as e:
+                    warn(f"backup would break profile credential isolation — refusing to restore: {e}")
+                    return False
     if is_locked(path, "the app"):
         return False
     if status:
@@ -1121,6 +1132,14 @@ def _desktop_profile_path(name):
         raise ValueError("profile directory must not be a symlink")
     return path
 
+def _desktop_profile_namespace_credentials(app, profile):
+    server = os.path.join(app, "Contents", "Resources", "bin", "language_server")
+    for path in (server, server + BAK):
+        if path == server or os.path.lexists(path):
+            if os.path.islink(path):
+                raise ValueError("profile backend and backup must not be symlinks")
+            _desktop_namespace_credentials(path, profile)
+
 def _asar_read(path):
     with open(path, "rb") as f:
         prefix = f.read(16)
@@ -1233,10 +1252,11 @@ def _desktop_profile_sign(app):
         main = (_mac_bundle_main(bundle) if bundle.endswith(".app") else
                 os.path.join(bundle, os.path.basename(bundle)[:-len(".framework")]))
         mains.add(os.path.realpath(main))
+    backend_backup = os.path.join(app, "Contents", "Resources", "bin", "language_server") + BAK
     for base, _, files in os.walk(app, followlinks=False):
         for name in files:
             path = os.path.join(base, name)
-            if os.path.islink(path) or name.endswith(BAK) or os.path.realpath(path) in mains:
+            if os.path.islink(path) or (name.endswith(BAK) and path != backend_backup) or os.path.realpath(path) in mains:
                 continue
             with open(path, "rb") as f:
                 magic = f.read(4)
@@ -1281,7 +1301,7 @@ def desktop_profile_create(name, overrides=None):
         copied = os.path.join(temp, "Antigravity.app")
         info("creating isolated app copy (about 650 MB per profile)")
         shutil.copytree(app, copied, symlinks=True)
-        _desktop_namespace_credentials(os.path.join(copied, "Contents", "Resources", "bin", "language_server"), profile)
+        _desktop_profile_namespace_credentials(copied, profile)
         digest = _asar_write(os.path.join(copied, "Contents", "Resources", "app.asar"), header, payload, scripts)
         identity = "com.parsa.agy-profile." + name
         original_identity = plist["CFBundleIdentifier"]
@@ -1360,18 +1380,29 @@ def desktop_profile_repair(name):
     with tempfile.TemporaryDirectory(prefix=".repair-", dir=profile) as temp:
         copied = os.path.join(temp, "Antigravity.app")
         shutil.copytree(app, copied, symlinks=True)
-        _desktop_namespace_credentials(os.path.join(copied, "Contents", "Resources", "bin", "language_server"), profile)
+        _desktop_profile_namespace_credentials(copied, profile)
         _desktop_profile_sign(copied)
-        saved = os.path.join(temp, "previous.app")
-        os.rename(app, saved)
+        # Keep the original outside automatic cleanup until rollback succeeds.
+        recovery = tempfile.mkdtemp(prefix=".recovery-", dir=profile)
+        saved = os.path.join(recovery, "Antigravity.app")
+        try:
+            os.rename(app, saved)
+        except Exception:
+            shutil.rmtree(recovery)
+            raise
         try:
             os.rename(copied, app)
             _desktop_namespace_credentials(os.path.join(app, "Contents", "Resources", "bin", "language_server"), profile, check_only=True)
-        except Exception:
-            if os.path.exists(app):
-                shutil.rmtree(app)
-            os.rename(saved, app)
+        except Exception as failure:
+            try:
+                if os.path.exists(app):
+                    shutil.rmtree(app)
+                os.rename(saved, app)
+            except Exception as rollback:
+                raise OSError(f"repair failed ({failure}); rollback failed ({rollback}); original app retained at {saved}") from rollback
+            shutil.rmtree(recovery)
             raise
+        shutil.rmtree(recovery)
     ok(f"repaired credential isolation for '{name}' — reopen it and sign into the other account")
     return 0
 
