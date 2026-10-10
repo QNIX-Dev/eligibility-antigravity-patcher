@@ -3,3 +3,4 @@
 # standard library alone, no installs required.
 rich>=13
 questionary>=2
+prompt-toolkit>=3.0.34,<4

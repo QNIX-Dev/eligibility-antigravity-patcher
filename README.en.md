@@ -146,7 +146,7 @@ The quota inspection engine communicates directly with Google's internal quota s
 - **Safety and Autonomy:** Quota queries are strictly read-only, use the account's existing OAuth session, and refresh expired tokens in memory when needed without modifying stored credentials on disk or switching the active account. Failure of one account (such as network errors or revoked tokens) is isolated and does not hide data for other accounts. Passing a reset time does not assume that quota has refilled until confirmed by a refreshed response.
 
 ### Usage in the Interactive Menu (TUI)
-The TUI runs on a separate terminal screen and clears between menu transitions to keep shell history clean. Exiting restores the regular terminal:
+The TUI runs on a separate terminal screen that stays open until the program exits. Patching, restoring, refreshing data, and account operations display an animation while messages appear as work proceeds. Resizing the window redraws tables and menus together while preserving selections and entered text; long paths are shortened with `…`. **PgUp/PgDn** scroll through long tables and operation results. Redrawing uses already loaded data without querying quotas again. When interrupted, the current operation finishes before the UI closes. Exiting restores the regular terminal:
 1. **Automatic Startup Summary:** Launching `python manager.py` (or `python manager.py menu`) automatically queries quotas for all profiles and active logins across both scopes, rendering compact summary tables directly on the main dashboard.
 2. **On-Demand Refresh:** The **Refresh quotas** option in the main menu updates data across both scopes on demand.
 3. **Accounts Menu Operations:**

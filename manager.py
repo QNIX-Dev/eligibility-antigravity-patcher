@@ -1996,7 +1996,7 @@ def _render(console, paths, status):
     tbl.add_column("App", style="bold cyan", no_wrap=True)
     tbl.add_column("Status", no_wrap=True)
     tbl.add_column("Account", style="bold green", no_wrap=True)
-    tbl.add_column("Location", style="dim", overflow="fold")
+    tbl.add_column("Location", style="dim", no_wrap=True, overflow="ellipsis", ratio=1)
     
     for t in ("cli", "manager", "extension", "ide"):
         path, st = paths[t], status[t]
@@ -2065,15 +2065,20 @@ def _accounts_submenu(console, qs, target_type, usage=None):
     label = "CLI + Manager + Extension" if target_type == "cli-manager" else "IDE"
     if usage is None:
         usage = {}
+
+    def load_profiles():
+        profiles = profile_bundles(target_type)
+        quota_profiles, cur = _usage_profiles(target_type, profiles)
+        return profiles, quota_profiles, cur
+
     while True:
         _clear_tui(console)
         try:
-            profiles = profile_bundles(target_type)
+            profiles, quota_profiles, cur = _tui_run(console, "Loading accounts…", load_profiles)
             names = list(profiles)
-            quota_profiles, cur = _usage_profiles(target_type, profiles)
         except Exception as e:
             console.print(f"[bold red]accounts error:[/] {e}")
-            questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); return
         tbl = Table(box=None, expand=True, pad_edge=False)
         tbl.add_column("Account", style="bold cyan"); tbl.add_column("", style="bold green", no_wrap=True)
         if names:
@@ -2096,7 +2101,7 @@ def _accounts_submenu(console, qs, target_type, usage=None):
             else:
                 usage[name]["active"] = name == cur
         _render_usage(console, usage, label, cur)
-        act = questionary.select("Accounts:", style=qs, qmark="»", choices=[
+        act = _tui_ask(console, questionary.select("Accounts:", style=qs, qmark="»", choices=[
             questionary.Choice("Check usage / quota", "usage"),
             questionary.Choice("Save current login as…", "save"),
             questionary.Choice("Switch to…", "use"),
@@ -2104,67 +2109,327 @@ def _accounts_submenu(console, qs, target_type, usage=None):
             questionary.Choice("Sign out locally", "logout"),
             questionary.Choice("Remove…", "rm"),
             questionary.Choice("Back", "back"),
-        ]).ask()
+        ]))
         if act in (None, "back"): return
         _clear_tui(console)
         console.rule(f"[bold cyan]{act}[/]")
         if act == "usage":
-            with console.status("Refreshing account quotas…"):
-                refreshed = _collect_usage(target_type, quota_profiles)
-                for name, result in refreshed.items():
-                    result["active"] = name == cur
+            refreshed = _tui_run(console, "Refreshing account quotas…", _collect_usage, target_type, quota_profiles)
+            for name, result in refreshed.items():
+                result["active"] = name == cur
             usage.clear(); usage.update(refreshed)
             _render_usage(console, usage, label, cur)
             if not quota_profiles:
                 console.print("[yellow]No active login or saved accounts.[/]")
         elif act == "save":
-            name = questionary.text("Name for this account:", style=qs).ask()
-            if name and name.strip(): acct_save(target_type, name.strip())
+            name = _tui_ask(console, questionary.text("Name for this account:", style=qs))
+            if name and name.strip():
+                _tui_run(console, "Saving account…", acct_save, target_type, name.strip())
         elif act == "logout":
-            acct_logout(target_type)
+            _tui_run(console, "Signing out…", acct_logout, target_type)
         elif act == "use":
             if not names: console.print("[yellow]Nothing saved yet.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                name = questionary.select("Switch to:", style=qs, choices=choices).ask()
-                if name and name != "back": acct_use(target_type, name)
+                name = _tui_ask(console, questionary.select("Switch to:", style=qs, choices=choices))
+                if name and name != "back":
+                    _tui_run(console, "Switching account…", acct_use, target_type, name)
         elif act == "rename":
             if not names: console.print("[yellow]Nothing saved yet.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                old_name = questionary.select("Select account to rename:", style=qs, choices=choices).ask()
+                old_name = _tui_ask(console, questionary.select("Select account to rename:", style=qs, choices=choices))
                 if old_name and old_name != "back":
-                    new_name = questionary.text(f"New name for '{old_name}':", style=qs).ask()
-                    if new_name and new_name.strip(): acct_rename(target_type, old_name, new_name.strip())
+                    new_name = _tui_ask(console, questionary.text(f"New name for '{old_name}':", style=qs))
+                    if new_name and new_name.strip():
+                        _tui_run(console, "Renaming account…", acct_rename, target_type, old_name, new_name.strip())
         elif act == "rm":
             if not names: console.print("[yellow]Nothing to remove.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                name = questionary.select("Remove:", style=qs, choices=choices).ask()
-                if name and name != "back": acct_rm(target_type, name)
-        questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask()
+                name = _tui_ask(console, questionary.select("Remove:", style=qs, choices=choices))
+                if name and name != "back":
+                    _tui_run(console, "Removing account…", acct_rm, target_type, name)
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
 
 def _accounts_menu(console, qs, usage=None):
     import questionary
     if os.name != "nt":
         console.print("[yellow]Account management is Windows-only.[/]")
-        questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); return
     if usage is None:
         usage = {}
     while True:
         _clear_tui(console)
-        act = questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
+        act = _tui_ask(console, questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
             questionary.Choice("CLI + Manager + Extension", "cli-manager"),
             questionary.Choice("IDE", "ide"),
             questionary.Choice("Back", "back"),
-        ]).ask()
+        ]))
         if act in (None, "back"): return
         _accounts_submenu(console, qs, act, usage.setdefault(act, {}))
+
+class _TuiSessionOutput:
+    """The interactive session owns the alternate screen, not each question."""
+    def __init__(self, output):
+        self.output = output
+
+    def __getattr__(self, name):
+        return getattr(self.output, name)
+
+    def enter_alternate_screen(self):
+        pass
+
+    def quit_alternate_screen(self):
+        pass
+
+
+class _TuiDisplay:
+    """Retain Rich renderables; prompt_toolkit owns the screen while asking."""
+    def __init__(self, console, output=None):
+        import threading
+        self.console = console
+        self.output = output
+        self.items = []
+        self._cache = None
+        self.follow_tail = False
+        self._revision = 0
+        self._lock = threading.RLock()
+
+    def print(self, *objects, **kwargs):
+        with self._lock:
+            self.items.append((objects, kwargs))
+            self._revision += 1
+            self._cache = None
+
+    def rule(self, title="", **kwargs):
+        from rich.rule import Rule
+        self.print(Rule(title, **kwargs))
+
+    def clear(self):
+        with self._lock:
+            self.items.clear()
+            self._revision += 1
+            self._cache = None
+            self.follow_tail = False
+
+    def formatted(self, width):
+        import io
+        from rich.console import Console
+        from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+        with self._lock:
+            if self._cache is not None and self._cache[0] == width:
+                return self._cache[1]
+            items, revision = list(self.items), self._revision
+        buffer = io.StringIO()
+        # Set both dimensions: Rich otherwise ignores an explicit width
+        # when the parent process declares TERM=dumb.
+        renderer = Console(file=buffer, width=max(1, width), height=self.console.height, force_terminal=True,
+                           color_system="truecolor", legacy_windows=False)
+        for objects, kwargs in items:
+            renderer.print(*objects, **kwargs)
+        text = to_formatted_text(ANSI(buffer.getvalue().rstrip("\n")))
+        with self._lock:
+            if self._revision == revision:
+                self._cache = width, text
+        return text
+
+
+def _tui_ask(console, question, operations=None):
+    operations = operations or {}
+    if not isinstance(console, _TuiDisplay):
+        answer = question.ask()
+        if operations and answer in operations:
+            message, callback = operations[answer]
+            with console.status(message): callback()
+        return answer
+    import asyncio
+    from prompt_toolkit.formatted_text import fragment_list_to_text
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.key_binding import ConditionalKeyBindings, KeyBindings, merge_key_bindings
+    from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+    app = question.application
+    if console.output is not None:
+        app.output = app.renderer.output = console.output
+    menu = app.layout.container
+    focus = app.layout.current_control
+    scroll = None
+    loading = {}
+
+    def header_text():
+        return console.formatted(app.output.get_size().columns)
+
+    def menu_height():
+        if loading:
+            return 1
+        size = app.output.get_size()
+        return min(size.rows, menu.preferred_height(size.columns, size.rows).preferred)
+
+    def header_metrics():
+        text = fragment_list_to_text(header_text())
+        lines = text.count("\n") + 1 if text else 0
+        available = max(0, app.output.get_size().rows - menu_height())
+        hint = int(lines > available and available > 1)
+        return lines, min(lines, available - hint), hint
+
+    def scroll_position():
+        lines, height, _ = header_metrics()
+        limit = max(0, lines - height)
+        return min(limit, max(0, scroll)) if scroll is not None else limit if console.follow_tail else 0
+
+    bindings = KeyBindings()
+
+    @bindings.add("c-c", eager=True)
+    def cancel(event):
+        event.app.exit(exception=KeyboardInterrupt)
+
+    @bindings.add("<any>", filter=Condition(lambda: bool(loading)))
+    def ignore_while_loading(event):
+        pass
+
+    @bindings.add("pageup")
+    @bindings.add("pagedown")
+    def scroll_header(event):
+        nonlocal scroll
+        step = max(1, header_metrics()[1] - 1)
+        scroll = scroll_position() + (-step if event.key_sequence[0].key == "pageup" else step)
+
+    header = FormattedTextControl(header_text, show_cursor=False,
+                                 get_cursor_position=lambda: Point(0, scroll_position()))
+    indicator = FormattedTextControl(
+        lambda: loading["display"].formatted(app.output.get_size().columns) if loading else [],
+        focusable=True, show_cursor=False)
+
+    app.layout = Layout(HSplit([
+        Window(header, height=lambda: Dimension.exact(header_metrics()[1]),
+               get_vertical_scroll=lambda _: scroll_position(), always_hide_cursor=True),
+        Window(FormattedTextControl("PgUp/PgDn: scroll tables and results", style="class:instruction"),
+               height=lambda: Dimension.exact(header_metrics()[2])),
+        ConditionalContainer(HSplit([menu], height=lambda: Dimension.exact(menu_height())),
+                             filter=Condition(lambda: not loading)),
+        ConditionalContainer(Window(indicator, height=1, always_hide_cursor=True),
+                             filter=Condition(lambda: bool(loading))),
+        Window(),
+    ]), focused_element=focus)
+    app.full_screen = app.renderer.full_screen = True
+    app.key_bindings = merge_key_bindings([
+        ConditionalKeyBindings(app.key_bindings, filter=Condition(lambda: not loading)), bindings])
+    app.min_redraw_interval = .03
+    app.terminal_size_polling_interval = .1
+    exit_question = app.exit
+
+    async def animate():
+        while loading:
+            loading["display"]._cache = None
+            app.invalidate()
+            await asyncio.sleep(.08)
+
+    async def run_operation(answer, callback):
+        try:
+            await app.loop.run_in_executor(None, callback)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            exit_question(exception=error)
+        else:
+            if loading.get("cancelled"):
+                exit_question(exception=KeyboardInterrupt)
+            else:
+                exit_question(result=answer)
+        finally:
+            loading.clear()
+            app.layout.focus(focus)
+
+    def exit_or_run(result=None, exception=None, style=""):
+        if loading and (exception is KeyboardInterrupt or isinstance(exception, KeyboardInterrupt)):
+            # Finish writes and their verification/rollback before closing UI.
+            loading["cancelled"] = True
+            return
+        # Keep this application and its alternate screen alive until the
+        # operation finishes, including the existing tables and resize handling.
+        if operations and exception is None and result in operations:
+            if not loading:
+                from rich.spinner import Spinner
+                message, callback = operations[result]
+                spinner = _TuiDisplay(console.console)
+                spinner.print(Spinner("dots", text=message, style="cyan"))
+                loading["display"] = spinner
+                app.layout.focus(indicator)
+                app.create_background_task(animate())
+                app.create_background_task(run_operation(result, callback))
+            return
+        exit_question(result=result, exception=exception, style=style)
+
+    app.exit = exit_or_run
+    try:
+        return question.unsafe_ask()
+    except KeyboardInterrupt:
+        return None
+
+
+@contextlib.contextmanager
+def _tui_output(console):
+    """Keep scriptable commands' ordinary print output in the menu screen."""
+    if not isinstance(console, _TuiDisplay):
+        yield
+        return
+    import io
+    from rich.text import Text
+    class LogStream(io.StringIO):
+        pending = ""
+
+        def write(self, value):
+            count = super().write(value)
+            self.pending += value
+            if "\n" in self.pending:
+                lines, self.pending = self.pending.rsplit("\n", 1)
+                # Older Rich decoders discard line breaks in from_ansi().
+                for line in lines.split("\n"):
+                    console.print(Text.from_ansi(line))
+                console.follow_tail = True
+            return count
+
+        def flush(self):
+            if self.pending:
+                console.print(Text.from_ansi(self.pending), end="")
+                console.follow_tail = True
+                self.pending = ""
+
+    buffer = LogStream()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            yield
+    finally:
+        buffer.flush()
+
+
+def _tui_run(console, message, callback, *args, **kwargs):
+    """Run any operation inside the same UI, retaining live output and resize."""
+    if not isinstance(console, _TuiDisplay):
+        with console.status(message):
+            return callback(*args, **kwargs)
+    import questionary
+    results = []
+
+    def operation():
+        with _tui_output(console):
+            results.append(callback(*args, **kwargs))
+
+    question = questionary.press_any_key_to_continue(message)
+    question.application.pre_run_callables.append(lambda: question.application.exit(result="operation"))
+    if _tui_ask(console, question, {"operation": (message, operation)}) is None:
+        raise KeyboardInterrupt
+    return results[0]
+
 
 @contextlib.contextmanager
 def _tui_console():
     """Keep menu output out of shell history and restore Windows console flags."""
     from rich.console import Console
+    from prompt_toolkit.application import get_app_session
     restore = None
     if os.name == "nt" and sys.stdout.isatty():
         import ctypes
@@ -2184,8 +2449,15 @@ def _tui_console():
                 restore = kernel, handle, mode.value
     try:
         console = Console()
-        with console.screen(hide_cursor=False):
-            yield console
+        output = get_app_session().output
+        output.enter_alternate_screen()
+        try:
+            output.flush()
+            yield _TuiDisplay(console, _TuiSessionOutput(output))
+        finally:
+            output.quit_alternate_screen()
+            output.show_cursor()
+            output.flush()
     finally:
         if restore is not None:
             kernel, handle, mode = restore
@@ -2193,6 +2465,9 @@ def _tui_console():
 
 
 def _clear_tui(console):
+    if isinstance(console, _TuiDisplay):
+        console.clear()
+        return
     if os.name == "nt" and console.legacy_windows is True:
         # Classic consoles without VT still need an actual Win32 screen erase.
         from prompt_toolkit.shortcuts import clear
@@ -2211,9 +2486,17 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
     qs = questionary.Style([("qmark", "fg:#00afff bold"), ("pointer", "fg:#00afff bold"),
                             ("highlighted", "fg:#00afff bold"), ("selected", "fg:#00ff87 bold"),
                             ("answer", "fg:#00ff87 bold")])
-    paths, status = scan(overrides)
-    with console.status("Refreshing account quotas…"):
-        usage = _startup_usage()
+    paths, status = _tui_run(console, "Scanning installed apps…", scan, overrides)
+    usage = _tui_run(console, "Refreshing account quotas…", _startup_usage)
+
+    def refresh_status():
+        nonlocal paths, status
+        paths, status = scan(overrides)
+
+    def refresh_quotas():
+        refreshed = _startup_usage()
+        usage.clear(); usage.update(refreshed)
+
     while True:
         _clear_tui(console)
         _render(console, paths, status)
@@ -2221,25 +2504,21 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
             _render_usage(console, usage.get(target_type, {}), label)
         for error in usage.get("_errors", []):
             console.print(error, style="yellow", markup=False)
-        action = questionary.select("What do you want to do?", style=qs, qmark="»", choices=[
+        action = _tui_ask(console, questionary.select("What do you want to do?", style=qs, qmark="»", choices=[
             questionary.Choice("Patch app(s)", "patch"),
             questionary.Choice("Restore app(s) from backup", "restore"),
             questionary.Choice("Manage accounts", "accounts"),
             questionary.Choice("Refresh quotas", "refresh-quotas"),
             questionary.Choice("Refresh status", "refresh"),
             questionary.Choice("Quit", "quit"),
-        ]).ask()
+        ]), operations={"refresh": ("Refreshing app status…", refresh_status),
+                     "refresh-quotas": ("Refreshing account quotas…", refresh_quotas)})
         if action in (None, "quit"):
-            console.print("[dim]bye 👋[/]"); return 0
-        if action == "refresh":
-            paths, status = scan(overrides)
+            return 0
+        if action in ("refresh", "refresh-quotas"):
             continue
         if action == "accounts":
             _accounts_menu(console, qs, usage); continue
-        if action == "refresh-quotas":
-            refreshed = _startup_usage()
-            usage.clear(); usage.update(refreshed)
-            continue
         _clear_tui(console)
         console.rule(f"[bold cyan]{action}[/]")
         opts = []
@@ -2252,16 +2531,19 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
             opts.append(questionary.Choice(f"{SPEC[t]['name']}  · {st}", value=t))
         if not opts:
             console.print(f"[yellow]Nothing to {action}.[/]")
-            questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); continue
-        sel = questionary.checkbox(f"Select app(s) to {action}:", choices=opts, style=qs).ask()
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); continue
+        sel = _tui_ask(console, questionary.checkbox(f"Select app(s) to {action}:", choices=opts, style=qs))
         if not sel:
             continue
-        run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
-        # Restoring a shared agy also changes the other target's status.
-        for t in TARGETS:
-            status[t] = _status_of(t, paths[t])
+        def apply_action():
+            run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
+            # Restoring a shared agy also changes the other target's status.
+            for t in TARGETS:
+                status[t] = _status_of(t, paths[t])
+
+        _tui_run(console, "Patching app(s)…" if action == "patch" else "Restoring app(s)…", apply_action)
         console.rule(style="dim")
-        questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs).ask()
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs))
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -2291,13 +2573,16 @@ def main(argv=None):
     if args.action in (None, "menu"):
         try:
             import questionary, rich  # noqa: F401
+            from prompt_toolkit import VERSION as toolkit_version
+            if tuple(map(int, toolkit_version[:3])) < (3, 0, 34):
+                raise ImportError("interactive menu requires prompt-toolkit >= 3.0.34")
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 raise RuntimeError("not a terminal")
             return interactive(overrides, macos_disable_library_validation=args.macos_disable_library_validation)
         except KeyboardInterrupt:
             print(); return 0
         except ImportError:
-            warn("interactive menu needs:  pip install rich questionary")
+            warn('interactive menu needs:  pip install rich questionary "prompt-toolkit>=3.0.34,<4"')
             if args.action == "menu": return 2
         except Exception:
             if args.action == "menu":

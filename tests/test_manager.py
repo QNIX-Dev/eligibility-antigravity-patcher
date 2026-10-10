@@ -642,7 +642,7 @@ class UsageTests(unittest.TestCase):
     def test_tui_terminal_cleanup(self):
         import ctypes
         import sys
-        kernel, console = mock.MagicMock(), mock.MagicMock()
+        kernel, console, output = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
         kernel.GetStdHandle.return_value = 42
         kernel.SetConsoleMode.return_value = 1
         def read_mode(handle, pointer):
@@ -651,8 +651,10 @@ class UsageTests(unittest.TestCase):
         kernel.GetConsoleMode.side_effect = read_mode
         for interrupted in (False, True):
             with self.subTest(interrupted=interrupted):
-                kernel.reset_mock(); console.reset_mock()
-                with (mock.patch.dict(sys.modules, {"rich.console": mock.Mock(Console=mock.Mock(return_value=console))}),
+                kernel.reset_mock(); console.reset_mock(); output.reset_mock()
+                with (mock.patch.dict(sys.modules, {
+                        "rich.console": mock.Mock(Console=mock.Mock(return_value=console)),
+                        "prompt_toolkit.application": mock.Mock(get_app_session=mock.Mock(return_value=mock.Mock(output=output)))}),
                       mock.patch.object(manager.os, "name", "nt"),
                       mock.patch.object(manager.sys.stdout, "isatty", return_value=True),
                       mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True)):
@@ -661,7 +663,10 @@ class UsageTests(unittest.TestCase):
                             if interrupted: raise KeyboardInterrupt
                     except KeyboardInterrupt: self.assertTrue(interrupted)
                 self.assertEqual(kernel.SetConsoleMode.call_args_list, [mock.call(42, 7), mock.call(42, 3)])
-                console.screen.return_value.__exit__.assert_called_once()
+                console.screen.assert_not_called()
+                output.enter_alternate_screen.assert_called_once()
+                output.quit_alternate_screen.assert_called_once()
+                output.show_cursor.assert_called_once()
         clear = mock.Mock()
         console = mock.Mock(legacy_windows=True)
         with (mock.patch.object(manager.os, "name", "nt"),
@@ -702,6 +707,63 @@ class UsageTests(unittest.TestCase):
                     self.assertTrue(usage["one"]["active"])
                     self.assertEqual(usage["one"]["checked_at"], 1)
 
+    def test_tui_resize_preserves_input_and_loaded_accounts(self):
+        try:
+            import asyncio
+            import questionary
+            from rich.console import Console
+            from rich.cells import cell_len
+            from prompt_toolkit.application import create_app_session
+            from prompt_toolkit.data_structures import Size
+            from prompt_toolkit.formatted_text import fragment_list_to_text
+            from prompt_toolkit.input import create_pipe_input
+            from prompt_toolkit.output import DummyOutput
+        except ImportError:
+            self.skipTest("optional interactive dependencies are not installed")
+        cases = (("select", "\x1b[B", "\r", "two"),
+                 ("checkbox", "\x1b[B ", "\r", ["two"]),
+                 ("text", "fixture name", "\r", "fixture name"),
+                 ("cancel", "\x1b[B", "\x03", None))
+        for kind, keys, finish, expected in cases:
+            with self.subTest(kind=kind), create_pipe_input() as pipe:
+                size = [Size(rows=32, columns=160)]
+                output = DummyOutput()
+                output.get_size = lambda: size[0]
+                display = manager._TuiDisplay(Console(file=io.StringIO()))
+                paths = {t: "/fixture/" + "long-path/" * 8 + t for t in manager.TARGETS}
+                with mock.patch.object(manager, "current_account", return_value="fixture") as read:
+                    manager._render(display, paths, dict.fromkeys(manager.TARGETS, "patched"))
+                    reads = read.call_count
+                    formatted = display.formatted
+                    def checked_frame(width):
+                        frame = formatted(width)
+                        self.assertEqual(max(map(cell_len, fragment_list_to_text(frame).splitlines())), width)
+                        return frame
+                    with create_app_session(input=pipe, output=output):
+                        factory = questionary.text if kind == "text" else getattr(questionary, "select" if kind == "cancel" else kind)
+                        kwargs = {} if kind == "text" else {"choices": ["one", "two"]}
+                        question = factory("Fixture:", **kwargs)
+                        app = question.application
+
+                        async def resize():
+                            await asyncio.sleep(.15)
+                            pipe.send_text(keys)
+                            for rows, columns in ((16, 55), (8, 100), (32, 160)):
+                                await asyncio.sleep(.15)
+                                size[0] = Size(rows=rows, columns=columns)
+                            await asyncio.sleep(.15)
+                            pipe.send_text(finish)
+
+                        app.pre_run_callables.append(lambda: app.create_background_task(resize()))
+                        with (mock.patch.object(display, "formatted", side_effect=checked_frame) as render,
+                              mock.patch.object(output, "enter_alternate_screen") as enter,
+                              mock.patch.object(output, "quit_alternate_screen") as leave,
+                              contextlib.redirect_stdout(io.StringIO())):
+                            self.assertEqual(manager._tui_ask(display, question), expected)
+                        self.assertTrue({55, 100, 160}.issubset({call.args[0] for call in render.call_args_list}))
+                        enter.assert_called_once(); leave.assert_called_once()
+                    self.assertEqual(read.call_count, reads)
+
     def test_main_refresh_preserves_menu_and_does_not_repeat_quota_checks(self):
         import sys
         console, questionary = mock.MagicMock(), mock.MagicMock()
@@ -721,8 +783,230 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(refresh.call_count, 2)
         self.assertEqual(scan.call_count, 2)
         self.assertEqual(clears_at_refresh, [0, 2])
-        self.assertEqual(console.status.call_count, 1)
+        self.assertEqual(console.status.call_args_list, [mock.call("Scanning installed apps…"),
+                                                       mock.call("Refreshing account quotas…"),
+                                                       mock.call("Refreshing app status…"),
+                                                       mock.call("Refreshing account quotas…")])
         questionary.press_any_key_to_continue.assert_not_called()
+
+    def test_tui_refresh_keeps_tables_and_animation_until_completion(self):
+        try:
+            import asyncio
+            import threading
+            import questionary
+            from rich.console import Console
+            from prompt_toolkit.application import create_app_session
+            from prompt_toolkit.data_structures import Size
+            from prompt_toolkit.input import create_pipe_input
+            from prompt_toolkit.output import DummyOutput
+        except ImportError:
+            self.skipTest("optional interactive dependencies are not installed")
+        for action, message in (("refresh", "Refreshing app status\u2026"),
+                                ("refresh-quotas", "Refreshing account quotas\u2026")):
+            with self.subTest(action=action), create_pipe_input() as pipe:
+                started, finished = threading.Event(), threading.Event()
+                size = [Size(rows=16, columns=160)]
+                output = DummyOutput()
+                output.get_size = lambda: size[0]
+                display = manager._TuiDisplay(Console(file=io.StringIO()))
+                display.print("Loaded app and quota tables")
+                with (create_app_session(input=pipe, output=output),
+                      mock.patch.object(output, "enter_alternate_screen") as enter,
+                      mock.patch.object(output, "quit_alternate_screen") as leave):
+                    question = questionary.select("Fixture:", choices=[action])
+                    app = question.application
+                    frames, exits_during_refresh = [], []
+
+                    def collect_frame(_):
+                        screen = app.renderer._last_screen
+                        if screen is not None:
+                            lines = ["".join(screen.data_buffer[y][x].char for x in range(size[0].columns))
+                                     for y in range(size[0].rows)]
+                            if any(message in line for line in lines):
+                                frames.append(lines)
+
+                    def refresh():
+                        started.set()
+                        exits_during_refresh.append(leave.call_count)
+                        if not finished.wait(3): raise TimeoutError("fixture refresh did not finish")
+                        exits_during_refresh.append(leave.call_count)
+
+                    async def exercise():
+                        try:
+                            await asyncio.sleep(.15)
+                            pipe.send_text("\r")
+                            for _ in range(100):
+                                if started.is_set(): break
+                                await asyncio.sleep(.01)
+                            for width in (55, 100, 160):
+                                size[0] = Size(rows=16, columns=width)
+                                await asyncio.sleep(.15)
+                            pipe.send_text("\r")  # A second Enter must not start another request.
+                        finally:
+                            finished.set()
+
+                    app.after_render += collect_frame
+                    app.pre_run_callables.append(lambda: app.create_background_task(exercise()))
+                    job = mock.Mock(side_effect=refresh)
+                    self.assertEqual(manager._tui_ask(display, question, {action: (message, job)}), action)
+                    job.assert_called_once()
+                    self.assertEqual(exits_during_refresh, [0, 0])
+                    enter.assert_called_once(); leave.assert_called_once()
+                    self.assertTrue(frames)
+                    self.assertTrue(all("Loaded app and quota tables" in "\n".join(frame) for frame in frames))
+                    self.assertGreater(len({line.strip() for frame in frames for line in frame if message in line}), 1)
+
+    def test_tui_operations_share_screen_and_stream_output_until_finished(self):
+        try:
+            import asyncio
+            import threading
+            import questionary
+            from rich.console import Console
+            from prompt_toolkit.application import create_app_session
+            from prompt_toolkit.data_structures import Size
+            from prompt_toolkit.formatted_text import fragment_list_to_text
+            from prompt_toolkit.input import create_pipe_input
+            from prompt_toolkit.output import DummyOutput
+        except ImportError:
+            self.skipTest("optional interactive dependencies are not installed")
+        output = DummyOutput()
+        size = [Size(rows=16, columns=160)]
+        output.get_size = lambda: size[0]
+        console = Console(file=io.StringIO(), width=160, height=16)
+        prompt = questionary.press_any_key_to_continue
+        cases = [(message, None) for message in ("Patching app(s)", "Restoring app(s)", "Loading accounts",
+                 "Saving account", "Switching account", "Renaming account", "Signing out", "Removing account",
+                 "Refreshing account quotas")]
+        cases += [("Failed operation", OSError), ("Interrupted operation", KeyboardInterrupt)]
+        with (create_pipe_input() as pipe, create_app_session(input=pipe, output=output),
+              mock.patch("rich.console.Console", side_effect=lambda *args, **kwargs:
+                         Console(*args, **kwargs) if "file" in kwargs else console),
+              mock.patch.object(output, "enter_alternate_screen") as enter,
+              mock.patch.object(output, "quit_alternate_screen") as leave,
+              contextlib.redirect_stdout(io.StringIO())):
+            with manager._tui_console() as display:
+                for message, error in cases:
+                    with self.subTest(operation=message):
+                        started, finish, completed = threading.Event(), threading.Event(), threading.Event()
+                        frames = []
+                        display.clear(); display.print("Operation dashboard")
+
+                        def work():
+                            print("progress visible")
+                            started.set()
+                            if not finish.wait(3): raise TimeoutError("fixture operation did not finish")
+                            print("verified result")
+                            completed.set()
+                            if error is OSError: raise OSError("fixture failure")
+                            return "done"
+
+                        def ask(*args, **kwargs):
+                            question = prompt(*args, **kwargs)
+                            app = question.application
+                            def capture(_):
+                                screen = app.renderer._last_screen
+                                if screen is not None and not finish.is_set():
+                                    frame = "\n".join("".join(screen.data_buffer[y][x].char for x in range(size[0].columns))
+                                                      for y in range(size[0].rows))
+                                    if "progress visible" in frame: frames.append(frame)
+                            async def exercise():
+                                try:
+                                    for _ in range(100):
+                                        if started.is_set(): break
+                                        await asyncio.sleep(.01)
+                                    if error is KeyboardInterrupt: pipe.send_text("\x03")
+                                    for width in (55, 100, 160):
+                                        size[0] = Size(rows=16, columns=width)
+                                        await asyncio.sleep(.12)
+                                finally:
+                                    finish.set()
+                            app.after_render += capture
+                            app.pre_run_callables.append(lambda: app.create_background_task(exercise()))
+                            return question
+
+                        with mock.patch.object(questionary, "press_any_key_to_continue", side_effect=ask):
+                            if error:
+                                with self.assertRaises(error): manager._tui_run(display, message, work)
+                            else:
+                                self.assertEqual(manager._tui_run(display, message, work), "done")
+                        self.assertTrue(completed.is_set())
+                        self.assertTrue(frames)
+                        self.assertTrue(all("Operation dashboard" in frame and message in frame for frame in frames))
+                        self.assertIn("verified result", fragment_list_to_text(display.formatted(160)))
+                        enter.assert_called_once(); leave.assert_not_called()
+            leave.assert_called_once()
+
+    def test_tui_patch_restore_cycle_retains_results_and_session_screen(self):
+        try:
+            import asyncio
+            import questionary
+            from rich.console import Console
+            from prompt_toolkit.application import create_app_session
+            from prompt_toolkit.data_structures import Size
+            from prompt_toolkit.input import create_pipe_input
+            from prompt_toolkit.output import DummyOutput
+        except ImportError:
+            self.skipTest("optional interactive dependencies are not installed")
+        gate = manager.Gate(rb"ORIG", rb"DONE", b"DONE", desc="fixture", arch="x64")
+        output = DummyOutput()
+        output.get_size = lambda: Size(rows=24, columns=100)
+        console = Console(file=io.StringIO(), width=100, height=24)
+        choose, toggle, pause = questionary.select, questionary.checkbox, questionary.press_any_key_to_continue
+        actions, frames = iter((0, 1, 5)), []
+        run = manager.run
+        with tempfile.TemporaryDirectory() as tmp, create_pipe_input() as pipe:
+            path = os.path.join(tmp, "fixture.exe")
+            original = _minimal_pe(code=b"ORIG")
+            _write(path, original)
+            status = lambda p: manager.gate_status(p, gate)
+            spec = dict(manager.SPEC)
+            spec["cli"] = dict(spec["cli"], status=status,
+                               patch=lambda p: manager.gate_patch(p, gate, "CLI", "fixture.exe"))
+            paths = dict.fromkeys(manager.TARGETS); paths["cli"] = path
+            states = dict.fromkeys(manager.TARGETS, "not found"); states["cli"] = "unpatched"
+
+            def capture(question, keys=None):
+                app = question.application
+                if keys is not None:
+                    async def send_keys():
+                        await asyncio.sleep(.03)
+                        pipe.send_text(keys)
+                    app.pre_run_callables.append(lambda: app.create_background_task(send_keys()))
+                def rendered(_):
+                    screen = app.renderer._last_screen
+                    if screen is not None:
+                        frames.append("\n".join("".join(screen.data_buffer[y][x].char for x in range(100))
+                                                for y in range(24)))
+                app.after_render += rendered
+                return question
+
+            def do_run(*args, **kwargs):
+                enter.assert_called_once(); leave.assert_not_called()
+                return run(*args, **kwargs)
+
+            with (create_app_session(input=pipe, output=output),
+                  mock.patch("rich.console.Console", side_effect=lambda *args, **kwargs:
+                             Console(*args, **kwargs) if "file" in kwargs else console),
+                  mock.patch.object(manager, "SPEC", spec),
+                  mock.patch.object(manager, "scan", return_value=(paths, states)),
+                  mock.patch.object(manager, "_startup_usage", return_value={}),
+                  mock.patch.object(manager, "current_account", return_value=None),
+                  mock.patch.object(questionary, "select", side_effect=lambda *a, **k:
+                                    capture(choose(*a, **k), "\x1b[B" * next(actions) + "\r")),
+                  mock.patch.object(questionary, "checkbox", side_effect=lambda *a, **k: capture(toggle(*a, **k), " \r")),
+                  mock.patch.object(questionary, "press_any_key_to_continue", side_effect=lambda message, **k:
+                                    capture(pause(message, **k), "\r" if message.startswith("Enter") else None)),
+                  mock.patch.object(manager, "run", side_effect=do_run) as apply,
+                  mock.patch.object(output, "enter_alternate_screen") as enter,
+                  mock.patch.object(output, "quit_alternate_screen") as leave,
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(manager.interactive({"cli": path}), 0)
+            self.assertEqual([call.args[0] for call in apply.call_args_list], ["patch", "restore"])
+            self.assertTrue(any("CLI patched" in frame for frame in frames))
+            self.assertTrue(any("restored fixture.exe" in frame for frame in frames))
+            self.assertEqual(status(path)[0], "unpatched")
+            with open(path, "rb") as f: self.assertEqual(f.read(), original)
+            enter.assert_called_once(); leave.assert_called_once()
 
 
 class TransactionTests(unittest.TestCase):
