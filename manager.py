@@ -21,6 +21,9 @@ def ok(m):   _say("ok", m)
 def info(m): _say("..", m)
 def warn(m): _say("!!", m)
 
+def _patch_success(app, change, offset):
+    ok(f"{app} patched ({change} @ file 0x{offset:x})")
+
 def _bin(name):
     return name + (".exe" if os.name == "nt" else "")
 
@@ -517,7 +520,7 @@ def _gate_write(path, gate, off, g, before, app):
         warn("state before this patch restored" if rolled_back else
              f"automatic rollback failed — restore {os.path.basename(path)}{BAK} manually")
         return False
-    ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
+    _patch_success(app, g.desc, off)
     return True
 
 # CLI eligibility screen
@@ -669,6 +672,7 @@ def ide_patch(path):
         warn(str(e)); return False
     if kind == "patched":
         ok("IDE already patched"); return True
+    off = IDE_RE.search(d).end(1)
     bak = make_backup(path)
     try:
         with open(path, "rb") as f:
@@ -694,7 +698,7 @@ def ide_patch(path):
              f"automatic rollback failed — restore {os.path.basename(bak)} manually")
         return False
     for c in _ide_cache_dirs(): rmtree_quiet(c)
-    ok("IDE patched (isGoogleInternal -> true) + caches cleared")
+    _patch_success("IDE", "isGoogleInternal=true", off)
     return True
 
 # Accounts
