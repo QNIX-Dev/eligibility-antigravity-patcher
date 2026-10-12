@@ -3,6 +3,8 @@
 from __future__ import annotations
 import argparse, base64, contextlib, errno, filecmp, functools, getpass, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 from urllib.parse import urlsplit, urlunsplit
+import datetime, math, urllib.error, urllib.parse, urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from xml.parsers.expat import ExpatError
 try:
@@ -13,13 +15,16 @@ except Exception:
 BAK = ".agybak"
 MAC_SIGNATURE_BAK = ".agysignbak"
 MAC_DISABLE_LIBRARY_VALIDATION = "com.apple.security.cs.disable-library-validation"
-TARGETS = ("cli", "manager", "ide")
+TARGETS = ("cli", "manager", "ide", "extension")
 
 # Utilities
 def _say(tag, msg): print(f"  [{tag}] {msg}")
 def ok(m):   _say("ok", m)
 def info(m): _say("..", m)
 def warn(m): _say("!!", m)
+
+def _patch_success(app, change, offset):
+    ok(f"{app} patched ({change} @ file 0x{offset:x})")
 
 def _bin(name):
     return name + (".exe" if os.name == "nt" else "")
@@ -64,17 +69,72 @@ def is_locked(path, app=None):
             warn(f"system error: {e}")
         return True
 
-def make_backup(path):
+def _files_equal(first, second):
+    """Read actual bytes on every check, including same-size/mtime rewrites."""
+    with open(first, "rb") as a, open(second, "rb") as b:
+        while True:
+            chunk = a.read(1024 * 1024)
+            if chunk != b.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+def _binary_backup_matches(path, bak):
+    """Recognize a pristine backup plus only our known binary replacements."""
+    replacements = []
+    try:
+        ranges, arch = executable_info(bak)
+        current_ranges, current_arch = executable_info(path)
+        if arch != current_arch or os.path.getsize(path) != os.path.getsize(bak):
+            return False
+        with mapped(bak) as saved, mapped(path) as current:
+            for gate in (CLI_GATE, MANAGER_GATE):
+                try:
+                    state, off, g = gate.resolve(saved, ranges, arch)
+                except SignatureNotFound:
+                    continue
+                if state != "unpatched":
+                    return False
+                current_state, current_off, current_gate = gate.resolve(current, current_ranges, current_arch)
+                if current_off != off or current_gate is not g:
+                    return False
+                if current_state == "patched":
+                    replacements.append((off, g.fix))
+        if not replacements:
+            return False
+        pos = 0
+        with open(bak, "rb") as saved, open(path, "rb") as current:
+            while chunk := saved.read(1024 * 1024):
+                expected = bytearray(chunk)
+                for off, fix in replacements:
+                    start, end = max(off, pos), min(off + len(fix), pos + len(chunk))
+                    if start < end:
+                        expected[start - pos:end - pos] = fix[start - off:end - off]
+                if current.read(len(chunk)) != expected:
+                    return False
+                pos += len(chunk)
+        return True
+    except (LookupError, OSError, ValueError):
+        return False
+
+def make_backup(path, binary=False):
     """Create or refresh a verified clean backup."""
     bak = path + BAK
     if os.path.exists(bak):
-        if filecmp.cmp(path, bak, shallow=False):
+        if _files_equal(path, bak):
+            if not binary or not any(gate_status(bak, gate)[0] == "patched" for gate in (CLI_GATE, MANAGER_GATE)):
+                return bak
+            raise OSError("backup already contains a binary patch; restore a pristine original before applying another target")
+        if binary and _binary_backup_matches(path, bak):
             return bak
+    if binary and any(gate_status(path, gate)[0] == "patched" for gate in (CLI_GATE, MANAGER_GATE)):
+        raise OSError("cannot verify a pristine backup for the existing binary patch; restore the original before applying another target")
+    if os.path.exists(bak):
         info(f"backup is stale (app updated) — refreshing {os.path.basename(path)}{BAK}")
     else:
         info(f"backup -> {os.path.basename(path)}{BAK}")
     shutil.copy2(path, bak)
-    if not filecmp.cmp(path, bak, shallow=False):
+    if not _files_equal(path, bak):
         raise OSError("backup verification failed")
     return bak
 
@@ -480,16 +540,32 @@ def gate_patch(path, gate, app, fname):
         warn(str(e)); return False
     if kind == "patched":
         ok(f"{app} already patched"); return True
-    bak = make_backup(path)
+    bak = make_backup(path, binary=True)
+    try:
+        # A CLI and extension can share agy. Preserve the pristine disk backup;
+        # use a separate snapshot to rescan and roll back this operation only.
+        with tempfile.TemporaryDirectory(prefix="agy-patch-") as temp:
+            before = os.path.join(temp, "before")
+            shutil.copy2(path, before)
+            if not _files_equal(path, before):
+                raise OSError("patch snapshot verification failed")
+            if not _files_equal(before, bak) and not _binary_backup_matches(before, bak):
+                raise OSError("target changed after backup")
+            return _gate_write(path, gate, off, g, before, app)
+    except Exception as e:
+        warn(f"{app} patch failed: {e}")
+        return False
+
+def _gate_write(path, gate, off, g, before, app):
     write_started = False
     try:
-        if not filecmp.cmp(path, bak, shallow=False):
+        if not _files_equal(path, before):
             raise OSError("target changed after backup")
         staging = _mac_staged_binary(path) if sys.platform == "darwin" else contextlib.nullcontext(path)
         with staging as writable:
             if writable != path:
                 shutil.copy2(path, writable)
-                if not filecmp.cmp(writable, bak, shallow=False):
+                if not _files_equal(writable, before):
                     raise OSError("target changed while staging patch")
             ranges, arch = executable_info(writable)
             with open(writable, "r+b") as f:
@@ -508,7 +584,7 @@ def gate_patch(path, gate, app, fname):
                 ranges, arch = executable_info(path)
                 with mapped(path) as data:
                     current = gate.resolve(data, ranges, arch)
-                if current != ("unpatched", off, g) or not filecmp.cmp(path, bak, shallow=False):
+                if current != ("unpatched", off, g) or not _files_equal(path, before):
                     raise OSError("target changed before patch replacement")
                 os.replace(writable, path)
                 write_started = True
@@ -520,17 +596,17 @@ def gate_patch(path, gate, app, fname):
     except Exception as e:
         try:
             if write_started:
-                _copy_binary(bak, path)
-            rolled_back = filecmp.cmp(path, bak, shallow=False)
+                _copy_binary(before, path)
+            rolled_back = _files_equal(path, before)
         except Exception:
             rolled_back = False
         warn(f"{app} patch failed: {e}")
         if isinstance(e, OSError):
             _mac_write_permission_hint(path, e)
-        warn("original restored from backup" if rolled_back else
-             f"automatic rollback failed — restore {os.path.basename(bak)} manually")
+        warn("state before this patch restored" if rolled_back else
+             f"automatic rollback failed — restore {os.path.basename(path) + BAK} manually")
         return False
-    ok(f"{app} patched ({g.desc} @ file 0x{off:x})")
+    _patch_success(app, g.desc, off)
     return True
 
 # CLI eligibility screen
@@ -607,6 +683,14 @@ MANAGER_GATE_ARM64 = Gate(rb"\x03\x20\x40\x39[\x03\x23\x43\x63\x83\xa3\xc3\xe3].
 
 MANAGER_GATE = MultiGate(MANAGER_GATE_X64, MANAGER_GATE_ARM64, desc="hasValidAuth=true")
 
+# Extension 1.7.0 uses agy 1.3.0 --hub: its verified Windows x64 validator
+# has the same cmp/je and token-attachment instructions as Manager 2.19.1.
+# ARM64 extension builds require their own verification before enabling them.
+EXTENSION_GATE = MultiGate(MANAGER_GATE_X64, desc="hub hasValidAuth=true")
+
+def extension_default_paths():
+    return _dedup_newest([os.path.join(os.path.expanduser("~"), ".gemini", "bin", _bin("agy"))])
+
 def manager_default_bins():
     if os.name == "nt":
         return find_marker(os.path.join("resources", "bin", "language_server.exe"))
@@ -674,6 +758,7 @@ def ide_patch(path):
         warn(str(e)); return False
     if kind == "patched":
         ok("IDE already patched"); return True
+    off = IDE_RE.search(d).end(1)
     bak = make_backup(path)
     try:
         with open(path, "rb") as f:
@@ -691,7 +776,7 @@ def ide_patch(path):
     except Exception as e:
         try:
             shutil.copy2(bak, path)
-            rolled_back = filecmp.cmp(path, bak, shallow=False)
+            rolled_back = _files_equal(path, bak)
         except Exception:
             rolled_back = False
         warn(f"IDE patch failed: {e}")
@@ -699,11 +784,11 @@ def ide_patch(path):
              f"automatic rollback failed — restore {os.path.basename(bak)} manually")
         return False
     for c in _ide_cache_dirs(): rmtree_quiet(c)
-    ok("IDE patched (isGoogleInternal -> true) + caches cleared")
+    _patch_success("IDE", "isGoogleInternal=true", off)
     return True
 
 # Accounts
-# Live logins remain opaque: CLI/Manager use Credential Manager; IDE uses state.vscdb.
+# Live logins remain opaque: CLI + Manager + Extension use Credential Manager; IDE uses state.vscdb.
 ACCT_PREFIX = "agy-manager:account:"
 CRED_TARGET = "gemini:antigravity"
 CRED_USER   = "antigravity"
@@ -959,6 +1044,301 @@ def acct_current(target_type):
     (ok if cur else info)(f"active account: {cur}" if cur else "current login is not saved as a profile")
     return 0
 
+# CLI 1.2.16/1.2.17 and Manager 2.19.1: CodeAssistClient.fetchRetrieveUserQuotaSummary
+# marshals RetrieveUserQuotaSummaryRequest as JSON and POSTs to this endpoint.
+# Public installed-app OAuth configuration also used by IDE getOAuth2Config;
+# these identify Google's shipped client, not private account credentials.
+_USAGE_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+_USAGE_OAUTH_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+_USAGE_OAUTH_SECRET = "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"
+_USAGE_TIMEOUT = 15
+_USAGE_MAX_RESPONSE = 1024 * 1024
+
+
+class UsageError(Exception):
+    """Only fixed, credential-free messages may cross the usage boundary."""
+
+
+class _UsageHTTPError(UsageError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"usage service returned HTTP {status}")
+
+
+class _UsageNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Do not forward OAuth credentials or bearer headers to a redirected host.
+        return None
+
+
+def _usage_post(url, data, token=None):
+    headers = {"Content-Type": "application/json", "User-Agent": "antigravity"}
+    if isinstance(data, dict):
+        payload = json.dumps(data).encode("utf-8")
+    else:
+        payload = data
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    try:
+        request = urllib.request.Request(url, data=payload, headers=headers)
+        opener = urllib.request.build_opener(_UsageNoRedirect())
+        with opener.open(request, timeout=_USAGE_TIMEOUT) as response:
+            raw = response.read(_USAGE_MAX_RESPONSE + 1)
+        if len(raw) > _USAGE_MAX_RESPONSE:
+            raise UsageError("usage response is too large")
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise UsageError("unsupported usage response")
+        return result
+    except urllib.error.HTTPError as e:
+        status = e.code
+        e.close()
+        raise _UsageHTTPError(status) from None
+    except (OSError, ValueError, urllib.error.URLError):
+        # Exception text and response bodies can contain tokens; never expose them.
+        raise UsageError("could not read usage service (network or response error)") from None
+
+
+def _usage_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.timestamp() if dt.tzinfo is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _usage_token(value):
+    return value if isinstance(value, str) and value and all(32 < ord(c) < 127 for c in value) else None
+
+
+def _usage_refresh(refresh_token):
+    if not refresh_token:
+        raise UsageError("no usable OAuth token; sign in and save this profile again")
+    payload = urllib.parse.urlencode({"client_id": _USAGE_OAUTH_ID,
+        "client_secret": _USAGE_OAUTH_SECRET, "grant_type": "refresh_token",
+        "refresh_token": refresh_token}).encode("ascii")
+    try:
+        result = _usage_post("https://oauth2.googleapis.com/token", payload)
+    except _UsageHTTPError as e:
+        if e.status in (400, 401, 403):
+            raise UsageError("OAuth refresh rejected; sign in and save this profile again") from None
+        raise UsageError(f"OAuth service returned HTTP {e.status}") from None
+    access = _usage_token(result.get("access_token"))
+    if not access:
+        raise UsageError("OAuth service did not return a usable access token")
+    return access
+
+
+def _usage_auth(target_type, bundle):
+    """Read saved credentials in memory; never install or rewrite the live login."""
+    access = refresh = expiry = None
+    try:
+        if target_type == "cli-manager":
+            credentials = json.loads(base64.b64decode(bundle.get("cred") or "", validate=True))
+            token = credentials.get("token", {})
+            access = _usage_token(token.get("access_token"))
+            refresh = _usage_token(token.get("refresh_token"))
+            expiry = _usage_timestamp(token.get("expiry"))
+        elif target_type == "ide":
+            refresh = _usage_token(_refresh_token(target_type, bundle))
+        else:
+            raise UsageError("unsupported account type")
+    except (ValueError, TypeError, AttributeError):
+        raise UsageError("saved OAuth data is unreadable; sign in and save this profile again") from None
+    return access, refresh, expiry
+
+
+def _parse_usage(response):
+    """QuotaSummaryGroup/Bucket schema recovered from quota_summary.proto in both binaries."""
+    if not isinstance(response, dict):
+        raise UsageError("unsupported quota summary response")
+    response = response.get("response", response)
+    if not isinstance(response, dict) or not isinstance(response.get("groups"), list):
+        raise UsageError("quota summary unavailable in this response")
+    groups = []
+    for i, group in enumerate(response["groups"], 1):
+        if not isinstance(group, dict) or not isinstance(group.get("buckets", []), list):
+            continue
+        label = group.get("displayName")
+        label = label if isinstance(label, str) and label.strip() else f"Quota group {i}"
+        label = "".join(c if c.isprintable() else " " for c in label)[:80]
+        windows, seen = {"5h": None, "weekly": None}, set()
+        for bucket in group.get("buckets", []):
+            if not isinstance(bucket, dict):
+                continue
+            window = bucket.get("window")
+            if not isinstance(window, str) or window not in windows:
+                continue
+            if window in seen:
+                windows[window] = None  # Ambiguous: don't silently pick one bucket.
+                continue
+            seen.add(window)
+            fraction = bucket.get("remainingFraction")
+            if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+                    or not 0 <= fraction <= 1 or not math.isfinite(fraction)):
+                fraction = None
+            windows[window] = {"fraction": fraction,
+                               "reset": _usage_timestamp(bucket.get("resetTime")),
+                               "disabled": bucket.get("disabled") is True}
+        groups.append({"name": label, "windows": windows})
+    return groups
+
+
+def _profile_usage(target_type, bundle):
+    access, refresh, expiry = _usage_auth(target_type, bundle)
+    refreshed = False
+    if not access or (expiry is not None and expiry <= time.time() + 30):
+        access = _usage_refresh(refresh)
+        refreshed = True
+    try:
+        response = _usage_post(_USAGE_URL, {}, access)
+    except _UsageHTTPError as e:
+        if e.status != 401 or refreshed or not refresh:
+            raise
+        response = _usage_post(_USAGE_URL, {}, _usage_refresh(refresh))
+    return _parse_usage(response)
+
+
+def _usage_fingerprint(bundle):
+    data = {key: value for key, value in bundle.items() if key != "saved_at"}
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).digest()
+
+
+def _usage_live_bundle(target_type):
+    if target_type == "ide":
+        db = _ide_state_db()
+        if not db:
+            return None
+        bundle = _snapshot(target_type, db)
+        oauth = bundle["ide"].get("antigravityUnifiedStateSync.oauthToken")
+        return bundle if oauth and _dec(oauth) else None
+    bundle = _snapshot(target_type)
+    return bundle if bundle.get("cred") else None
+
+
+def _usage_profiles(target_type, profiles=None):
+    """Read the live login once; None is a collision-free key for an unsaved login."""
+    profiles = dict(profile_bundles(target_type) if profiles is None else profiles)
+    live = _usage_live_bundle(target_type)
+    if live is None:
+        return profiles, None
+    refresh = _usage_token(_refresh_token(target_type, live))
+    try:
+        access = _usage_auth(target_type, live)[0] if not refresh else None
+    except UsageError:
+        access = None
+    for name, bundle in profiles.items():
+        if not bundle:
+            continue
+        if refresh and _refresh_token(target_type, bundle) == refresh:
+            return profiles, name
+        if access:
+            try:
+                if _usage_auth(target_type, bundle)[0] == access:
+                    return profiles, name
+            except UsageError:
+                pass
+    return {None: live, **profiles}, None
+
+
+def _check_usage(target_type, profiles=None):
+    profiles, current = _usage_profiles(target_type, profiles)
+    results = _collect_usage(target_type, profiles)
+    for name, result in results.items():
+        result["active"] = name == current
+    return results
+
+
+def _usage_account_label(name):
+    return "Current · unsaved" if name is None else name
+
+
+def _collect_usage(target_type, profiles):
+    def fetch(item):
+        name, bundle = item
+        result = {"groups": [], "error": None, "checked_at": time.time(),
+                  "fingerprint": _usage_fingerprint(bundle)}
+        try:
+            result["groups"] = _profile_usage(target_type, bundle)
+        except UsageError as e:
+            result["error"] = str(e)
+        except Exception:
+            result["error"] = "could not check this profile"
+        result["checked_at"] = time.time()
+        return name, result
+    # Only in-memory results for this check; no credential or quota cache on disk.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return dict(pool.map(fetch, profiles.items()))
+
+
+def _usage_cells(bucket, now, compact=False):
+    if bucket is None:
+        return "no data", "not reported"
+    fraction = bucket["fraction"]
+    quota = ("unavailable" if bucket["disabled"] else "no data" if fraction is None
+             else "0% [RATE-LIMITED]" if fraction == 0 else f"{fraction * 100:.1f}%")
+    reset = bucket["reset"]
+    if reset is None:
+        return quota, "not reported"
+    seconds = max(0, math.ceil(reset - now))
+    minutes = math.ceil(seconds / 60)
+    days, hours = divmod(minutes // 60, 24)
+    timer = (f"{days}d {hours}h" if days else f"{hours}h {minutes % 60}m" if hours
+             else f"{minutes}m" if minutes else "reset due; refresh to confirm")
+    try:
+        dt = datetime.datetime.fromtimestamp(reset, datetime.timezone.utc).astimezone()
+    except (ValueError, OverflowError, OSError):
+        return quota, "not reported"
+    if compact:
+        return quota.replace("[RATE-LIMITED]", "(limited)"), f"{timer}\n{dt:%m-%d %H:%M}"
+    local = dt.strftime("%Y-%m-%d %H:%M %z")
+    return quota, f"{timer} ({local})"
+
+
+def acct_usage(target_type, name=None):
+    # A named check reads only that profile; an all-account check loads each once.
+    if name is None:
+        profiles, cur = _usage_profiles(target_type)
+    else:
+        profiles = {name: profile_load(target_type, name)}
+        cur = current_account(target_type, profiles) if profiles[name] is not None else None
+    if name is not None and profiles[name] is None:
+        warn(f"no saved account '{name}' (see 'accounts {target_type} list')"); return 1
+    if not profiles:
+        info("no active login or saved accounts - log in to Antigravity first"); return 0
+    results = _collect_usage(target_type, profiles)
+    now = time.time()
+    for account, result in results.items():
+        info(f"{'* ' if account == cur else '  '}{_usage_account_label(account)}")
+        if result["error"]:
+            warn(result["error"]); continue
+        if not result["groups"]:
+            info("no quota data returned")
+        for group in result["groups"]:
+            info(group["name"])
+            for window, label in (("5h", "5-Hour"), ("weekly", "Weekly")):
+                quota, reset = _usage_cells(group["windows"][window], now)
+                info(f"  {label}: {quota} remaining; reset: {reset}")
+    return int(any(r["error"] for r in results.values()))
+
+
+def _startup_usage():
+    if os.name != "nt":
+        return {}
+    results = {"_errors": []}
+    for target_type in ("cli-manager", "ide"):
+        try:
+            results[target_type] = _check_usage(target_type)
+        except Exception:
+            # Credential Manager failure must not prevent patching or reveal a blob.
+            results[target_type] = {}
+            results["_errors"].append(f"could not read {target_type} accounts for startup quota check")
+    return results
+
+
 def acct_save(target_type, name):
     if "/" in name:
         warn("account name can't contain '/'"); return 1
@@ -1024,7 +1404,7 @@ def acct_logout(target_type):
     
     if target_type == "cli-manager":
         cred_delete(CRED_TARGET)
-        ok("live CLI/Manager login cleared locally (NOT revoked) - launch Antigravity, "
+        ok("live CLI + Manager + Extension login cleared locally (NOT revoked) - launch Antigravity, "
            "sign into the next account, then `accounts cli-manager save <name>`")
     elif target_type == "ide":
         try:
@@ -1486,7 +1866,7 @@ def desktop_profile_open(name, api_key=None, api_instance=False):
     ok(f"opened API instance '{name}'" if api_instance else f"opened desktop profile '{name}'")
     return 0
 
-def run_api_instances(argv, overrides=None, base_url=None, model=None, key_env=None):
+def run_api_instances(argv, overrides=None, base_url=None, model=None, key_env=None, api_key=None):
     if sys.platform != "darwin" or os.geteuid() == 0:
         warn("API instances currently require macOS and must run without sudo")
         return 2
@@ -1503,16 +1883,20 @@ def run_api_instances(argv, overrides=None, base_url=None, model=None, key_env=N
             if key_env is not None:
                 raise ValueError("repair does not require an API key")
             return desktop_profile_repair(argv[1], api_instance=True, overrides=overrides)
-        if key_env:
+        if api_key is not None:
+            key = api_key
+        elif key_env:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
                 raise ValueError("invalid API key environment variable name")
             key = os.environ.get(key_env)
         elif sys.stdin.isatty():
-            key = getpass.getpass("API key (not saved): ")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                key = getpass.getpass("API key (not saved): ")
         else:
             raise ValueError("open in a terminal to enter the key, or use --api-key-env")
         return desktop_profile_open(argv[1], api_key=key, api_instance=True)
-    except (OSError, ValueError, LookupError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, LookupError, subprocess.SubprocessError, getpass.GetPassWarning) as e:
         warn(f"API instance error: {e}")
         return 1
 
@@ -1604,17 +1988,21 @@ def run_accounts(argv, overrides=None):
     if os.name != "nt":
         warn("account management is Windows-only"); return 2
     if not argv:
-        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
+        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]"); return 1
     
     target_type = argv[0].lower()
     if target_type not in ("cli-manager", "ide"):
         warn(f"unknown account target '{target_type}' (choose: cli-manager | ide)")
-        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]"); return 1
+        warn("usage: accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]"); return 1
 
     sub = (argv[1] if len(argv) > 1 else "list").lower()
     arg = argv[2] if len(argv) > 2 else None
     need = lambda: (warn(f"usage: accounts {target_type} {sub} <name>"), 1)[1]
     try:
+        if sub == "usage":
+            if len(argv) > 3:
+                warn(f"usage: accounts {target_type} usage [name]"); return 1
+            return acct_usage(target_type, arg)
         if sub in ("list", "ls"):          return acct_list(target_type)
         if sub in ("current", "who"):      return acct_current(target_type)
         if sub == "save":                  return acct_save(target_type, arg) if arg else need()
@@ -1626,8 +2014,8 @@ def run_accounts(argv, overrides=None):
             return acct_rename(target_type, arg, arg2) if (arg and arg2) else need_rename()
         if sub in ("logout", "signout", "clear"): return acct_logout(target_type)
     except Exception as e:
-        warn(f"accounts error: {e}"); return 1
-    warn(f"unknown accounts subcommand '{sub}' (list | current | save | use | rename | logout | rm)"); return 2
+        warn("could not check account usage" if sub == "usage" else f"accounts error: {e}"); return 1
+    warn(f"unknown accounts subcommand '{sub}' (list | current | save | use | rename | logout | rm | usage)"); return 2
 
 # Driver
 SPEC = {
@@ -1636,6 +2024,9 @@ SPEC = {
     "manager": dict(name="Antigravity Manager",  find=manager_default_bins,  status=functools.partial(gate_status, gate=MANAGER_GATE),
                     patch=functools.partial(gate_patch, gate=MANAGER_GATE, app="Manager", fname=_bin("language_server"))),
     "ide":     dict(name="Antigravity IDE",      find=ide_default_mains,     status=ide_status,     patch=ide_patch),
+    "extension": dict(name="Antigravity IDE Extension", find=extension_default_paths,
+                      status=functools.partial(gate_status, gate=EXTENSION_GATE),
+                      patch=functools.partial(gate_patch, gate=EXTENSION_GATE, app="IDE Extension", fname=_bin("agy"))),
 }
 
 
@@ -1926,7 +2317,7 @@ def _mac_sign_transaction(entries, bundle_entitlements=None):
     bundles = []
     for target, path in entries.items():
         actual = os.path.realpath(path)
-        if target in ("cli", "manager") and actual not in binaries:
+        if target in ("cli", "manager", "extension") and actual not in binaries:
             binaries.append(actual)
         app = _mac_app_bundle(path)
         if app and app not in bundles:
@@ -1940,7 +2331,7 @@ def _mac_sign_transaction(entries, bundle_entitlements=None):
         for i, path in enumerate(binaries):
             saved = os.path.join(temp, f"binary-{i}")
             shutil.copy2(path, saved)
-            if not filecmp.cmp(path, saved, shallow=False):
+            if not _files_equal(path, saved):
                 raise OSError("temporary macOS signing backup verification failed")
             binary_copies.append((path, saved))
         for i, app in enumerate(bundles):
@@ -2307,30 +2698,89 @@ def _render(console, paths, status):
     tbl.add_column("App", style="bold cyan", no_wrap=True)
     tbl.add_column("Status", no_wrap=True)
     tbl.add_column("Account", style="bold green", no_wrap=True)
-    tbl.add_column("Location", style="dim", overflow="fold")
+    tbl.add_column("Location", style="dim", no_wrap=True, overflow="ellipsis", ratio=1)
     
-    for t in TARGETS:
+    for t in ("cli", "manager", "extension", "ide"):
         path, st = paths[t], status[t]
-        acct = cur_cli_manager if t in ("cli", "manager") else cur_ide
+        acct = cur_cli_manager if t in ("cli", "manager", "extension") else cur_ide if t == "ide" else None
         acct_str = acct if acct else "[white dim]—[/]"
         tbl.add_row(SPEC[t]["name"], f"[{_STYLE[st]}]{_ICON[st]} {st}[/]", acct_str, path or "—")
         
     console.print(Panel(tbl, title="[bold white]agy-manager[/] · Antigravity environment manager",
                         subtitle="[dim]↑↓ move · enter select · space toggle[/]", border_style="cyan"))
 
-def _accounts_submenu(console, qs, target_type):
+def _render_usage(console, results, label, cur=None):
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    if not results:
+        return
+    now = time.time()
+    group_names = list(dict.fromkeys(group["name"] for result in results.values()
+                                    for group in result["groups"]))
+    tbl = Table(box=None, expand=True, pad_edge=False)
+    tbl.add_column("Account", style="bold white", ratio=1)
+    for i, name in enumerate(group_names):
+        color = "bright_cyan" if i % 2 == 0 else "bright_magenta"
+        tbl.add_column(Text(f"{name}\n5h / weekly", style=f"bold {color}"), ratio=2)
+    if not group_names:
+        tbl.add_column("Quota status", ratio=2)
+    tbl.add_column("Checked", width=8)
+    for account, result in results.items():
+        cells = []
+        for name in group_names:
+            matches = [group for group in result["groups"] if group["name"] == name]
+            group = matches[0] if len(matches) == 1 else None
+            cell = Text()
+            for i, window in enumerate(("5h", "weekly")):
+                if i:
+                    cell.append(" / ")
+                bucket = group["windows"][window] if group is not None else None
+                quota = _usage_cells(bucket, now, compact=True)[0]
+                fraction = (bucket["fraction"]
+                            if bucket is not None and not bucket["disabled"] else None)
+                style = ("white" if fraction is None else "bold red" if fraction == 0
+                         else "bold yellow" if fraction <= .2 else "bold green")
+                cell.append(quota, style=style)
+            cells.append(cell)
+        if result["error"] or not result["groups"]:
+            message = result["error"] or "No quota data"
+            cells = [Text(message, style="red" if result["error"] else "yellow")]
+            cells.extend(Text("—") for _ in range(max(0, len(group_names) - 1)))
+        account_text = Text(_usage_account_label(account), style="bold white")
+        if result.get("active", account == cur):
+            account_text.append(" ●", style="bold green")
+        checked = time.strftime("%H:%M:%S", time.localtime(result["checked_at"]))
+        tbl.add_row(account_text, *cells, checked)
+    title = Text()
+    title.append("Quotas", style="bold white")
+    title.append(f" · {label}", style="cyan")
+    console.print(Panel(tbl, title=title,
+                        title_align="left", border_style="cyan",
+                        subtitle=Text("Remaining: 5h / weekly", style="white")))
+
+
+def _accounts_submenu(console, qs, target_type, usage=None):
     import questionary
     from rich.table import Table
     from rich.panel import Panel
-    label = "CLI + Manager" if target_type == "cli-manager" else "IDE"
+    label = "CLI + Manager + Extension" if target_type == "cli-manager" else "IDE"
+    if usage is None:
+        usage = {}
+
+    def load_profiles():
+        profiles = profile_bundles(target_type)
+        quota_profiles, cur = _usage_profiles(target_type, profiles)
+        return profiles, quota_profiles, cur
+
     while True:
-        console.clear()
+        _clear_tui(console)
         try:
-            profiles = profile_bundles(target_type)
-            names, cur = list(profiles), current_account(target_type, profiles)
+            profiles, quota_profiles, cur = _tui_run(console, "Loading accounts…", load_profiles)
+            names = list(profiles)
         except Exception as e:
             console.print(f"[bold red]accounts error:[/] {e}")
-            questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); return
         tbl = Table(box=None, expand=True, pad_edge=False)
         tbl.add_column("Account", style="bold cyan"); tbl.add_column("", style="bold green", no_wrap=True)
         if names:
@@ -2339,50 +2789,77 @@ def _accounts_submenu(console, qs, target_type):
             tbl.add_row("[dim]— none saved —[/]", "")
         console.print(Panel(tbl, title=f"[bold white]accounts ({label})[/] · switch login",
                             border_style="cyan"))
-        if names and cur is None:
-            console.print("[dim]the current login isn't saved as a profile yet[/]")
-        act = questionary.select("Accounts:", style=qs, qmark="»", choices=[
+        if None in quota_profiles:
+            console.print("Current login is unsaved; its quotas are available below or via Check usage / quota.")
+        # A newly saved, renamed or externally changed profile must not inherit old quotas.
+        snapshots = {result["fingerprint"]: result for result in usage.values()}
+        if cur in quota_profiles and cur not in usage:
+            fingerprint = _usage_fingerprint(quota_profiles[cur])
+            if fingerprint in snapshots:
+                usage[cur] = dict(snapshots[fingerprint])
+        for name in list(usage):
+            if name not in quota_profiles or usage[name]["fingerprint"] != _usage_fingerprint(quota_profiles[name]):
+                del usage[name]
+            else:
+                usage[name]["active"] = name == cur
+        _render_usage(console, usage, label, cur)
+        act = _tui_ask(console, questionary.select("Accounts:", style=qs, qmark="»", choices=[
+            questionary.Choice("Check usage / quota", "usage"),
             questionary.Choice("Save current login as…", "save"),
             questionary.Choice("Switch to…", "use"),
             questionary.Choice("Rename…", "rename"),
             questionary.Choice("Sign out locally", "logout"),
             questionary.Choice("Remove…", "rm"),
             questionary.Choice("Back", "back"),
-        ]).ask()
+        ]))
         if act in (None, "back"): return
+        _clear_tui(console)
         console.rule(f"[bold cyan]{act}[/]")
-        if act == "save":
-            name = questionary.text("Name for this account:", style=qs).ask()
-            if name and name.strip(): acct_save(target_type, name.strip())
+        if act == "usage":
+            refreshed = _tui_run(console, "Refreshing account quotas…", _collect_usage, target_type, quota_profiles)
+            for name, result in refreshed.items():
+                result["active"] = name == cur
+            usage.clear(); usage.update(refreshed)
+            _render_usage(console, usage, label, cur)
+            if not quota_profiles:
+                console.print("[yellow]No active login or saved accounts.[/]")
+        elif act == "save":
+            name = _tui_ask(console, questionary.text("Name for this account:", style=qs))
+            if name and name.strip():
+                _tui_run(console, "Saving account…", acct_save, target_type, name.strip())
         elif act == "logout":
-            acct_logout(target_type)
+            _tui_run(console, "Signing out…", acct_logout, target_type)
         elif act == "use":
             if not names: console.print("[yellow]Nothing saved yet.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                name = questionary.select("Switch to:", style=qs, choices=choices).ask()
-                if name and name != "back": acct_use(target_type, name)
+                name = _tui_ask(console, questionary.select("Switch to:", style=qs, choices=choices))
+                if name and name != "back":
+                    _tui_run(console, "Switching account…", acct_use, target_type, name)
         elif act == "rename":
             if not names: console.print("[yellow]Nothing saved yet.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                old_name = questionary.select("Select account to rename:", style=qs, choices=choices).ask()
+                old_name = _tui_ask(console, questionary.select("Select account to rename:", style=qs, choices=choices))
                 if old_name and old_name != "back":
-                    new_name = questionary.text(f"New name for '{old_name}':", style=qs).ask()
-                    if new_name and new_name.strip(): acct_rename(target_type, old_name, new_name.strip())
+                    new_name = _tui_ask(console, questionary.text(f"New name for '{old_name}':", style=qs))
+                    if new_name and new_name.strip():
+                        _tui_run(console, "Renaming account…", acct_rename, target_type, old_name, new_name.strip())
         elif act == "rm":
             if not names: console.print("[yellow]Nothing to remove.[/]")
             else:
                 choices = [questionary.Choice(n, n) for n in names] + [questionary.Choice("Back", "back")]
-                name = questionary.select("Remove:", style=qs, choices=choices).ask()
-                if name and name != "back": acct_rm(target_type, name)
-        questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask()
+                name = _tui_ask(console, questionary.select("Remove:", style=qs, choices=choices))
+                if name and name != "back":
+                    _tui_run(console, "Removing account…", acct_rm, target_type, name)
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
 
-def _accounts_menu(console, qs, overrides=None):
+def _accounts_menu(console, qs, usage=None, overrides=None):
     import questionary
     if sys.platform == "darwin":
         while True:
-            act = questionary.select("Desktop account profiles:", style=qs, choices=[
+            _clear_tui(console)
+            act = _tui_ask(console, questionary.select("Desktop account profiles:", style=qs, choices=[
                 questionary.Choice("List profiles", "list"),
                 questionary.Choice("Create isolated profile", "create"),
                 questionary.Choice("Open profile", "open"),
@@ -2391,64 +2868,399 @@ def _accounts_menu(console, qs, overrides=None):
                 questionary.Choice("Open API instance", "api-open"),
                 questionary.Choice("Repair API instance", "api-repair"),
                 questionary.Choice("Back", "back"),
-            ]).ask()
+            ]))
             if act in (None, "back"):
                 return
             args = [act]
             if act != "list":
-                name = questionary.text("Profile name (lowercase letters, digits, - or _):", style=qs).ask()
+                name = _tui_ask(console, questionary.text("Profile name (lowercase letters, digits, - or _):", style=qs))
                 if not name:
                     continue
                 args.append(name.strip())
             if act.startswith("api-"):
                 base_url = model = None
                 if act == "api-create":
-                    base_url = questionary.text("API base URL:", style=qs).ask()
-                    model = questionary.text("Model ID:", style=qs).ask()
+                    base_url = _tui_ask(console, questionary.text("API base URL:", style=qs))
+                    model = _tui_ask(console, questionary.text("Model ID:", style=qs))
                     if not base_url or not model:
                         continue
-                run_api_instances([act[4:], args[1]], overrides, base_url, model)
+                key = None
+                if act == "api-open":
+                    key = _tui_ask(console, questionary.password("API key (not saved):", style=qs))
+                    if not key:
+                        continue
+                _tui_run(console, "Updating API instance…", run_api_instances,
+                         [act[4:], args[1]], overrides, base_url, model, api_key=key)
             else:
-                run_desktop_accounts(args, overrides)
-            questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask()
+                _tui_run(console, "Updating desktop profile…", run_desktop_accounts, args, overrides)
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
     if os.name != "nt":
         console.print("[yellow]Account management is Windows-only.[/]")
-        questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); return
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); return
+    if usage is None:
+        usage = {}
     while True:
-        console.clear()
-        act = questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
-            questionary.Choice("CLI + Manager", "cli-manager"),
+        _clear_tui(console)
+        act = _tui_ask(console, questionary.select("Manage accounts for:", style=qs, qmark="»", choices=[
+            questionary.Choice("CLI + Manager + Extension", "cli-manager"),
             questionary.Choice("IDE", "ide"),
             questionary.Choice("Back", "back"),
-        ]).ask()
+        ]))
         if act in (None, "back"): return
-        _accounts_submenu(console, qs, act)
+        _accounts_submenu(console, qs, act, usage.setdefault(act, {}))
+
+class _TuiSessionOutput:
+    """The interactive session owns the alternate screen, not each question."""
+    def __init__(self, output):
+        self.output = output
+
+    def __getattr__(self, name):
+        return getattr(self.output, name)
+
+    def enter_alternate_screen(self):
+        pass
+
+    def quit_alternate_screen(self):
+        pass
+
+
+class _TuiDisplay:
+    """Retain Rich renderables; prompt_toolkit owns the screen while asking."""
+    def __init__(self, console, output=None):
+        import threading
+        self.console = console
+        self.output = output
+        self.items = []
+        self._cache = None
+        self.follow_tail = False
+        self._revision = 0
+        self._lock = threading.RLock()
+
+    def print(self, *objects, **kwargs):
+        with self._lock:
+            self.items.append((objects, kwargs))
+            self._revision += 1
+            self._cache = None
+
+    def rule(self, title="", **kwargs):
+        from rich.rule import Rule
+        self.print(Rule(title, **kwargs))
+
+    def clear(self):
+        with self._lock:
+            self.items.clear()
+            self._revision += 1
+            self._cache = None
+            self.follow_tail = False
+
+    def formatted(self, width):
+        import io
+        from rich.console import Console
+        from prompt_toolkit.formatted_text import ANSI, to_formatted_text
+        with self._lock:
+            if self._cache is not None and self._cache[0] == width:
+                return self._cache[1]
+            items, revision = list(self.items), self._revision
+        buffer = io.StringIO()
+        # Set both dimensions: Rich otherwise ignores an explicit width
+        # when the parent process declares TERM=dumb.
+        renderer = Console(file=buffer, width=max(1, width), height=self.console.height, force_terminal=True,
+                           color_system="truecolor", legacy_windows=False)
+        for objects, kwargs in items:
+            renderer.print(*objects, **kwargs)
+        text = to_formatted_text(ANSI(buffer.getvalue().rstrip("\n")))
+        with self._lock:
+            if self._revision == revision:
+                self._cache = width, text
+        return text
+
+
+def _tui_ask(console, question, operations=None):
+    operations = operations or {}
+    if not isinstance(console, _TuiDisplay):
+        answer = question.ask()
+        if operations and answer in operations:
+            message, callback = operations[answer]
+            with console.status(message): callback()
+        return answer
+    import asyncio
+    from prompt_toolkit.formatted_text import fragment_list_to_text
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.key_binding import ConditionalKeyBindings, KeyBindings, merge_key_bindings
+    from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+    app = question.application
+    if console.output is not None:
+        app.output = app.renderer.output = console.output
+    menu = app.layout.container
+    focus = app.layout.current_control
+    scroll = None
+    loading = {}
+
+    def header_text():
+        return console.formatted(app.output.get_size().columns)
+
+    def menu_height():
+        if loading:
+            return 1
+        size = app.output.get_size()
+        return min(size.rows, menu.preferred_height(size.columns, size.rows).preferred)
+
+    def header_metrics():
+        text = fragment_list_to_text(header_text())
+        lines = text.count("\n") + 1 if text else 0
+        available = max(0, app.output.get_size().rows - menu_height())
+        hint = int(lines > available and available > 1)
+        return lines, min(lines, available - hint), hint
+
+    def scroll_position():
+        lines, height, _ = header_metrics()
+        limit = max(0, lines - height)
+        return min(limit, max(0, scroll)) if scroll is not None else limit if console.follow_tail else 0
+
+    bindings = KeyBindings()
+
+    @bindings.add("c-c", eager=True)
+    def cancel(event):
+        event.app.exit(exception=KeyboardInterrupt)
+
+    @bindings.add("<any>", filter=Condition(lambda: bool(loading)))
+    def ignore_while_loading(event):
+        pass
+
+    @bindings.add("pageup")
+    @bindings.add("pagedown")
+    def scroll_header(event):
+        nonlocal scroll
+        step = max(1, header_metrics()[1] - 1)
+        scroll = scroll_position() + (-step if event.key_sequence[0].key == "pageup" else step)
+
+    header = FormattedTextControl(header_text, show_cursor=False,
+                                 get_cursor_position=lambda: Point(0, scroll_position()))
+    indicator = FormattedTextControl(
+        lambda: loading["display"].formatted(app.output.get_size().columns) if loading else [],
+        focusable=True, show_cursor=False)
+
+    app.layout = Layout(HSplit([
+        Window(header, height=lambda: Dimension.exact(header_metrics()[1]),
+               get_vertical_scroll=lambda _: scroll_position(), always_hide_cursor=True),
+        Window(FormattedTextControl("PgUp/PgDn: scroll tables and results", style="class:instruction"),
+               height=lambda: Dimension.exact(header_metrics()[2])),
+        ConditionalContainer(HSplit([menu], height=lambda: Dimension.exact(menu_height())),
+                             filter=Condition(lambda: not loading)),
+        ConditionalContainer(Window(indicator, height=1, always_hide_cursor=True),
+                             filter=Condition(lambda: bool(loading))),
+        Window(),
+    ]), focused_element=focus)
+    app.full_screen = app.renderer.full_screen = True
+    app.key_bindings = merge_key_bindings([
+        ConditionalKeyBindings(app.key_bindings, filter=Condition(lambda: not loading)), bindings])
+    app.min_redraw_interval = .03
+    app.terminal_size_polling_interval = .1
+    exit_question = app.exit
+
+    async def animate():
+        while loading:
+            loading["display"]._cache = None
+            app.invalidate()
+            await asyncio.sleep(.08)
+
+    async def run_operation(answer, callback):
+        try:
+            await app.loop.run_in_executor(None, callback)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            exit_question(exception=error)
+        else:
+            if loading.get("cancelled"):
+                exit_question(exception=KeyboardInterrupt)
+            else:
+                exit_question(result=answer)
+        finally:
+            loading.clear()
+            app.layout.focus(focus)
+
+    def exit_or_run(result=None, exception=None, style=""):
+        if loading and (exception is KeyboardInterrupt or isinstance(exception, KeyboardInterrupt)):
+            # Finish writes and their verification/rollback before closing UI.
+            loading["cancelled"] = True
+            return
+        # Keep this application and its alternate screen alive until the
+        # operation finishes, including the existing tables and resize handling.
+        if operations and exception is None and result in operations:
+            if not loading:
+                from rich.spinner import Spinner
+                message, callback = operations[result]
+                spinner = _TuiDisplay(console.console)
+                spinner.print(Spinner("dots", text=message, style="cyan"))
+                loading["display"] = spinner
+                app.layout.focus(indicator)
+                app.create_background_task(animate())
+                app.create_background_task(run_operation(result, callback))
+            return
+        exit_question(result=result, exception=exception, style=style)
+
+    app.exit = exit_or_run
+    try:
+        return question.unsafe_ask()
+    except KeyboardInterrupt:
+        return None
+
+
+@contextlib.contextmanager
+def _tui_output(console):
+    """Keep scriptable commands' ordinary print output in the menu screen."""
+    if not isinstance(console, _TuiDisplay):
+        yield
+        return
+    import io
+    from rich.text import Text
+    class LogStream(io.StringIO):
+        pending = ""
+
+        def write(self, value):
+            count = super().write(value)
+            self.pending += value
+            if "\n" in self.pending:
+                lines, self.pending = self.pending.rsplit("\n", 1)
+                # Older Rich decoders discard line breaks in from_ansi().
+                for line in lines.split("\n"):
+                    console.print(Text.from_ansi(line))
+                console.follow_tail = True
+            return count
+
+        def flush(self):
+            if self.pending:
+                console.print(Text.from_ansi(self.pending), end="")
+                console.follow_tail = True
+                self.pending = ""
+
+    buffer = LogStream()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            yield
+    finally:
+        buffer.flush()
+
+
+def _tui_run(console, message, callback, *args, **kwargs):
+    """Run any operation inside the same UI, retaining live output and resize."""
+    if not isinstance(console, _TuiDisplay):
+        with console.status(message):
+            return callback(*args, **kwargs)
+    import questionary
+    results = []
+
+    def operation():
+        with _tui_output(console):
+            results.append(callback(*args, **kwargs))
+
+    question = questionary.press_any_key_to_continue(message)
+    question.application.pre_run_callables.append(lambda: question.application.exit(result="operation"))
+    if _tui_ask(console, question, {"operation": (message, operation)}) is None:
+        raise KeyboardInterrupt
+    return results[0]
+
+
+@contextlib.contextmanager
+def _tui_console():
+    """Keep menu output out of shell history and restore Windows console flags."""
+    from rich.console import Console
+    from prompt_toolkit.application import get_app_session
+    restore = None
+    if os.name == "nt" and sys.stdout.isatty():
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        handle = kernel.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = wintypes.DWORD()
+        # Rich otherwise selects its legacy renderer, which ignores screen erase.
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            if kernel.SetConsoleMode(handle, mode.value | 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                restore = kernel, handle, mode.value
+    try:
+        console = Console()
+        output = get_app_session().output
+        output.enter_alternate_screen()
+        try:
+            output.flush()
+            yield _TuiDisplay(console, _TuiSessionOutput(output))
+        finally:
+            output.quit_alternate_screen()
+            output.show_cursor()
+            output.flush()
+    finally:
+        if restore is not None:
+            kernel, handle, mode = restore
+            kernel.SetConsoleMode(handle, mode)
+
+
+def _clear_tui(console):
+    if isinstance(console, _TuiDisplay):
+        console.clear()
+        return
+    if os.name == "nt" and console.legacy_windows is True:
+        # Classic consoles without VT still need an actual Win32 screen erase.
+        from prompt_toolkit.shortcuts import clear
+        clear()
+    else:
+        console.clear()
+
 
 def interactive(overrides, macos_disable_library_validation=False):
+    with _tui_console() as console:
+        return _interactive(console, overrides, macos_disable_library_validation)
+
+
+def _interactive(console, overrides, macos_disable_library_validation=False):
     import questionary
-    from rich.console import Console
-    console = Console()
     qs = questionary.Style([("qmark", "fg:#00afff bold"), ("pointer", "fg:#00afff bold"),
                             ("highlighted", "fg:#00afff bold"), ("selected", "fg:#00ff87 bold"),
                             ("answer", "fg:#00ff87 bold")])
-    paths, status = scan(overrides)
+    paths, status = _tui_run(console, "Scanning installed apps…", scan, overrides)
+    usage = _tui_run(console, "Refreshing account quotas…", _startup_usage)
+
+    def refresh_status():
+        nonlocal paths, status
+        paths, status = scan(overrides)
+
+    def refresh_quotas():
+        refreshed = _startup_usage()
+        usage.clear(); usage.update(refreshed)
+
     while True:
-        console.clear()
+        _clear_tui(console)
         _render(console, paths, status)
-        action = questionary.select("What do you want to do?", style=qs, qmark="»", choices=[
+        for target_type, label in (("cli-manager", "CLI + Manager + Extension"), ("ide", "IDE")):
+            _render_usage(console, usage.get(target_type, {}), label)
+        for error in usage.get("_errors", []):
+            console.print(error, style="yellow", markup=False)
+        action = _tui_ask(console, questionary.select("What do you want to do?", style=qs, qmark="»", choices=[
             questionary.Choice("Patch app(s)", "patch"),
             questionary.Choice("Restore app(s) from backup", "restore"),
             questionary.Choice("Manage accounts", "accounts"),
+            questionary.Choice("Refresh quotas", "refresh-quotas"),
             questionary.Choice("Refresh status", "refresh"),
             questionary.Choice("Quit", "quit"),
-        ]).ask()
+        ]), operations={"refresh": ("Refreshing app status…", refresh_status),
+                     "refresh-quotas": ("Refreshing account quotas…", refresh_quotas)})
         if action in (None, "quit"):
-            console.print("[dim]bye 👋[/]"); return 0
-        if action == "refresh":
-            paths, status = scan(overrides)
+            return 0
+        if action in ("refresh", "refresh-quotas"):
             continue
         if action == "accounts":
-            _accounts_menu(console, qs, overrides); continue
+            _accounts_menu(console, qs, usage, overrides=overrides); continue
+        _clear_tui(console)
+        console.rule(f"[bold cyan]{action}[/]")
         opts = []
         for t in TARGETS:
             path, st = paths[t], status[t]
@@ -2459,16 +3271,19 @@ def interactive(overrides, macos_disable_library_validation=False):
             opts.append(questionary.Choice(f"{SPEC[t]['name']}  · {st}", value=t))
         if not opts:
             console.print(f"[yellow]Nothing to {action}.[/]")
-            questionary.press_any_key_to_continue("Enter to continue…", style=qs).ask(); continue
-        sel = questionary.checkbox(f"Select app(s) to {action}:", choices=opts, style=qs).ask()
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); continue
+        sel = _tui_ask(console, questionary.checkbox(f"Select app(s) to {action}:", choices=opts, style=qs))
         if not sel:
             continue
-        console.rule(f"[bold cyan]{action}[/]")
-        run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
-        for t in sel:
-            status[t] = _status_of(t, paths[t])
+        def apply_action():
+            run(action, sel, overrides, macos_disable_library_validation=macos_disable_library_validation)
+            # Restoring a shared agy also changes the other target's status.
+            for t in TARGETS:
+                status[t] = _status_of(t, paths[t])
+
+        _tui_run(console, "Patching app(s)…" if action == "patch" else "Restoring app(s)…", apply_action)
         console.rule(style="dim")
-        questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs).ask()
+        _tui_ask(console, questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs))
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -2476,8 +3291,8 @@ def main(argv=None):
                     "Run with no arguments for the interactive menu.")
     ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts", "api"), nargs="?",
                     help="menu (default) | status | patch | restore | accounts manager <list|create|open|repair> [name] (macOS) | "
-                         "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm> [name1] [name2]")
-    ap.add_argument("targets", nargs="*", default=[], metavar="{cli,manager,ide}",
+                         "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]")
+    ap.add_argument("targets", nargs="*", default=[], metavar="{" + ",".join(TARGETS) + "}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
     ap.add_argument("--base-url", help="Gemini-compatible proxy base URL for a new API instance")
@@ -2506,13 +3321,16 @@ def main(argv=None):
     if args.action in (None, "menu"):
         try:
             import questionary, rich  # noqa: F401
+            from prompt_toolkit import VERSION as toolkit_version
+            if tuple(map(int, toolkit_version[:3])) < (3, 0, 34):
+                raise ImportError("interactive menu requires prompt-toolkit >= 3.0.34")
             if not (sys.stdin.isatty() and sys.stdout.isatty()):
                 raise RuntimeError("not a terminal")
             return interactive(overrides, macos_disable_library_validation=args.macos_disable_library_validation)
         except KeyboardInterrupt:
             print(); return 0
         except ImportError:
-            warn("interactive menu needs:  pip install rich questionary")
+            warn('interactive menu needs:  pip install rich questionary "prompt-toolkit>=3.0.34,<4"')
             if args.action == "menu": return 2
         except Exception:
             if args.action == "menu":

@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; multi-account profiles on Windows and macOS)</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; multi-account profiles on Windows and macOS; live quota monitoring on Windows)</b>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 - [✨ Features](#features)
 - [🚀 Quick Start](#quick-start)
 - [🔓 Location Restriction Bypass](#bypass)
-- [👥 Account Profile Manager](#accounts)
+- [👥 Account Profiles & Quota Monitoring](#accounts)
 - [🔍 How it Works (Technical Details)](#details)
 - [⚠️ Caveats & Warnings](#warnings)
 - [📄 License](#license)
@@ -33,12 +33,12 @@
 
 ## <a id="features"></a>✨ Features
 
-`agy-manager` combines two essential tools for a seamless development experience in the Antigravity ecosystem:
+`agy-manager` combines essential tools for a seamless development experience in the Antigravity ecosystem:
 
-- 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all three core applications (CLI, Manager, IDE).
-- 👥 **Account Profile Manager:** Safely store and quickly switch between multiple authorization profiles offline, without the need for browser-based re-authentication.
-- 🎨 **Interactive TUI Dashboard:** Features a beautiful terminal interface built with `rich` and `questionary` for managing both patches and account profiles.
-- ⚡ **Zero-Dependency Core:** Scriptable commands run natively using Python's standard library alone, no package installation required.
+- 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all core components (CLI, Manager, IDE, and the IDE extension).
+- 👥 **Account Profiles & Live Quota Monitoring:** Safely store and quickly switch between multiple authorization profiles offline without browser-based re-authentication, plus track real-time model quota usage (5-hour and weekly windows for Gemini and Claude/GPT model groups), reset countdowns, and remaining percentages across all saved profiles and the active session.
+- 🎨 **Interactive TUI Dashboard:** Convenient terminal interface built with `rich` and `questionary` for managing patches and profiles, featuring an automatic live quota summary table right on the home screen.
+- ⚡ **Zero-Dependency Core:** All scriptable CLI commands (patching, profile switching, and quota inspection) run purely on Python's standard library with no external dependencies required.
 - 🛡️ **Safe & Reversible:** The patcher requires exactly one original or patched signature inside PE/ELF/Mach-O executable sections, verifies the backup and every write, and rolls back automatically on failure. Original files are kept as `*.agybak`; on macOS, the `.app` signature state is also saved in a sibling `*.app.agysignbak` directory.
 - ⚙️ **Smart Autodetect:** Dynamically scans registry keys, system PATH, environment variables, Scoop paths, standard Linux installation prefixes (such as `/opt`, `~/.local/share`, etc.), and macOS `.app` bundles (`/Applications`, `~/Applications`) to automatically locate installations.
 - 🧬 **Version- & Arch-Robust Patching:** Locates instruction signatures using regex patterns rather than brittle static file offsets, and carries per-architecture signatures (x86-64 and aarch64) so the same patch works on Intel and ARM builds alike.
@@ -58,7 +58,7 @@ cd eligibility-antigravity-patcher
 
 #### Option A: Interactive TUI (Recommended)
 
-Launches the complete terminal dashboard with live status reports for managing both patches and profiles:
+Launches the complete terminal dashboard with live patch status reports and quota monitoring for managing both patches and profiles:
 
 1. **Install dependencies:**
    ```bash
@@ -82,13 +82,15 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 | `python manager.py status` | Scan and display the patch status of all applications. |
 | `python manager.py patch` | Patch all detected applications. |
 | `python manager.py restore` | Revert all changes and restore original files. |
-| `python manager.py patch <cli\|manager\|ide>` | Patch only the specified applications. |
-| `python manager.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles (see details below). |
+| `python manager.py patch <cli\|manager\|ide\|extension>` | Patch only the specified applications. |
+| `python manager.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles and inspect quotas (see details below). |
 
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
 > ```bash
 > python manager.py --path-cli "D:\CustomTools\agy.exe" patch cli
+> # Or for the extension backend:
+> python manager.py --path-extension "D:\CustomTools\agy.exe" patch extension
 > ```
 
 > [!NOTE]
@@ -123,17 +125,18 @@ The patcher neutralizes local eligibility checks and directs each client into it
 | **`cli`** | **Antigravity CLI** (`agy` / `agy.exe`) | Binary-patches `agy` / `agy.exe` to neutralize the local `hasValidAuth` gate and select the `eligible` path. | `agy` / `agy.exe` |
 | **`manager`** | **Antigravity Manager** (Electron) | Binary-patches the Go backend `language_server` / `language_server.exe` to neutralize the `hasValidAuth` gate and select the success path. | `resources/bin/language_server` / `resources/bin/language_server.exe` |
 | **`ide`** | **Antigravity IDE** (VS Code) | Patches the minified `main.js` to neutralize the local auth gate and select the shortened authentication path. | `resources/app/out/main.js` |
+| **`extension`** | **Antigravity Extension** (Extension) | Binary-patches the extension's Go backend `agy` (`--hub`) to neutralize the `hasValidAuth` gate and select the success path. | `.gemini/bin/agy` / `.gemini/bin/agy.exe` |
 
 > [!NOTE]
-> **Platform Support:** All three patches (`cli`, `manager`, `ide`) are cross-platform and support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms.
+> **Platform Support:** The `cli`, `manager`, `ide`, and `extension` patches support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms. The `extension` patch uses the verified x64 backend signature (ARM64 is deliberately excluded pending signature verification in real-world builds).
 >
-> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli`). Ensure the applications are closed before patching to prevent file locking issues. Account management (`accounts`) supports saved login switching on Windows and isolated desktop profiles on macOS.
+> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For `extension`, autodetection scans `~/.gemini/bin/`, ignoring `PATH`. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli` or `--path-extension`). Ensure the applications are closed before patching to prevent file locking issues. Account management and quota tracking (`accounts`) support Windows login snapshots; macOS supports isolated desktop profiles and API instances.
 
 ---
 
-## <a id="accounts"></a>👥 Account Profile Manager
+## <a id="accounts"></a>👥 Account Profiles & Quota Monitoring
 
-On Windows, saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser. On macOS, creates isolated desktop app profiles for simultaneous accounts.
+On Windows, saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser and monitor live model quotas. On macOS, creates isolated desktop app profiles for simultaneous accounts.
 
 ### macOS: independent desktop accounts
 
@@ -155,6 +158,8 @@ Each copy uses about 650 MB and is signed locally, including nested code; the in
 
 ### macOS: API instances (experimental)
 
+If you already use a gateway that manages several Antigravity accounts, API mode lets you access it from the desktop app without logging into each account separately. The gateway handles the upstream accounts; the new desktop instance connects using the gateway's base URL and API key.
+
 On desktop **2.19.1 for Apple Silicon**, API mode opens a separate copy of the original desktop app using a Gemini-compatible proxy, including CLIProxyAPI. It has its own conversations, projects, settings and browser data under `~/Library/Application Support/agy-manager/api-instances/`. The installed app and existing Google account profiles remain unchanged. Run without `sudo`.
 
 ```bash
@@ -170,21 +175,35 @@ API instances use the backend's native Gemini BYOM mode. Their private renderer 
 
 ### Windows Management Scopes
 Sessions are isolated into two independent scopes:
-1. **CLI + Manager** (share a common credential stored in Windows Credential Manager).
+1. **CLI + Manager + Extension** (share a common credential stored in Windows Credential Manager).
 2. **IDE** (uses its own authorization keys in the SQLite database `state.vscdb` inside VS Code).
 
-This separation avoids database locking conflicts and lets you switch accounts for different tools independently.
+This separation avoids database locking conflicts, lets you query quotas and switch accounts for different tools independently.
 
-### Usage in the Interactive Menu:
-1. Choose **Manage accounts** in the main menu of `python manager.py`.
-2. Select the target scope: **CLI + Manager** or **IDE**.
-3. Use the menu options to save the current session, switch to a saved profile, delete profiles, or log out locally.
+### Live Quota Monitoring
+The quota inspection engine communicates directly with Google's internal quota service (`retrieveUserQuotaSummary`) using only Python's standard library:
+- **Tracked Model Groups:** 5-hour and weekly windows for the **Gemini Models** group (`5h` / `weekly`) and third-party **Claude and GPT models** (`5h` / `weekly`).
+- **Color-Coded Status:** Normal quota is green, low remaining quota (20% or less) is highlighted in yellow, and exhausted limits (`0% [RATE-LIMITED]`) are shown in red. Disabled buckets display `unavailable`, and unsupported windows display `no data`.
+- **Unsaved Session Support:** If an active session has not yet been saved under a profile name, it appears as **Current · unsaved** — saving a profile is not required to view quotas. If the active login matches a saved profile, only that profile's row appears, marked with an active indicator (`●`). Saving an active session seamlessly moves the quota snapshot to the saved profile name without duplicating rows.
+- **Safety and Autonomy:** Quota queries are strictly read-only, use the account's existing OAuth session, and refresh expired tokens in memory when needed without modifying stored credentials on disk or switching the active account. Failure of one account (such as network errors or revoked tokens) is isolated and does not hide data for other accounts. Passing a reset time does not assume that quota has refilled until confirmed by a refreshed response.
 
-### Usage via the Command Line:
+### Usage in the Interactive Menu (TUI)
+The TUI runs on a separate terminal screen that stays open until the program exits. Patching, restoring, refreshing data, and account operations display an animation while messages appear as work proceeds. Resizing the window redraws tables and menus together while preserving selections and entered text; long paths are shortened with `…`. **PgUp/PgDn** scroll through long tables and operation results. Redrawing uses already loaded data without querying quotas again. When interrupted, the current operation finishes before the UI closes. Exiting restores the regular terminal:
+1. **Automatic Startup Summary:** Launching `python manager.py` (or `python manager.py menu`) automatically queries quotas for all profiles and active logins across both scopes, rendering compact summary tables directly on the main dashboard.
+2. **On-Demand Refresh:** The **Refresh quotas** option in the main menu updates data across both scopes on demand.
+3. **Accounts Menu Operations:**
+   - Select **Manage accounts** in the main menu, then choose the scope: **CLI + Manager + Extension** or **IDE**.
+   - Displays saved profiles and the live quota table (one row per account: 5-hour and weekly remaining amounts, percentages, and check timestamp).
+   - Available actions: **Check usage / quota** (refresh quotas for the chosen scope), **Save current login as…** (save active session), **Switch to…** (switch profile), **Rename…**, **Sign out locally** (local logout), and **Remove…** (delete profile).
+
+### Usage via the Command Line (CLI)
 Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]`
+
+The `cli-manager` scope includes CLI, Manager, and Extension, which share the same login.
 
 | Action | Example Command | Description |
 | :--- | :--- | :--- |
+| `usage [name]` | `python manager.py accounts cli-manager usage` | Fetch detailed quota breakdowns (remaining percentages, reset countdown timers, and local reset dates) for all saved profiles plus any unsaved active session in the chosen scope. Specifying a profile name (`... usage work`) checks only that account. Returns exit code `1` if any profile could not be checked. |
 | `list` (or `ls`) | `python manager.py accounts cli-manager list` | List saved profiles for the chosen scope and mark the active one. |
 | `save <name>` | `python manager.py accounts cli-manager save work` | Save the current active session under the specified name. |
 | `use <name>` (or `switch`) | `python manager.py accounts cli-manager use personal` | Switch to a saved profile. |
@@ -214,10 +233,22 @@ At startup, the CLI reads the `hasValidAuth` field (the byte at offset `+8`) of 
 The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
 
 1. **x64 builds:** The patcher finds the validator's unique gate signature: `cmp byte ptr [rax+8],0` → `je` (skips the success path) → `mov rdx,[rsp+0x70]` → `mov [rax+0x60],rdx`. The context instructions are fixed; only the branch displacement may vary.
+   The same instruction sequence is verified in the Windows x64 agy 1.3.0 hub backend and reused by the `extension` target without maintaining duplicate signatures.
 2. The check and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP`: the flag is forced to `true` and the conditional jump is removed, so execution continues along the success path.
 3. This validator's result is returned by `GetAuthStatus` and used by the login routine, so both locations receive the same forced-success verdict during initial login and subsequent restarts.
 4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain the same gate in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → `ldp x3,x4,[sp,#0x80]` → `stp x3,x4,[x0,#0x60]`. The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]`, forcing the flag to `true`, removing the conditional jump, and continuing along the success path. The signature fixes the current context instructions and allows only the branch displacement to vary. The `MultiGate` class automatically selects the x64 or arm64 signature.
 The profile credential gate matches ARM64 `adrp/add x3` → `mov x4,#29` → `stp x3,x4` → `filepath.Join` in backend 2.19.1. It resolves the referenced filename through Mach-O segment addresses, verifies the original literal, replaces it with a 28-byte profile filename and changes the length to `mov x4,#28`. Duplicate or unsupported signatures stop before replacement.
+</details>
+
+<details>
+<summary>🧩 <b>Extension Patch (`agy --hub` Go Backend)</b></summary>
+
+The Google Antigravity extension runs the downloaded `agy` binary with `--hub` and serves its UI from a local HTTP server. The web UI invokes the `Login` and `GetAuthStatus` connect-rpc endpoints, verifies `authResult.hasValidAuth`, and displays an eligibility failure screen if the account is marked ineligible.
+
+1. **x64 builds:** The patcher locates the verified validator gate in `authclient.(*PersonalAuthValidator).Validate`: `cmp byte ptr [rax+8],0` → `je` → `mov rdx,[rsp+0x70]` → `mov [rax+0x60],rdx`. Surrounding context instructions remain untouched.
+2. The comparison and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP` + `NOP`: the validity flag is forced to `true` and execution proceeds down the success path.
+3. As a result, both `Login` and `GetAuthStatus` deliver a forced-success verdict directly to the hub UI, independent of the standard CLI's terminal gate.
+4. **Architecture support:** The target is architecture-aware and strictly matches x64 builds. ARM64 extension support is deliberately excluded until verified against real-world builds.
 </details>
 
 <details>
@@ -230,14 +261,26 @@ The profile credential gate matches ARM64 `adrp/add x3` → `mov x4,#29` → `st
 </details>
 
 <details>
-<summary>👥 <b>Account Profile Manager (Offline Session Swapping)</b></summary>
+<summary>👥 <b>Account Profile & Quota Manager (Session Storage & Live Monitoring)</b></summary>
 
 Profile switching is fully offline and does not call standard logout endpoints (which would revoke tokens on the server).
 
-1. **Storage Separation:** CLI/Manager tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
+1. **Storage Separation:** CLI + Manager + Extension tokens reside in Windows Credential Manager under `gemini:antigravity`. IDE tokens are read from the VS Code global SQLite DB `state.vscdb` (under `antigravityUnifiedStateSync.*` keys).
 2. **Secure Persistence:** On `save`, active credentials are read, encoded, and saved back to Windows Credential Manager under unique prefixed names: `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
 3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
 4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.
+5. **Live Quotas:** The client request and response schema were verified in Windows x64 CLI 1.2.16/1.2.17 and Manager 2.19.1. The patcher queries Google's `v1internal:retrieveUserQuotaSummary` endpoint using only the standard library, refreshing an expired OAuth token in memory when needed. Saved IDE credits/status snapshots are not used as live quota data. This internal API can change; unsupported responses are reported without inventing quota values.
+</details>
+
+<details>
+<summary>🍎 <b>macOS Code Signing & Library Validation</b></summary>
+
+The patcher fully automates the signing pipeline and entitlement management required to run modified applications on macOS:
+
+1. **Signing Order:** Binary patches are applied and verified first, followed by ad-hoc Mach-O signing (`agy` and `language_server`), and finally the outer `.app` bundle is signed inside-out. Each step is validated with `codesign --verify`; any failure triggers an immediate rollback.
+2. **Quarantine Removal:** Upon successful signing, `com.apple.quarantine` is recursively stripped from the target `.app` (using Python APIs or the built-in `/usr/bin/xattr`), preventing Gatekeeper from blocking the modified bundle.
+3. **Electron & Library Validation:** Signing flags and entitlements are preflight-checked before writing. When Library Validation is active, ad-hoc signing drops the Team ID and conflicts with the Electron Framework. The `--macos-disable-library-validation` flag injects `com.apple.security.cs.disable-library-validation=true` into the main executable's entitlements while preserving Hardened Runtime and existing entitlements.
+4. **Backup & Rollback:** Original signing metadata and entitlements are saved in the sibling `*.app.agysignbak` directory. Running `restore` reinstates the original bundle signature once the last patched target is restored.
 </details>
 
 ---
@@ -246,8 +289,8 @@ Profile switching is fully offline and does not call standard logout endpoints (
 
 - **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
 - **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
-- **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, or IDE) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
-- **Token Security:** All your credentials and profiles remain completely local to your machine. They are stored inside the secure Windows Credential Manager and your local SQLite database, and are never shared with external services.
+- **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, IDE, or the editor with the extension) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
+- **Token Security:** Credentials and profiles are stored in Windows Credential Manager and the local SQLite database. Quota checks send access tokens only to Google's quota service and refresh tokens only to Google's OAuth service over HTTPS. Tokens and raw service responses are never printed, redirects are refused, and refreshed credentials are not written back to the saved or active login. No credentials are sent to third-party services.
 - **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.
 
 ---
