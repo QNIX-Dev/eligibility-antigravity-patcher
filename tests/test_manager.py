@@ -5,6 +5,7 @@ import io
 import json
 import os
 import plistlib
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -354,6 +355,7 @@ class DesktopProfileTests(unittest.TestCase):
                                       "        env['AGY_BROWSER_ACTIVE_PORT_FILE'] = (0, paths_1.getActivePortFilePath)();",
             "dist/updater.js": "\n".join("function " + name + "() {}" for name in
                 ("initAutoUpdater", "checkForUpdates", "quitAndInstall", "applyHostUpdate", "setAutoUpdateChecking")),
+            "dist/preload.js": 'const fixturePreload = true;',
         }
         for name in scripts:
             header["files"]["dist"]["files"][name.split("/")[1]] = {"offset": "0", "size": 0}
@@ -416,7 +418,31 @@ class DesktopProfileTests(unittest.TestCase):
             copied = os.path.join(profile, "Antigravity.app", "Contents", "Resources", "bin", "language_server")
             manager._desktop_namespace_credentials(copied + manager.BAK, profile, check_only=True)
             self.assertEqual(manager.gate_status(copied, manager.MANAGER_GATE)[0], "patched")
-            self.assertTrue(manager.restore_file(copied, lambda p: manager.gate_status(p, manager.MANAGER_GATE)))
+            app = os.path.join(profile, "Antigravity.app")
+            seal = os.path.join(app, "Contents", "_CodeSignature", "CodeResources")
+
+            def digest():
+                with open(copied, "rb") as f:
+                    return manager.hashlib.sha256(f.read()).digest()
+
+            _write(seal, digest())
+
+            def command(args, check=True):
+                if os.path.realpath(args[-1]) == os.path.realpath(app):
+                    if "--sign" in args:
+                        _write(seal, digest())
+                    elif "--verify" in args:
+                        with open(seal, "rb") as f:
+                            if f.read() != digest():
+                                raise OSError("fixture resource seal does not match restored backend")
+                return manager.subprocess.CompletedProcess(args, 0, "", "Signature=adhoc\nCodeDirectory flags=0x0(none)\n")
+
+            with (mock.patch.object(manager, "_mac_command", side_effect=command),
+                  mock.patch.object(manager, "_mac_restore_bundle_signature") as vendor_restore):
+                self.assertEqual(manager.run("restore", ["manager"], {"manager": copied}), 0)
+            vendor_restore.assert_not_called()
+            with open(seal, "rb") as f:
+                self.assertEqual(f.read(), digest())
             self.assertEqual(manager.gate_status(copied, manager.MANAGER_GATE)[0], "unpatched")
             manager._desktop_namespace_credentials(copied, profile, check_only=True)
             with open(server, "rb") as f:
@@ -430,6 +456,59 @@ class DesktopProfileTests(unittest.TestCase):
             self.assertFalse(manager.restore_file(copied))
             with open(copied, "rb") as f:
                 self.assertEqual(f.read(), before)
+
+    def test_full_profile_restore_signing_failure_rolls_back_and_can_retry(self):
+        for api_instance in (False, True):
+            with (self.subTest(api_instance=api_instance), tempfile.TemporaryDirectory() as tmp,
+                  mock.patch.object(manager.sys, "platform", "darwin"),
+                  mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+                  mock.patch.object(manager, "_desktop_api_instances_root", return_value=os.path.join(tmp, "api")),
+                  mock.patch.object(manager, "_desktop_profile_sign"),
+                  mock.patch.object(manager, "_mac_prepare_signature_backup"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                _, server, _ = self.fixture(tmp)
+                original = self.token_binary()
+                original[0x240:0x250] = bytes.fromhex("03204039a3010036e31348a9031006a9")
+                struct.pack_into("<Q", original, 32 + 72 + 40, 0x50)
+                patched = bytearray(original)
+                patched[0x240:0x248] = manager.MANAGER_GATE_ARM64.fix
+                _write(server, patched)
+                _write(server + manager.BAK, original)
+                config = {"base_url": "https://proxy.example.com", "model": "test-model"} if api_instance else None
+                manager.desktop_profile_create("work", {"manager": server}, config)
+                root = manager._desktop_api_instances_root() if api_instance else manager._desktop_profiles_root()
+                profile = os.path.join(root, "work")
+                copied = os.path.join(profile, "Antigravity.app", "Contents", "Resources", "bin", "language_server")
+                with open(copied, "rb") as f:
+                    before = f.read()
+                with mock.patch.object(manager, "_mac_sign_transaction", side_effect=OSError("fixture signing failure")):
+                    self.assertEqual(manager.run("restore", ["manager"], {"manager": copied}), 1)
+                with open(copied, "rb") as f:
+                    self.assertEqual(f.read(), before)
+                manager._desktop_namespace_credentials(copied, profile, check_only=True)
+                with (mock.patch.object(manager, "_mac_sign_transaction") as sign,
+                      mock.patch.object(manager, "_mac_restore_bundle_signature") as vendor_restore):
+                    self.assertEqual(manager.run("restore", ["manager"], {"manager": copied}), 0)
+                    sign.assert_called_once_with({"manager": copied})
+                    vendor_restore.assert_not_called()
+                self.assertEqual(manager.gate_status(copied, manager.MANAGER_GATE)[0], "unpatched")
+                # If the binary rollback itself fails, retain the original
+                # outside the restore transaction's automatic cleanup.
+                _write(copied, before)
+                real_copy = manager._copy_binary
+
+                def fail_rollback(src, dst):
+                    if os.path.basename(src) == "0" and dst == copied:
+                        raise OSError("fixture rollback failure")
+                    return real_copy(src, dst)
+
+                with (mock.patch.object(manager, "_mac_sign_transaction", side_effect=OSError("fixture signing failure")),
+                      mock.patch.object(manager, "_copy_binary", side_effect=fail_rollback)):
+                    self.assertEqual(manager.run("restore", ["manager"], {"manager": copied}), 1)
+                recoveries = [n for n in os.listdir(profile) if n.startswith(".restore-recovery-")]
+                self.assertEqual(len(recoveries), 1)
+                with open(os.path.join(profile, recoveries[0], "language_server"), "rb") as f:
+                    self.assertEqual(f.read(), before)
 
     def test_repair_namespaces_inherited_backup(self):
         with (tempfile.TemporaryDirectory() as tmp,
@@ -731,6 +810,184 @@ class DesktopProfileTests(unittest.TestCase):
             _write(os.path.join(app, "Contents", "Resources", "bin", "language_server"), self.token_binary())
             with self.assertRaisesRegex(ValueError, "repair"):
                 manager.desktop_profile_open("work")
+            launch.assert_not_called()
+
+
+class APIInstanceTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node is needed only to test the Electron preload adapter")
+    def test_api_ui_session_adapter_frames_and_scopes_requests(self):
+        script = r'''
+const assert = require("node:assert/strict"), vm = require("node:vm");
+if (typeof Response === "undefined") process.exit(77);
+global.location = new URL("https://127.0.0.1:12345/");
+let forwarded = 0;
+global.window = {fetch: async (url) => {
+    forwarded++;
+    if (String(url).endsWith("/GetUserStatus")) {
+        const message = {userStatus: {fixtureStatus: true, cascadeModelConfigData: {
+            clientModelConfigs: [{label: "Custom Model: ", modelOrAlias: {model: "MODEL_PLACEHOLDER_M318"}}],
+            defaultOverrideModelConfig: {modelOrAlias: {model: "MODEL_PLACEHOLDER_M318"}}
+        }}};
+        const data = new TextEncoder().encode(JSON.stringify(message));
+        const body = new Uint8Array(data.length + 5);
+        new DataView(body.buffer).setUint32(1, data.length); body.set(data, 5);
+        return new Response(body, {headers: {"content-type": "application/grpc-web+json"}});
+    }
+    return new Response("forwarded");
+}};
+vm.runInNewContext(HOOK, {require: () => ({contextBridge: {executeInMainWorld: ({func, args}) => func(...args)}}),
+    window, location, URL, Headers, Request, Response, TextEncoder, TextDecoder, Uint8Array, DataView, Promise});
+(async () => {
+    const route = "/exa.language_server_pb.LanguageServerService/HasAuthToken";
+    const options = {method: "POST", headers: {"content-type": "application/grpc-web+json"}};
+    const response = await window.fetch(route, options);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const length = new DataView(bytes.buffer).getUint32(1);
+    assert.equal(bytes[0], 0);
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(bytes.slice(5, 5 + length))), {hasToken: true});
+    assert.equal(bytes[5 + length], 128);
+    assert.equal(new TextDecoder().decode(bytes.slice(10 + length)), "grpc-status: 0\r\n");
+    const auth = await window.fetch(route.replace("HasAuthToken", "GetAuthStatus"), options);
+    assert.match(new TextDecoder().decode(await auth.arrayBuffer()), /hasValidAuth/);
+    for (const url of ["https://remote.example" + route, "/unrelated", route + "/extra", "/toString"])
+        assert.equal(await (await window.fetch(url, options)).text(), "forwarded");
+    await window.fetch(route, {method: "GET"});
+    await window.fetch(route, {method: "POST", headers: {"content-type": "application/json"}});
+    assert.equal(forwarded, 6);
+    const status = await window.fetch(route.replace("HasAuthToken", "GetUserStatus"), options);
+    const statusBytes = new Uint8Array(await status.arrayBuffer());
+    const userStatus = JSON.parse(new TextDecoder().decode(statusBytes.slice(5))).userStatus;
+    assert.equal(userStatus.fixtureStatus, true);
+    assert.equal(userStatus.cascadeModelConfigData.clientModelConfigs[0].label, "Custom Model: test-model");
+    for (const config of [userStatus.cascadeModelConfigData.clientModelConfigs[0],
+                          userStatus.cascadeModelConfigData.defaultOverrideModelConfig])
+        assert.deepEqual(config.modelOrAlias, {model: "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM"});
+    const abort = new AbortController(); abort.abort();
+    await assert.rejects(window.fetch(route, {...options, signal: abort.signal}));
+})().catch(error => {console.error(error); process.exitCode = 1;});
+'''.replace("HOOK", json.dumps(manager._desktop_api_preload("test-model")))
+        result = manager.subprocess.run([shutil.which("node")], input=script, text=True,
+                                        capture_output=True, timeout=15)
+        if result.returncode == 77:
+            self.skipTest("Preload test requires Node with the standard Fetch API")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_normal_profile_does_not_receive_api_ui_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, archive = DesktopProfileTests.fixture(tmp)
+            _, _, scripts = manager._desktop_profile_scripts(archive, "work")
+            self.assertNotIn("dist/preload.js", scripts)
+            self.assertNotIn("AGY_INSTANCE_API_KEY", scripts["dist/languageServer.js"])
+
+    def test_api_repair_updates_adapter_and_preserves_configuration_and_history(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_api_instances_root", return_value=os.path.join(tmp, "api")),
+              mock.patch.object(manager, "_desktop_profile_sign"),
+              mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(stdout="")),
+              contextlib.redirect_stdout(io.StringIO())):
+            _, server, _ = DesktopProfileTests.fixture(tmp)
+            override = {"manager": server}
+            manager.desktop_profile_create("work", override,
+                {"base_url": "https://proxy.example.com", "model": "gemini-3.8-flash-high"})
+            profile = os.path.join(tmp, "api", "work")
+            archive = os.path.join(profile, "Antigravity.app", "Contents", "Resources", "app.asar")
+            h, p = manager._asar_read(archive)
+            manager._asar_write(archive, h, p, {"dist/preload.js": "const legacyAdapter = true;"})
+            marker = os.path.join(profile, "user-data", "history")
+            _write(marker, b"private fixture history")
+            with open(os.path.join(profile, "api.json"), "rb") as f:
+                original_config = f.read()
+            self.assertEqual(manager.desktop_profile_repair("work", api_instance=True, overrides=override), 0)
+            h, p = manager._asar_read(archive)
+            preload = manager._asar_content(h, p, "dist/preload.js")
+            self.assertIn("MODEL_GOOGLE_GEMINI_INTERNAL_BYOM", preload)
+            self.assertIn("gemini-3.8-flash-high", preload)
+            self.assertNotIn("legacyAdapter", preload)
+            server_script = manager._asar_content(h, p, "dist/languageServer.js")
+            self.assertIn('"--override_model_name", "models/gemini-3.8-flash-high"', server_script)
+            with open(marker, "rb") as f:
+                self.assertEqual(f.read(), b"private fixture history")
+            with open(os.path.join(profile, "api.json"), "rb") as f:
+                self.assertEqual(f.read(), original_config)
+
+    def test_api_configuration_validates_and_normalizes_proxy_url(self):
+        self.assertEqual(manager._desktop_api_config("proxy.example.com/v1/", "provider/model"),
+                         {"base_url": "https://proxy.example.com", "model": "provider/model"})
+        for url in ("http://proxy.example.com", "https://key@proxy.example.com", "https://proxy.example.com?key=secret", "https://proxy.example.com/#fragment"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                manager._desktop_api_config(url, "test-model")
+        with self.assertRaises(ValueError):
+            manager._desktop_api_config("https://proxy.example.com", "model\n--other-option")
+
+    def test_api_creation_uses_separate_root_and_preserves_existing_profile(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=os.path.join(tmp, "profiles")),
+              mock.patch.object(manager, "_desktop_api_instances_root", return_value=os.path.join(tmp, "api")),
+              mock.patch.object(manager, "_desktop_profile_sign"),
+              contextlib.redirect_stdout(io.StringIO())):
+            _, server, archive = DesktopProfileTests.fixture(tmp)
+            with open(archive, "rb") as f:
+                original = f.read()
+            os.makedirs(os.path.join(tmp, "profiles", "work"))
+            marker = os.path.join(tmp, "profiles", "work", "history")
+            _write(marker, b"private fixture history")
+            self.assertEqual(manager.desktop_profile_create("work", {"manager": server},
+                {"base_url": "https://proxy.example.com/v1", "model": "test-model"}), 0)
+            root = os.path.join(tmp, "api", "work")
+            with open(os.path.join(root, "api.json")) as f:
+                self.assertEqual(json.load(f), {"base_url": "https://proxy.example.com", "model": "test-model"})
+            app = os.path.join(root, "Antigravity.app")
+            with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+                plist = plistlib.load(f)
+            self.assertEqual(plist["CFBundleIdentifier"], "com.parsa.agy-api.work")
+            self.assertEqual(plist["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["antigravity-api-work"])
+            h, p = manager._asar_read(os.path.join(app, "Contents", "Resources", "app.asar"))
+            script = manager._asar_content(h, p, "dist/languageServer.js")
+            self.assertIn('"--model_api_client_type", "gemini"', script)
+            self.assertIn('"--override_model_name", "models/test-model"', script)
+            self.assertIn('env["GOOGLE_GEMINI_BASE_URL"] = "https://proxy.example.com"', script)
+            self.assertLess(script.index('delete env[key]'), script.index('env["GEMINI_API_KEY"] ='))
+            self.assertIn('process.env.AGY_INSTANCE_API_KEY', script)
+            self.assertEqual(plist["CFBundleDisplayName"], "Antigravity API work")
+            self.assertIn('contextBridge.executeInMainWorld', manager._asar_content(h, p, 'dist/preload.js'))
+            with open(marker, "rb") as f:
+                self.assertEqual(f.read(), b"private fixture history")
+            with open(archive, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_api_key_is_passed_only_to_api_instance_without_printing_or_saving(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_api_instances_root", return_value=tmp),
+              mock.patch.object(manager, "_desktop_profiles_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "Popen") as launch,
+              mock.patch.dict(os.environ, {"AGY_INSTANCE_API_KEY": "unrelated-fixture-key"}),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            _, server, _ = DesktopProfileTests.fixture(profile)
+            manager._desktop_namespace_credentials(server, profile)
+            _write(os.path.join(profile, "api.json"), b'{"base_url":"https://proxy.example.com","model":"test-model"}')
+            launch.return_value.wait.return_value = 0
+            key = "private-fixture-api-key"
+            self.assertEqual(manager.desktop_profile_open("work", api_key=key, api_instance=True), 0)
+            self.assertEqual(launch.call_args.kwargs["env"]["AGY_INSTANCE_API_KEY"], key)
+            self.assertNotIn(key, repr(launch.call_args.args))
+            with open(os.path.join(profile, "api.json")) as f:
+                self.assertNotIn(key, f.read())
+            self.assertNotIn(key, output.getvalue())
+            self.assertEqual(manager.desktop_profile_open("work"), 0)
+            self.assertNotIn("AGY_INSTANCE_API_KEY", launch.call_args.kwargs["env"])
+
+    def test_api_open_requires_key_without_launching(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager, "_desktop_api_instances_root", return_value=tmp),
+              mock.patch.object(manager.subprocess, "Popen") as launch):
+            profile = os.path.join(tmp, "work")
+            os.mkdir(profile)
+            _, server, _ = DesktopProfileTests.fixture(profile)
+            manager._desktop_namespace_credentials(server, profile)
+            with self.assertRaisesRegex(ValueError, "key"):
+                manager.desktop_profile_open("work", api_instance=True)
             launch.assert_not_called()
 
 
