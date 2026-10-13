@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, errno, filecmp, functools, getpass, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
-from urllib.parse import urlsplit, urlunsplit
+import argparse, base64, contextlib, errno, filecmp, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
 import datetime, math, urllib.error, urllib.parse, urllib.request
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from xml.parsers.expat import ExpatError
 try:
@@ -1502,35 +1500,14 @@ def _desktop_namespace_credentials(path, profile, check_only=False):
                 raise OSError("credential namespace rollback verification failed")
             raise
 
-def _desktop_profile_path(name, root=None):
+def _desktop_profile_path(name):
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", name):
         raise ValueError("profile names must use 1–48 lowercase letters, digits, underscores or hyphens")
-    root = _desktop_profiles_root() if root is None else root
+    root = _desktop_profiles_root()
     path = os.path.join(root, name)
     if os.path.realpath(path) != os.path.join(os.path.realpath(root), name):
         raise ValueError("profile directory must not be a symlink")
     return path
-
-def _desktop_api_instances_root():
-    return os.path.expanduser("~/Library/Application Support/agy-manager/api-instances")
-
-def _desktop_api_config(base_url, model):
-    if not base_url or not model:
-        raise ValueError("API instances require a base URL and model ID")
-    if "://" not in base_url:
-        base_url = "https://" + base_url
-    parsed = urlsplit(base_url)
-    if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-        raise ValueError("base URL must contain only the server address and optional path")
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")):
-        raise ValueError("use HTTPS for remote APIs; HTTP is allowed only on loopback")
-    parsed.port  # Reject malformed ports before creating an app copy.
-    path = parsed.path.rstrip("/")
-    if path.endswith(("/v1", "/v1beta")):
-        path = path.rsplit("/", 1)[0]
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model):
-        raise ValueError("invalid model ID")
-    return {"base_url": urlunsplit((parsed.scheme, parsed.netloc, path, "", "")), "model": model}
 
 def _desktop_profile_namespace_credentials(app, profile):
     server = os.path.join(app, "Contents", "Resources", "bin", "language_server")
@@ -1591,72 +1568,8 @@ def _asar_write(path, header, payload, replacements):
         f.flush(); os.fsync(f.fileno())
     return hashlib.sha256(raw).hexdigest()
 
-def _desktop_api_preload(model):
-    # The verified 2.19.1 UI requires OAuth even when the LS uses Gemini BYOM.
-    # Supply only its local UI session checks; inference still authenticates
-    # against the configured provider and reports invalid keys normally.
-    return r'''require("electron").contextBridge.executeInMainWorld({func: (model) => {
-    const originalFetch = window.fetch;
-    const replies = {
-        "/exa.language_server_pb.LanguageServerService/HasAuthToken": {hasToken: true},
-        "/exa.language_server_pb.LanguageServerService/GetAuthStatus": {authResult: {hasValidAuth: true}},
-        "/exa.language_server_pb.LanguageServerService/GetBuildWithGooglePlugins": {}
-    };
-    window.fetch = function(input, init) {
-        const url = new URL(input instanceof Request ? input.url : input, location.href);
-        const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
-        const method = init?.method || (input instanceof Request ? input.method : "GET");
-        if (location.protocol !== "https:" || location.hostname !== "127.0.0.1" ||
-            url.origin !== location.origin || method !== "POST" ||
-            headers.get("content-type") !== "application/grpc-web+json" ||
-            !(Object.prototype.hasOwnProperty.call(replies, url.pathname) ||
-              url.pathname === "/exa.language_server_pb.LanguageServerService/GetUserStatus")) {
-            return originalFetch.call(this, input, init);
-        }
-        const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
-        if (signal?.aborted) return Promise.reject(signal.reason);
-        if (url.pathname.endsWith("/GetUserStatus")) {
-            return originalFetch.call(this, input, init).then(async response => {
-                // Recognized names can resolve to Google-only model enums.
-                // Preserve real backend status; route this one custom model
-                // through BYOM rather than inventing account or quota data.
-                if (!response.ok || response.headers.get("content-type") !== "application/grpc-web+json") return response;
-                try {
-                    const original = new Uint8Array(await response.clone().arrayBuffer());
-                    if (original.length < 5 || original[0] !== 0) return response;
-                    const length = new DataView(original.buffer).getUint32(1);
-                    if (length > original.length - 5) return response;
-                    const message = JSON.parse(new TextDecoder().decode(original.slice(5, 5 + length)));
-                    const config = message.userStatus?.cascadeModelConfigData;
-                    if (config?.clientModelConfigs?.length !== 1 || !config.defaultOverrideModelConfig) return response;
-                    const alias = {model: "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM"};
-                    config.clientModelConfigs[0].modelOrAlias = alias;
-                    config.clientModelConfigs[0].label = "Custom Model: " + model;
-                    config.defaultOverrideModelConfig.modelOrAlias = alias;
-                    const data = new TextEncoder().encode(JSON.stringify(message));
-                    const body = new Uint8Array(original.length - length + data.length);
-                    new DataView(body.buffer).setUint32(1, data.length);
-                    body.set(data, 5); body.set(original.slice(5 + length), 5 + data.length);
-                    const headers = new Headers(response.headers); headers.delete("content-length");
-                    return new Response(body, {status: response.status, headers});
-                } catch { return response; }
-            });
-        }
-        const data = new TextEncoder().encode(JSON.stringify(replies[url.pathname]));
-        const trailer = new TextEncoder().encode("grpc-status: 0\r\n");
-        const body = new Uint8Array(10 + data.length + trailer.length);
-        new DataView(body.buffer).setUint32(1, data.length);
-        body.set(data, 5);
-        body[5 + data.length] = 128;
-        new DataView(body.buffer).setUint32(6 + data.length, trailer.length);
-        body.set(trailer, 10 + data.length);
-        return Promise.resolve(new Response(body, {headers: {"content-type": "application/grpc-web+json"}}));
-    };
-}, args: [AGY_MODEL_JSON]});
-'''.replace("AGY_MODEL_JSON", json.dumps(model))
 
-
-def _desktop_profile_scripts(archive, name, api_config=None):
+def _desktop_profile_scripts(archive, name):
     header, payload = _asar_read(archive)
     scripts = {n: _asar_content(header, payload, n) for n in
                ("dist/main.js", "dist/paths.js", "dist/languageServer.js", "dist/updater.js")}
@@ -1666,7 +1579,7 @@ def _desktop_profile_scripts(archive, name, api_config=None):
                  'const agyProfileRoot = require("path").resolve(process.resourcesPath, "../../..");\n'
                  'process.umask(0o077);\n'
                  'const agyProfileApp = require("electron").app;\n'
-                 'agyProfileApp.setName(' + json.dumps(("Antigravity API " if api_config is not None else "Antigravity Profile ") + name) + ');\n'
+                 'agyProfileApp.setName(' + json.dumps("Antigravity Profile " + name) + ');\n'
                  'for (const [key, dir] of [["userData", "user-data"], ["logs", "logs"]]) {\n'
                  '  const target = require("path").join(agyProfileRoot, dir);\n'
                  '  require("fs").mkdirSync(target, {recursive: true, mode: 0o700});\n'
@@ -1693,24 +1606,6 @@ def _desktop_profile_scripts(archive, name, api_config=None):
     server = server.replace(env_anchor, env_anchor + '\n        env["SSH_CONNECTION"] = "127.0.0.1 1234 127.0.0.1 22";')
     server = server.replace(env_anchor, env_anchor +
         '\n        for (const key of ["JETSKI_OAUTH_TOKEN", "JETSKI_TEST_GAIA_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]) delete env[key];')
-    if api_config is not None:
-        scripts["dist/preload.js"] = _desktop_api_preload(api_config["model"]) + _asar_content(header, payload, "dist/preload.js")
-        # Bare recognized model names are canonicalized by the backend (for
-        # example, removing "-high"). A Gemini resource name avoids that
-        # lookup; the SDK removes "models/" when constructing the API URL.
-        resource_model = api_config["model"]
-        if not resource_model.startswith("models/"):
-            resource_model = "models/" + resource_model
-        server = server.replace(anchor,
-            '        args.push("--model_api_client_type", "gemini", "--override_model_name", ' + json.dumps(resource_model) + ');\n' + anchor)
-        # Read the launcher key from process.env after shellEnvSync, preventing
-        # a login shell from replacing this instance's key with a global key.
-        server = server.replace('        env["SSH_CONNECTION"]',
-            '        if (!process.env.AGY_INSTANCE_API_KEY) throw new Error("Open this API instance through the manager to supply its key");\n'
-            '        env["GEMINI_API_KEY"] = process.env.AGY_INSTANCE_API_KEY;\n'
-            '        env["GOOGLE_GEMINI_BASE_URL"] = ' + json.dumps(api_config["base_url"]) + ';\n'
-            '        delete env["AGY_INSTANCE_API_KEY"];\n'
-            '        env["SSH_CONNECTION"]')
     scripts["dist/languageServer.js"] = server
     updater = scripts["dist/updater.js"]
     for function in ("initAutoUpdater", "checkForUpdates", "quitAndInstall", "applyHostUpdate", "setAutoUpdateChecking"):
@@ -1763,11 +1658,8 @@ def _desktop_profile_sign(app):
         identifier = plistlib.load(f)["CFBundleIdentifier"]
     _mac_codesign(app, bundle=True, entitlements=entitlements, identifier=identifier)
 
-def desktop_profile_create(name, overrides=None, api_config=None):
-    if api_config is not None:
-        api_config = _desktop_api_config(api_config.get("base_url"), api_config.get("model"))
-    root = _desktop_api_instances_root() if api_config is not None else _desktop_profiles_root()
-    profile = _desktop_profile_path(name, root)
+def desktop_profile_create(name, overrides=None):
+    profile = _desktop_profile_path(name)
     if os.path.lexists(profile):
         raise ValueError("profile already exists; use open to launch it")
     source = resolve("manager", (overrides or {}).get("manager"))
@@ -1779,7 +1671,8 @@ def desktop_profile_create(name, overrides=None, api_config=None):
     if plist.get("CFBundleShortVersionString") != "2.19.1":
         raise ValueError("isolated desktop profiles currently support verified Antigravity 2.19.1 only")
     archive = os.path.join(app, "Contents", "Resources", "app.asar")
-    header, payload, scripts = _desktop_profile_scripts(archive, name, api_config)
+    header, payload, scripts = _desktop_profile_scripts(archive, name)
+    root = _desktop_profiles_root()
     os.makedirs(root, mode=0o700, exist_ok=True)
     temp = tempfile.mkdtemp(prefix=".creating-", dir=root)
     try:
@@ -1788,12 +1681,12 @@ def desktop_profile_create(name, overrides=None, api_config=None):
         shutil.copytree(app, copied, symlinks=True)
         _desktop_profile_namespace_credentials(copied, profile)
         digest = _asar_write(os.path.join(copied, "Contents", "Resources", "app.asar"), header, payload, scripts)
-        identity = ("com.parsa.agy-api." if api_config is not None else "com.parsa.agy-profile.") + name
+        identity = "com.parsa.agy-profile." + name
         original_identity = plist["CFBundleIdentifier"]
         # Electron resolves bundled helper executables using CFBundleName.
         # Keep that vendor name; only the displayed name identifies the profile.
-        plist.update(CFBundleIdentifier=identity, CFBundleDisplayName=("Antigravity API " if api_config is not None else "Antigravity Profile ") + name,
-                     CFBundleURLTypes=[{"CFBundleURLName": identity, "CFBundleURLSchemes": [("antigravity-api-" if api_config is not None else "antigravity-profile-") + name]}])
+        plist.update(CFBundleIdentifier=identity, CFBundleDisplayName="Antigravity Profile " + name,
+                     CFBundleURLTypes=[{"CFBundleURLName": identity, "CFBundleURLSchemes": ["antigravity-profile-" + name]}])
         plist["ElectronAsarIntegrity"] = {"Resources/app.asar": {"algorithm": "SHA256", "hash": digest}}
         plist.pop("ElectronTeamID", None)
         with open(os.path.join(copied, "Contents", "Info.plist"), "wb") as f:
@@ -1816,11 +1709,6 @@ def desktop_profile_create(name, overrides=None, api_config=None):
         _desktop_profile_sign(copied)
         for directory in ("gemini", "user-data", "logs", "browser"):
             os.mkdir(os.path.join(temp, directory), 0o700)
-        if api_config is not None:
-            with open(os.path.join(temp, "api.json"), "x", encoding="utf-8") as f:
-                json.dump(api_config, f)
-                f.flush(); os.fsync(f.fileno())
-            os.chmod(os.path.join(temp, "api.json"), 0o600)
         # Exclusive publication protects a concurrently created profile.
         os.mkdir(profile, 0o700)
         try:
@@ -1829,14 +1717,13 @@ def desktop_profile_create(name, overrides=None, api_config=None):
         except Exception:
             shutil.rmtree(profile)
             raise
-        ok(f"created API instance '{name}' — open it through the manager" if api_config is not None else
-           f"created desktop profile '{name}' — open it and sign in separately")
+        ok(f"created desktop profile '{name}' — open it and sign in separately")
         return 0
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
-def desktop_profile_open(name, api_key=None, api_instance=False):
-    profile = _desktop_profile_path(name, _desktop_api_instances_root()) if api_instance else _desktop_profile_path(name)
+def desktop_profile_open(name):
+    profile = _desktop_profile_path(name)
     app = os.path.join(profile, "Antigravity.app")
     if not os.path.isdir(app):
         raise ValueError("profile not found; create it first")
@@ -1845,13 +1732,6 @@ def desktop_profile_open(name, api_key=None, api_instance=False):
     # Direct execution preserves launch environment and lets each profile's
     # own Electron lock focus only its existing window on repeated launches.
     env = os.environ.copy()
-    env.pop("AGY_INSTANCE_API_KEY", None)
-    if api_instance:
-        if not api_key or not api_key.strip():
-            raise ValueError("an API key is required")
-        if not os.path.isfile(os.path.join(profile, "api.json")):
-            raise ValueError("API instance configuration is missing")
-        env["AGY_INSTANCE_API_KEY"] = api_key
     for key in ("DEV_URL", "ELECTRON_RUN_AS_NODE", "ELECTRON_OZONE_PLATFORM_HINT"):
         env.pop(key, None)
     child = subprocess.Popen([executable], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1863,45 +1743,11 @@ def desktop_profile_open(name, api_key=None, api_instance=False):
     if code:
         warn(f"desktop profile failed to start (exit {code}); check its private logs")
         return 1
-    ok(f"opened API instance '{name}'" if api_instance else f"opened desktop profile '{name}'")
+    ok(f"opened desktop profile '{name}'")
     return 0
 
-def run_api_instances(argv, overrides=None, base_url=None, model=None, key_env=None, api_key=None):
-    if sys.platform != "darwin" or os.geteuid() == 0:
-        warn("API instances currently require macOS and must run without sudo")
-        return 2
-    try:
-        if len(argv) != 2 or argv[0] not in ("create", "open", "repair"):
-            raise ValueError("usage: api create <name> --base-url <url> --model <id> | api open <name> [--api-key-env <variable>] | api repair <name>")
-        if argv[0] == "create":
-            if key_env is not None:
-                raise ValueError("--api-key-env is only used when opening an API instance")
-            return desktop_profile_create(argv[1], overrides, _desktop_api_config(base_url, model))
-        if base_url is not None or model is not None:
-            raise ValueError("base URL and model are configured when creating an API instance")
-        if argv[0] == "repair":
-            if key_env is not None:
-                raise ValueError("repair does not require an API key")
-            return desktop_profile_repair(argv[1], api_instance=True, overrides=overrides)
-        if api_key is not None:
-            key = api_key
-        elif key_env:
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
-                raise ValueError("invalid API key environment variable name")
-            key = os.environ.get(key_env)
-        elif sys.stdin.isatty():
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", getpass.GetPassWarning)
-                key = getpass.getpass("API key (not saved): ")
-        else:
-            raise ValueError("open in a terminal to enter the key, or use --api-key-env")
-        return desktop_profile_open(argv[1], api_key=key, api_instance=True)
-    except (OSError, ValueError, LookupError, subprocess.SubprocessError, getpass.GetPassWarning) as e:
-        warn(f"API instance error: {e}")
-        return 1
-
-def desktop_profile_repair(name, api_instance=False, overrides=None):
-    profile = _desktop_profile_path(name, _desktop_api_instances_root()) if api_instance else _desktop_profile_path(name)
+def desktop_profile_repair(name):
+    profile = _desktop_profile_path(name)
     app = os.path.join(profile, "Antigravity.app")
     if os.path.realpath(app) != os.path.join(os.path.realpath(profile), "Antigravity.app"):
         raise ValueError("profile app must not be a symlink")
@@ -1909,29 +1755,10 @@ def desktop_profile_repair(name, api_instance=False, overrides=None):
     result = subprocess.run(["/bin/ps", "-axo", "command="], capture_output=True, text=True, check=True)
     if any(line.strip().startswith(app + os.sep) for line in result.stdout.splitlines()):
         raise ValueError("close this extra profile by quitting its app (⌘Q); it is still running in the background — closing windows is not enough; keep your main app open")
-    if api_instance:
-        with open(os.path.join(profile, "api.json"), encoding="utf-8") as f:
-            config = json.load(f)
-        config = _desktop_api_config(config.get("base_url"), config.get("model"))
-        source = _mac_app_bundle(resolve("manager", (overrides or {}).get("manager")))
-        if not source:
-            raise ValueError("installed desktop app not found")
-        with open(os.path.join(source, "Contents", "Info.plist"), "rb") as f:
-            if plistlib.load(f).get("CFBundleShortVersionString") != "2.19.1":
-                raise ValueError("API repair requires the verified desktop 2.19.1 build")
-        header, payload, scripts = _desktop_profile_scripts(os.path.join(source, "Contents", "Resources", "app.asar"), name, config)
     with tempfile.TemporaryDirectory(prefix=".repair-", dir=profile) as temp:
         copied = os.path.join(temp, "Antigravity.app")
         shutil.copytree(app, copied, symlinks=True)
         _desktop_profile_namespace_credentials(copied, profile)
-        if api_instance:
-            digest = _asar_write(os.path.join(copied, "Contents", "Resources", "app.asar"), header, payload, scripts)
-            info = os.path.join(copied, "Contents", "Info.plist")
-            with open(info, "rb") as f:
-                plist = plistlib.load(f)
-            plist["ElectronAsarIntegrity"] = {"Resources/app.asar": {"algorithm": "SHA256", "hash": digest}}
-            with open(info, "wb") as f:
-                plistlib.dump(plist, f)
         _desktop_profile_sign(copied)
         # Keep the original outside automatic cleanup until rollback succeeds.
         recovery = tempfile.mkdtemp(prefix=".recovery-", dir=profile)
@@ -1954,8 +1781,7 @@ def desktop_profile_repair(name, api_instance=False, overrides=None):
             shutil.rmtree(recovery)
             raise
         shutil.rmtree(recovery)
-    ok(f"repaired API instance '{name}' — reopen it through the manager" if api_instance else
-       f"repaired credential isolation for '{name}' — reopen it and sign into the other account")
+    ok(f"repaired credential isolation for '{name}' — reopen it and sign into the other account")
     return 0
 
 def run_desktop_accounts(argv, overrides=None):
@@ -2542,7 +2368,7 @@ def _mac_run_patch(targets, overrides, disable_library_validation=False):
 def _mac_is_isolated_profile(app):
     with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
         return plistlib.load(f).get("CFBundleIdentifier", "").startswith(
-            ("com.parsa.agy-profile.", "com.parsa.agy-api."))
+            "com.parsa.agy-profile.")
 
 
 def _mac_run_restore(targets, overrides):
@@ -2864,9 +2690,6 @@ def _accounts_menu(console, qs, usage=None, overrides=None):
                 questionary.Choice("Create isolated profile", "create"),
                 questionary.Choice("Open profile", "open"),
                 questionary.Choice("Repair profile login isolation", "repair"),
-                questionary.Choice("Create API instance", "api-create"),
-                questionary.Choice("Open API instance", "api-open"),
-                questionary.Choice("Repair API instance", "api-repair"),
                 questionary.Choice("Back", "back"),
             ]))
             if act in (None, "back"):
@@ -2877,22 +2700,7 @@ def _accounts_menu(console, qs, usage=None, overrides=None):
                 if not name:
                     continue
                 args.append(name.strip())
-            if act.startswith("api-"):
-                base_url = model = None
-                if act == "api-create":
-                    base_url = _tui_ask(console, questionary.text("API base URL:", style=qs))
-                    model = _tui_ask(console, questionary.text("Model ID:", style=qs))
-                    if not base_url or not model:
-                        continue
-                key = None
-                if act == "api-open":
-                    key = _tui_ask(console, questionary.password("API key (not saved):", style=qs))
-                    if not key:
-                        continue
-                _tui_run(console, "Updating API instance…", run_api_instances,
-                         [act[4:], args[1]], overrides, base_url, model, api_key=key)
-            else:
-                _tui_run(console, "Updating desktop profile…", run_desktop_accounts, args, overrides)
+            _tui_run(console, "Updating desktop profile…", run_desktop_accounts, args, overrides)
             _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
     if os.name != "nt":
         console.print("[yellow]Account management is Windows-only.[/]")
@@ -3289,15 +3097,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Manage the Antigravity environment (patch location gates and manage profiles). "
                     "Run with no arguments for the interactive menu.")
-    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts", "api"), nargs="?",
+    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts"), nargs="?",
                     help="menu (default) | status | patch | restore | accounts manager <list|create|open|repair> [name] (macOS) | "
                          "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]")
     ap.add_argument("targets", nargs="*", default=[], metavar="{" + ",".join(TARGETS) + "}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
-    ap.add_argument("--base-url", help="Gemini-compatible proxy base URL for a new API instance")
-    ap.add_argument("--model", help="exact proxy model ID for a new API instance")
-    ap.add_argument("--api-key-env", help="environment variable containing the API-instance key (the key is not saved)")
     ap.add_argument("--macos-disable-library-validation", action="store_true",
                     help="allow an Electron app's main executable to load other/unsigned libraries after ad-hoc signing (macOS patch/menu only)")
     args = ap.parse_args(argv)
@@ -3305,13 +3110,8 @@ def main(argv=None):
     if args.macos_disable_library_validation and (sys.platform != "darwin" or args.action not in (None, "menu", "patch")):
         ap.error("--macos-disable-library-validation is only available for patch/menu on macOS")
 
-    if args.action != "api" and (args.base_url is not None or args.model is not None or args.api_key_env is not None):
-        ap.error("--base-url, --model and --api-key-env are only available for API instances")
     if args.action == "accounts":
         return run_accounts(args.targets, {t: getattr(args, f"path_{t}") for t in TARGETS})
-    if args.action == "api":
-        return run_api_instances(args.targets, {t: getattr(args, f"path_{t}") for t in TARGETS},
-                                 args.base_url, args.model, args.api_key_env)
 
     bad = [t for t in args.targets if t not in TARGETS]
     if bad:
