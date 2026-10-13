@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Patch Antigravity eligibility gates and manage Windows login profiles."""
 from __future__ import annotations
-import argparse, base64, contextlib, errno, functools, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
+import argparse, base64, contextlib, errno, filecmp, functools, getpass, glob, hashlib, json, mmap, os, plistlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time
+from urllib.parse import urlsplit, urlunsplit
 import datetime, math, urllib.error, urllib.parse, urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from xml.parsers.expat import ExpatError
 try:
@@ -27,18 +29,41 @@ def _patch_success(app, change, offset):
 def _bin(name):
     return name + (".exe" if os.name == "nt" else "")
 
+def _mac_write_permission_hint(path, error):
+    if (sys.platform == "darwin" and error.errno == errno.EPERM and
+            _mac_app_bundle(path)):
+        warn("macOS blocked modification of an app bundle; App Management permission may be required")
+        info("open System Settings > Privacy & Security > App Management and enable the app running this command "
+             "(your terminal app, or your editor when using its integrated terminal)")
+        info("quit and reopen that terminal/editor, then retry; sudo does not grant macOS privacy permissions")
+        return True
+    return False
+
 def is_locked(path, app=None):
     """Check write access, optionally reporting why the file cannot be opened."""
     try:
         with open(path, "r+b"):
             return False
     except OSError as e:
+        # macOS can deny opening a signed executable for in-place writes even
+        # when its owner can replace it. Probe the directory without touching it.
+        if sys.platform == "darwin" and e.errno == errno.EPERM:
+            try:
+                actual = os.path.realpath(path)
+                fd, probe = tempfile.mkstemp(prefix=".agy-write-", dir=os.path.dirname(actual))
+                os.close(fd)
+                os.unlink(probe)
+                return False
+            except OSError as probe_error:
+                if app:
+                    warn(f"cannot create a temporary replacement in {os.path.dirname(actual)}: {probe_error}")
         if app:
             if e.errno == errno.ETXTBSY or getattr(e, "winerror", None) in (32, 33):
                 warn(f"{os.path.basename(path)} is in use — close {app} and its background processes first")
             elif e.errno in (errno.EACCES, errno.EPERM):
-                warn(f"permission denied writing {path} — use an account with write access to the installation")
-                info("check file permissions and directory permissions for the backup")
+                if not _mac_write_permission_hint(path, e):
+                    warn(f"permission denied writing {path} — use an account with write access to the installation")
+                    info("check file permissions and directory permissions for the backup")
             else:
                 warn(f"cannot open {path} for writing")
             warn(f"system error: {e}")
@@ -113,11 +138,46 @@ def make_backup(path, binary=False):
         raise OSError("backup verification failed")
     return bak
 
+@contextlib.contextmanager
+def _mac_staged_binary(path):
+    """Create a private sibling inode; leave the installed binary untouched."""
+    fd, staged = tempfile.mkstemp(prefix=".agy-write-", dir=os.path.dirname(path))
+    os.close(fd)
+    try:
+        yield staged
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+
+def _copy_binary(src, dst):
+    if sys.platform != "darwin":
+        shutil.copy2(src, dst)
+        return
+    dst = os.path.realpath(dst)
+    with _mac_staged_binary(dst) as staged:
+        shutil.copy2(src, staged)
+        if not filecmp.cmp(src, staged, shallow=False):
+            raise OSError("replacement copy verification failed")
+        with open(staged, "r+b") as f:
+            f.flush(); os.fsync(f.fileno())
+        os.replace(staged, dst)
+
 def restore_file(path, status=None):
+    if sys.platform == "darwin":
+        path = os.path.realpath(path)
     b = path + BAK
     if not os.path.exists(b):
         warn(f"no backup for {os.path.basename(path)} (nothing to restore)")
         return False
+    if sys.platform == "darwin":
+        app = _mac_app_bundle(path)
+        if app and os.path.basename(path) == "language_server":
+            if _mac_is_isolated_profile(app):
+                try:
+                    _desktop_namespace_credentials(b, os.path.dirname(app), check_only=True)
+                except (OSError, ValueError, LookupError) as e:
+                    warn(f"backup would break profile credential isolation — refusing to restore: {e}")
+                    return False
     if is_locked(path, "the app"):
         return False
     if status:
@@ -127,7 +187,7 @@ def restore_file(path, status=None):
                 return False
         except Exception as e:
             warn(f"couldn't validate backup: {e}"); return False
-    shutil.copy2(b, path)
+    _copy_binary(b, path)
     if status and status(path)[0] != "unpatched":
         warn("restore verification failed")
         return False
@@ -468,6 +528,8 @@ def gate_status(path, gate):
         return ("unknown", None)
 
 def gate_patch(path, gate, app, fname):
+    if sys.platform == "darwin":
+        path = os.path.realpath(path)
     if is_locked(path, app):
         return False
     try:
@@ -495,16 +557,37 @@ def gate_patch(path, gate, app, fname):
         return False
 
 def _gate_write(path, gate, off, g, before, app):
+    write_started = False
     try:
         if not _files_equal(path, before):
             raise OSError("target changed after backup")
-        ranges, arch = executable_info(path)
-        with open(path, "r+b") as f:
-            with _scan_data(f) as data:
-                current_kind, current_off, current_gate = gate.resolve(data, ranges, arch)
-            if current_kind != "unpatched" or current_off != off or current_gate is not g:
-                raise OSError("target changed before patch write")
-            f.seek(off); f.write(g.fix); f.flush(); os.fsync(f.fileno())
+        staging = _mac_staged_binary(path) if sys.platform == "darwin" else contextlib.nullcontext(path)
+        with staging as writable:
+            if writable != path:
+                shutil.copy2(path, writable)
+                if not _files_equal(writable, before):
+                    raise OSError("target changed while staging patch")
+            ranges, arch = executable_info(writable)
+            with open(writable, "r+b") as f:
+                with _scan_data(f) as data:
+                    current_kind, current_off, current_gate = gate.resolve(data, ranges, arch)
+                if current_kind != "unpatched" or current_off != off or current_gate is not g:
+                    raise OSError("target changed before patch write")
+                f.seek(off)
+                if writable == path:
+                    write_started = True
+                f.write(g.fix); f.flush(); os.fsync(f.fileno())
+            if writable != path:
+                with mapped(writable) as data:
+                    if gate.resolve(data, ranges, arch) != ("patched", off, g):
+                        raise OSError("staged signature verification failed")
+                ranges, arch = executable_info(path)
+                with mapped(path) as data:
+                    current = gate.resolve(data, ranges, arch)
+                if current != ("unpatched", off, g) or not _files_equal(path, before):
+                    raise OSError("target changed before patch replacement")
+                os.replace(writable, path)
+                write_started = True
         ranges, arch = executable_info(path)
         with mapped(path) as d:
             final_kind, final_off, final_gate = gate.resolve(d, ranges, arch)
@@ -512,13 +595,16 @@ def _gate_write(path, gate, off, g, before, app):
             raise OSError("post-write signature verification failed")
     except Exception as e:
         try:
-            shutil.copy2(before, path)
+            if write_started:
+                _copy_binary(before, path)
             rolled_back = _files_equal(path, before)
         except Exception:
             rolled_back = False
         warn(f"{app} patch failed: {e}")
+        if isinstance(e, OSError):
+            _mac_write_permission_hint(path, e)
         warn("state before this patch restored" if rolled_back else
-             f"automatic rollback failed — restore {os.path.basename(path)}{BAK} manually")
+             f"automatic rollback failed — restore {os.path.basename(path) + BAK} manually")
         return False
     _patch_success(app, g.desc, off)
     return True
@@ -1331,7 +1417,574 @@ def acct_logout(target_type):
            "sign into the next account, then `accounts ide save <name>`")
     return 0
 
-def run_accounts(argv):
+def _desktop_profiles_root():
+    return os.path.expanduser("~/Library/Application Support/agy-manager/profiles")
+
+# Manager 2.19.1 macOS arm64: adrp/add x3 load the fallback filename;
+# mov x4,#29 supplies its length before filepath.Join. Use a 28-byte private
+# filename instead. The ADRP displacement varies with the executable layout.
+DESKTOP_TOKEN_GATE_ARM64 = Gate(
+    rb"[\x03\x23\x43\x63\x83\xa3\xc3\xe3]..[\x90\xb0\xd0\xf0]\x63\xc8\x3d\x91"
+    rb"\xa4\x03\x80\xd2\xe3\x93\x06\xa9\xe0\x23\x01\x91\xe1\x07\x40\xb2"
+    rb"\xe2\x03\x01\xaa...[\x94-\x97]\xe1\x83\x03\xa9",
+    rb"[\x03\x23\x43\x63\x83\xa3\xc3\xe3]..[\x90\xb0\xd0\xf0]\x63\xc8\x3d\x91"
+    rb"\x84\x03\x80\xd2\xe3\x93\x06\xa9\xe0\x23\x01\x91\xe1\x07\x40\xb2"
+    rb"\xe2\x03\x01\xaa...[\x94-\x97]\xe1\x83\x03\xa9",
+    b"\x84\x03\x80\xd2", offset=8, desc="private fallback credential filename", arch="arm64")
+
+def _desktop_token_name(profile):
+    return ("agy-profile-" + hashlib.sha256(os.path.realpath(profile).encode()).hexdigest()[:16]).encode("ascii")
+
+def _desktop_token_location(data, ranges, arch):
+    if arch != "arm64" or data[:4] != b"\xcf\xfa\xed\xfe":
+        raise ValueError("credential-isolated profiles currently require verified macOS ARM64 2.19.1")
+    state, write_offset, gate = DESKTOP_TOKEN_GATE_ARM64.resolve(data, ranges, arch)
+    instruction_offset = write_offset - 8
+    segments = []
+    pos = 32
+    for _ in range(struct.unpack_from("<I", data, 16)[0]):
+        command, size = struct.unpack_from("<II", data, pos)
+        if command == 0x19:
+            vm, _, file_offset, file_size = struct.unpack_from("<QQQQ", data, pos + 24)
+            segments.append((vm, file_offset, file_size))
+        pos += size
+    instruction_addresses = [vm + instruction_offset - off for vm, off, size in segments
+                             if off <= instruction_offset < off + size]
+    if len(instruction_addresses) != 1:
+        raise ValueError("ambiguous credential constructor address")
+    adrp, add = struct.unpack_from("<II", data, instruction_offset)
+    displacement = ((adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 3)
+    if displacement & (1 << 20):
+        displacement -= 1 << 21
+    address = (instruction_addresses[0] & ~0xfff) + (displacement << 12) + ((add >> 10) & 0xfff)
+    locations = [off + address - vm for vm, off, size in segments if vm <= address and address + 29 <= vm + size]
+    if len(locations) != 1:
+        raise ValueError("ambiguous credential filename address")
+    return state, write_offset, locations[0]
+
+def _desktop_namespace_credentials(path, profile, check_only=False):
+    ranges, arch = executable_info(path)
+    with mapped(path) as data:
+        state, write_offset, name_offset = _desktop_token_location(data, ranges, arch)
+        current = data[name_offset:name_offset + 29]
+    private = _desktop_token_name(profile) + b"\0"
+    if state == "patched":
+        if current != private:
+            raise ValueError("credential namespace belongs to a different profile")
+        return
+    if current != b"jetski-standalone-oauth-token":
+        raise ValueError("unsupported credential fallback filename")
+    if check_only:
+        raise ValueError("profile needs credential isolation repair — close its window, then run accounts manager repair <name>")
+    with _mac_staged_binary(path) as backup, _mac_staged_binary(path) as staged:
+        shutil.copy2(path, backup)
+        if not filecmp.cmp(path, backup, shallow=False):
+            raise OSError("credential isolation backup verification failed")
+        shutil.copy2(backup, staged)
+        with open(staged, "r+b") as f:
+            data = f.read()
+            if _desktop_token_location(data, ranges, arch) != (state, write_offset, name_offset) or data[name_offset:name_offset + 29] != current:
+                raise OSError("credential constructor changed before write")
+            f.seek(name_offset); f.write(private)
+            f.seek(write_offset); f.write(DESKTOP_TOKEN_GATE_ARM64.fix)
+            f.flush(); os.fsync(f.fileno())
+        _desktop_namespace_credentials(staged, profile, check_only=True)
+        # Rescan the installed copy before replacing it; the source is read-only.
+        with mapped(path) as data:
+            if _desktop_token_location(data, ranges, arch) != (state, write_offset, name_offset) or data[name_offset:name_offset + 29] != current or not filecmp.cmp(path, backup, shallow=False):
+                raise OSError("credential constructor changed before replacement")
+        os.replace(staged, path)
+        try:
+            _desktop_namespace_credentials(path, profile, check_only=True)
+        except Exception:
+            _copy_binary(backup, path)
+            if not filecmp.cmp(backup, path, shallow=False):
+                raise OSError("credential namespace rollback verification failed")
+            raise
+
+def _desktop_profile_path(name, root=None):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", name):
+        raise ValueError("profile names must use 1–48 lowercase letters, digits, underscores or hyphens")
+    root = _desktop_profiles_root() if root is None else root
+    path = os.path.join(root, name)
+    if os.path.realpath(path) != os.path.join(os.path.realpath(root), name):
+        raise ValueError("profile directory must not be a symlink")
+    return path
+
+def _desktop_api_instances_root():
+    return os.path.expanduser("~/Library/Application Support/agy-manager/api-instances")
+
+def _desktop_api_config(base_url, model):
+    if not base_url or not model:
+        raise ValueError("API instances require a base URL and model ID")
+    if "://" not in base_url:
+        base_url = "https://" + base_url
+    parsed = urlsplit(base_url)
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("base URL must contain only the server address and optional path")
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")):
+        raise ValueError("use HTTPS for remote APIs; HTTP is allowed only on loopback")
+    parsed.port  # Reject malformed ports before creating an app copy.
+    path = parsed.path.rstrip("/")
+    if path.endswith(("/v1", "/v1beta")):
+        path = path.rsplit("/", 1)[0]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model):
+        raise ValueError("invalid model ID")
+    return {"base_url": urlunsplit((parsed.scheme, parsed.netloc, path, "", "")), "model": model}
+
+def _desktop_profile_namespace_credentials(app, profile):
+    server = os.path.join(app, "Contents", "Resources", "bin", "language_server")
+    for path in (server, server + BAK):
+        if path == server or os.path.lexists(path):
+            if os.path.islink(path):
+                raise ValueError("profile backend and backup must not be symlinks")
+            _desktop_namespace_credentials(path, profile)
+
+def _asar_read(path):
+    with open(path, "rb") as f:
+        prefix = f.read(16)
+        if len(prefix) != 16:
+            raise ValueError("truncated ASAR header")
+        size, header_size, payload_size, json_size = struct.unpack("<4I", prefix)
+        if size != 4 or header_size != payload_size + 4 or not 0 < json_size <= payload_size - 4 <= 32 * 1024 * 1024:
+            raise ValueError("unsupported ASAR header")
+        header = json.loads(f.read(json_size))
+        f.seek(8 + header_size)
+        return header, f.read()
+
+def _asar_entry(header, name):
+    item = header
+    for part in name.split("/"):
+        item = item["files"][part]
+    if "offset" not in item or item.get("unpacked") or "link" in item:
+        raise ValueError(f"unsupported ASAR entry: {name}")
+    return item
+
+def _asar_content(header, payload, name):
+    item = _asar_entry(header, name)
+    offset, size = int(item["offset"]), item["size"]
+    if offset < 0 or size < 0 or offset + size > len(payload):
+        raise ValueError("ASAR entry outside payload")
+    data = payload[offset:offset + size]
+    integrity = item.get("integrity")
+    if integrity and (integrity.get("algorithm") != "SHA256" or
+                      hashlib.sha256(data).hexdigest() != integrity.get("hash")):
+        raise ValueError(f"ASAR integrity verification failed: {name}")
+    return data.decode("utf-8")
+
+def _asar_write(path, header, payload, replacements):
+    for name, content in replacements.items():
+        item = _asar_entry(header, name)
+        data = content.encode("utf-8")
+        item.update(offset=str(len(payload)), size=len(data))
+        block_size = 4 * 1024 * 1024
+        item["integrity"] = {"algorithm": "SHA256", "hash": hashlib.sha256(data).hexdigest(),
+                             "blockSize": block_size,
+                             "blocks": [hashlib.sha256(data[i:i + block_size]).hexdigest()
+                                        for i in range(0, len(data), block_size)]}
+        payload += data
+    raw = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    padded = raw + b"\0" * (-len(raw) % 4)
+    pickle = struct.pack("<II", len(padded) + 4, len(raw)) + padded
+    with open(path, "wb") as f:
+        f.write(struct.pack("<II", 4, len(pickle)) + pickle + payload)
+        f.flush(); os.fsync(f.fileno())
+    return hashlib.sha256(raw).hexdigest()
+
+def _desktop_api_preload(model):
+    # The verified 2.19.1 UI requires OAuth even when the LS uses Gemini BYOM.
+    # Supply only its local UI session checks; inference still authenticates
+    # against the configured provider and reports invalid keys normally.
+    return r'''require("electron").contextBridge.executeInMainWorld({func: (model) => {
+    const originalFetch = window.fetch;
+    const replies = {
+        "/exa.language_server_pb.LanguageServerService/HasAuthToken": {hasToken: true},
+        "/exa.language_server_pb.LanguageServerService/GetAuthStatus": {authResult: {hasValidAuth: true}},
+        "/exa.language_server_pb.LanguageServerService/GetBuildWithGooglePlugins": {}
+    };
+    window.fetch = function(input, init) {
+        const url = new URL(input instanceof Request ? input.url : input, location.href);
+        const headers = new Headers(init?.headers || (input instanceof Request ? input.headers : undefined));
+        const method = init?.method || (input instanceof Request ? input.method : "GET");
+        if (location.protocol !== "https:" || location.hostname !== "127.0.0.1" ||
+            url.origin !== location.origin || method !== "POST" ||
+            headers.get("content-type") !== "application/grpc-web+json" ||
+            !(Object.prototype.hasOwnProperty.call(replies, url.pathname) ||
+              url.pathname === "/exa.language_server_pb.LanguageServerService/GetUserStatus")) {
+            return originalFetch.call(this, input, init);
+        }
+        const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
+        if (signal?.aborted) return Promise.reject(signal.reason);
+        if (url.pathname.endsWith("/GetUserStatus")) {
+            return originalFetch.call(this, input, init).then(async response => {
+                // Recognized names can resolve to Google-only model enums.
+                // Preserve real backend status; route this one custom model
+                // through BYOM rather than inventing account or quota data.
+                if (!response.ok || response.headers.get("content-type") !== "application/grpc-web+json") return response;
+                try {
+                    const original = new Uint8Array(await response.clone().arrayBuffer());
+                    if (original.length < 5 || original[0] !== 0) return response;
+                    const length = new DataView(original.buffer).getUint32(1);
+                    if (length > original.length - 5) return response;
+                    const message = JSON.parse(new TextDecoder().decode(original.slice(5, 5 + length)));
+                    const config = message.userStatus?.cascadeModelConfigData;
+                    if (config?.clientModelConfigs?.length !== 1 || !config.defaultOverrideModelConfig) return response;
+                    const alias = {model: "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM"};
+                    config.clientModelConfigs[0].modelOrAlias = alias;
+                    config.clientModelConfigs[0].label = "Custom Model: " + model;
+                    config.defaultOverrideModelConfig.modelOrAlias = alias;
+                    const data = new TextEncoder().encode(JSON.stringify(message));
+                    const body = new Uint8Array(original.length - length + data.length);
+                    new DataView(body.buffer).setUint32(1, data.length);
+                    body.set(data, 5); body.set(original.slice(5 + length), 5 + data.length);
+                    const headers = new Headers(response.headers); headers.delete("content-length");
+                    return new Response(body, {status: response.status, headers});
+                } catch { return response; }
+            });
+        }
+        const data = new TextEncoder().encode(JSON.stringify(replies[url.pathname]));
+        const trailer = new TextEncoder().encode("grpc-status: 0\r\n");
+        const body = new Uint8Array(10 + data.length + trailer.length);
+        new DataView(body.buffer).setUint32(1, data.length);
+        body.set(data, 5);
+        body[5 + data.length] = 128;
+        new DataView(body.buffer).setUint32(6 + data.length, trailer.length);
+        body.set(trailer, 10 + data.length);
+        return Promise.resolve(new Response(body, {headers: {"content-type": "application/grpc-web+json"}}));
+    };
+}, args: [AGY_MODEL_JSON]});
+'''.replace("AGY_MODEL_JSON", json.dumps(model))
+
+
+def _desktop_profile_scripts(archive, name, api_config=None):
+    header, payload = _asar_read(archive)
+    scripts = {n: _asar_content(header, payload, n) for n in
+               ("dist/main.js", "dist/paths.js", "dist/languageServer.js", "dist/updater.js")}
+    if scripts["dist/main.js"].count("electron_1.app.requestSingleInstanceLock()") != 1:
+        raise ValueError("unsupported desktop instance-lock layout")
+    bootstrap = ('"use strict";\n'
+                 'const agyProfileRoot = require("path").resolve(process.resourcesPath, "../../..");\n'
+                 'process.umask(0o077);\n'
+                 'const agyProfileApp = require("electron").app;\n'
+                 'agyProfileApp.setName(' + json.dumps(("Antigravity API " if api_config is not None else "Antigravity Profile ") + name) + ');\n'
+                 'for (const [key, dir] of [["userData", "user-data"], ["logs", "logs"]]) {\n'
+                 '  const target = require("path").join(agyProfileRoot, dir);\n'
+                 '  require("fs").mkdirSync(target, {recursive: true, mode: 0o700});\n'
+                 '  agyProfileApp.setPath(key, target);\n'
+                 '}\n')
+    scripts["dist/main.js"] = bootstrap + scripts["dist/main.js"]
+    paths = scripts["dist/paths.js"]
+    old = "path_1.default.join(os_1.default.homedir(), '.gemini',"
+    if paths.count(old) != 5:
+        raise ValueError("unsupported desktop storage layout")
+    scripts["dist/paths.js"] = ('const agyGeminiRoot = require("path").resolve(process.resourcesPath, "../../../gemini");\n' +
+                                paths.replace(old, "path_1.default.join(agyGeminiRoot,"))
+    server = scripts["dist/languageServer.js"]
+    anchor = "        // Point the LS at the main process' host bridge server."
+    env_anchor = "        env['AGY_BROWSER_ACTIVE_PORT_FILE'] = (0, paths_1.getActivePortFilePath)();"
+    if server.count(anchor) != 1 or server.count(env_anchor) != 1:
+        raise ValueError("unsupported desktop language-server launch layout")
+    server = server.replace(anchor,
+        '        const agyRoot = require("path").resolve(process.resourcesPath, "../../..");\n'
+        '        args.push("--gemini_dir", require("path").join(agyRoot, "gemini"),\n'
+        '                  "--local_chrome_user_data_dir", require("path").join(agyRoot, "browser"));\n' + anchor)
+    # Set this after shellEnvSync: an inherited shell environment must never
+    # restore shared Keychain access. The backend's SSH detector uses file tokens.
+    server = server.replace(env_anchor, env_anchor + '\n        env["SSH_CONNECTION"] = "127.0.0.1 1234 127.0.0.1 22";')
+    server = server.replace(env_anchor, env_anchor +
+        '\n        for (const key of ["JETSKI_OAUTH_TOKEN", "JETSKI_TEST_GAIA_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]) delete env[key];')
+    if api_config is not None:
+        scripts["dist/preload.js"] = _desktop_api_preload(api_config["model"]) + _asar_content(header, payload, "dist/preload.js")
+        # Bare recognized model names are canonicalized by the backend (for
+        # example, removing "-high"). A Gemini resource name avoids that
+        # lookup; the SDK removes "models/" when constructing the API URL.
+        resource_model = api_config["model"]
+        if not resource_model.startswith("models/"):
+            resource_model = "models/" + resource_model
+        server = server.replace(anchor,
+            '        args.push("--model_api_client_type", "gemini", "--override_model_name", ' + json.dumps(resource_model) + ');\n' + anchor)
+        # Read the launcher key from process.env after shellEnvSync, preventing
+        # a login shell from replacing this instance's key with a global key.
+        server = server.replace('        env["SSH_CONNECTION"]',
+            '        if (!process.env.AGY_INSTANCE_API_KEY) throw new Error("Open this API instance through the manager to supply its key");\n'
+            '        env["GEMINI_API_KEY"] = process.env.AGY_INSTANCE_API_KEY;\n'
+            '        env["GOOGLE_GEMINI_BASE_URL"] = ' + json.dumps(api_config["base_url"]) + ';\n'
+            '        delete env["AGY_INSTANCE_API_KEY"];\n'
+            '        env["SSH_CONNECTION"]')
+    scripts["dist/languageServer.js"] = server
+    updater = scripts["dist/updater.js"]
+    for function in ("initAutoUpdater", "checkForUpdates", "quitAndInstall", "applyHostUpdate", "setAutoUpdateChecking"):
+        pattern = r"(\bfunction " + function + r"\([^)]*\)\s*\{)"
+        if len(re.findall(pattern, updater)) != 1:
+            raise ValueError("unsupported desktop updater layout")
+        updater = re.sub(pattern, r"\1\n    return; // Profile copies must retain isolation changes.\n", updater)
+    scripts["dist/updater.js"] = updater
+    return header, payload, scripts
+
+def _desktop_profile_sign(app):
+    # Profile copies are self-contained. Re-sign nested code inside out as the
+    # installed source may already have modified framework signatures.
+    bundles = []
+    for base, dirs, _ in os.walk(app, followlinks=False):
+        for name in dirs:
+            path = os.path.join(base, name)
+            if not os.path.islink(path) and name.endswith((".app", ".framework")):
+                bundles.append(path)
+    mains = {os.path.realpath(_mac_bundle_main(app))}
+    for bundle in bundles:
+        main = (_mac_bundle_main(bundle) if bundle.endswith(".app") else
+                os.path.join(bundle, os.path.basename(bundle)[:-len(".framework")]))
+        mains.add(os.path.realpath(main))
+    backend_backup = os.path.join(app, "Contents", "Resources", "bin", "language_server") + BAK
+    for base, _, files in os.walk(app, followlinks=False):
+        for name in files:
+            path = os.path.join(base, name)
+            if os.path.islink(path) or (name.endswith(BAK) and path != backend_backup) or os.path.realpath(path) in mains:
+                continue
+            with open(path, "rb") as f:
+                magic = f.read(4)
+            if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe",
+                         b"\xfe\xed\xfa\xce", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                         b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+                _mac_codesign(path)
+    for bundle in sorted(bundles, key=lambda p: p.count(os.sep), reverse=True):
+        if bundle.endswith(".app"):
+            with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+                identifier = plistlib.load(f)["CFBundleIdentifier"]
+            # Ad-hoc helper signatures have no Team ID and must be able to
+            # load the copied Electron framework and execute Chromium's JIT.
+            entitlements = {**_mac_entitlements(bundle), MAC_DISABLE_LIBRARY_VALIDATION: True,
+                            "com.apple.security.cs.allow-jit": True}
+            _mac_codesign(bundle, bundle=True, identifier=identifier, entitlements=entitlements)
+        else:
+            _mac_codesign(bundle, bundle=True)
+    entitlements = _mac_library_validation_entitlements(app, True)
+    with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+        identifier = plistlib.load(f)["CFBundleIdentifier"]
+    _mac_codesign(app, bundle=True, entitlements=entitlements, identifier=identifier)
+
+def desktop_profile_create(name, overrides=None, api_config=None):
+    if api_config is not None:
+        api_config = _desktop_api_config(api_config.get("base_url"), api_config.get("model"))
+    root = _desktop_api_instances_root() if api_config is not None else _desktop_profiles_root()
+    profile = _desktop_profile_path(name, root)
+    if os.path.lexists(profile):
+        raise ValueError("profile already exists; use open to launch it")
+    source = resolve("manager", (overrides or {}).get("manager"))
+    app = _mac_app_bundle(source) if source else None
+    if not app:
+        raise ValueError("Antigravity desktop app not found (use --path-manager)")
+    with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+        plist = plistlib.load(f)
+    if plist.get("CFBundleShortVersionString") != "2.19.1":
+        raise ValueError("isolated desktop profiles currently support verified Antigravity 2.19.1 only")
+    archive = os.path.join(app, "Contents", "Resources", "app.asar")
+    header, payload, scripts = _desktop_profile_scripts(archive, name, api_config)
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    temp = tempfile.mkdtemp(prefix=".creating-", dir=root)
+    try:
+        copied = os.path.join(temp, "Antigravity.app")
+        info("creating isolated app copy (about 650 MB per profile)")
+        shutil.copytree(app, copied, symlinks=True)
+        _desktop_profile_namespace_credentials(copied, profile)
+        digest = _asar_write(os.path.join(copied, "Contents", "Resources", "app.asar"), header, payload, scripts)
+        identity = ("com.parsa.agy-api." if api_config is not None else "com.parsa.agy-profile.") + name
+        original_identity = plist["CFBundleIdentifier"]
+        # Electron resolves bundled helper executables using CFBundleName.
+        # Keep that vendor name; only the displayed name identifies the profile.
+        plist.update(CFBundleIdentifier=identity, CFBundleDisplayName=("Antigravity API " if api_config is not None else "Antigravity Profile ") + name,
+                     CFBundleURLTypes=[{"CFBundleURLName": identity, "CFBundleURLSchemes": [("antigravity-api-" if api_config is not None else "antigravity-profile-") + name]}])
+        plist["ElectronAsarIntegrity"] = {"Resources/app.asar": {"algorithm": "SHA256", "hash": digest}}
+        plist.pop("ElectronTeamID", None)
+        with open(os.path.join(copied, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump(plist, f)
+        for base, dirs, _ in os.walk(copied, followlinks=False):
+            for entry in dirs:
+                helper = os.path.join(base, entry)
+                if not entry.endswith(".app") or os.path.islink(helper):
+                    continue
+                helper_info = os.path.join(helper, "Contents", "Info.plist")
+                with open(helper_info, "rb") as f:
+                    helper_plist = plistlib.load(f)
+                old_id = helper_plist["CFBundleIdentifier"]
+                if not old_id.startswith(original_identity + "."):
+                    raise ValueError("unsupported desktop helper bundle identifier")
+                helper_plist["CFBundleIdentifier"] = identity + old_id[len(original_identity):]
+                helper_plist.pop("ElectronTeamID", None)
+                with open(helper_info, "wb") as f:
+                    plistlib.dump(helper_plist, f)
+        _desktop_profile_sign(copied)
+        for directory in ("gemini", "user-data", "logs", "browser"):
+            os.mkdir(os.path.join(temp, directory), 0o700)
+        if api_config is not None:
+            with open(os.path.join(temp, "api.json"), "x", encoding="utf-8") as f:
+                json.dump(api_config, f)
+                f.flush(); os.fsync(f.fileno())
+            os.chmod(os.path.join(temp, "api.json"), 0o600)
+        # Exclusive publication protects a concurrently created profile.
+        os.mkdir(profile, 0o700)
+        try:
+            for entry in sorted(os.listdir(temp), key=lambda n: n == "Antigravity.app"):
+                os.rename(os.path.join(temp, entry), os.path.join(profile, entry))
+        except Exception:
+            shutil.rmtree(profile)
+            raise
+        ok(f"created API instance '{name}' — open it through the manager" if api_config is not None else
+           f"created desktop profile '{name}' — open it and sign in separately")
+        return 0
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+def desktop_profile_open(name, api_key=None, api_instance=False):
+    profile = _desktop_profile_path(name, _desktop_api_instances_root()) if api_instance else _desktop_profile_path(name)
+    app = os.path.join(profile, "Antigravity.app")
+    if not os.path.isdir(app):
+        raise ValueError("profile not found; create it first")
+    _desktop_namespace_credentials(os.path.join(app, "Contents", "Resources", "bin", "language_server"), profile, check_only=True)
+    executable = _mac_bundle_main(app)
+    # Direct execution preserves launch environment and lets each profile's
+    # own Electron lock focus only its existing window on repeated launches.
+    env = os.environ.copy()
+    env.pop("AGY_INSTANCE_API_KEY", None)
+    if api_instance:
+        if not api_key or not api_key.strip():
+            raise ValueError("an API key is required")
+        if not os.path.isfile(os.path.join(profile, "api.json")):
+            raise ValueError("API instance configuration is missing")
+        env["AGY_INSTANCE_API_KEY"] = api_key
+    for key in ("DEV_URL", "ELECTRON_RUN_AS_NODE", "ELECTRON_OZONE_PLATFORM_HINT"):
+        env.pop(key, None)
+    child = subprocess.Popen([executable], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True, umask=0o077)
+    try:
+        code = child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        code = 0
+    if code:
+        warn(f"desktop profile failed to start (exit {code}); check its private logs")
+        return 1
+    ok(f"opened API instance '{name}'" if api_instance else f"opened desktop profile '{name}'")
+    return 0
+
+def run_api_instances(argv, overrides=None, base_url=None, model=None, key_env=None, api_key=None):
+    if sys.platform != "darwin" or os.geteuid() == 0:
+        warn("API instances currently require macOS and must run without sudo")
+        return 2
+    try:
+        if len(argv) != 2 or argv[0] not in ("create", "open", "repair"):
+            raise ValueError("usage: api create <name> --base-url <url> --model <id> | api open <name> [--api-key-env <variable>] | api repair <name>")
+        if argv[0] == "create":
+            if key_env is not None:
+                raise ValueError("--api-key-env is only used when opening an API instance")
+            return desktop_profile_create(argv[1], overrides, _desktop_api_config(base_url, model))
+        if base_url is not None or model is not None:
+            raise ValueError("base URL and model are configured when creating an API instance")
+        if argv[0] == "repair":
+            if key_env is not None:
+                raise ValueError("repair does not require an API key")
+            return desktop_profile_repair(argv[1], api_instance=True, overrides=overrides)
+        if api_key is not None:
+            key = api_key
+        elif key_env:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
+                raise ValueError("invalid API key environment variable name")
+            key = os.environ.get(key_env)
+        elif sys.stdin.isatty():
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                key = getpass.getpass("API key (not saved): ")
+        else:
+            raise ValueError("open in a terminal to enter the key, or use --api-key-env")
+        return desktop_profile_open(argv[1], api_key=key, api_instance=True)
+    except (OSError, ValueError, LookupError, subprocess.SubprocessError, getpass.GetPassWarning) as e:
+        warn(f"API instance error: {e}")
+        return 1
+
+def desktop_profile_repair(name, api_instance=False, overrides=None):
+    profile = _desktop_profile_path(name, _desktop_api_instances_root()) if api_instance else _desktop_profile_path(name)
+    app = os.path.join(profile, "Antigravity.app")
+    if os.path.realpath(app) != os.path.join(os.path.realpath(profile), "Antigravity.app"):
+        raise ValueError("profile app must not be a symlink")
+    executable = _mac_bundle_main(app)
+    result = subprocess.run(["/bin/ps", "-axo", "command="], capture_output=True, text=True, check=True)
+    if any(line.strip().startswith(app + os.sep) for line in result.stdout.splitlines()):
+        raise ValueError("close this extra profile by quitting its app (⌘Q); it is still running in the background — closing windows is not enough; keep your main app open")
+    if api_instance:
+        with open(os.path.join(profile, "api.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        config = _desktop_api_config(config.get("base_url"), config.get("model"))
+        source = _mac_app_bundle(resolve("manager", (overrides or {}).get("manager")))
+        if not source:
+            raise ValueError("installed desktop app not found")
+        with open(os.path.join(source, "Contents", "Info.plist"), "rb") as f:
+            if plistlib.load(f).get("CFBundleShortVersionString") != "2.19.1":
+                raise ValueError("API repair requires the verified desktop 2.19.1 build")
+        header, payload, scripts = _desktop_profile_scripts(os.path.join(source, "Contents", "Resources", "app.asar"), name, config)
+    with tempfile.TemporaryDirectory(prefix=".repair-", dir=profile) as temp:
+        copied = os.path.join(temp, "Antigravity.app")
+        shutil.copytree(app, copied, symlinks=True)
+        _desktop_profile_namespace_credentials(copied, profile)
+        if api_instance:
+            digest = _asar_write(os.path.join(copied, "Contents", "Resources", "app.asar"), header, payload, scripts)
+            info = os.path.join(copied, "Contents", "Info.plist")
+            with open(info, "rb") as f:
+                plist = plistlib.load(f)
+            plist["ElectronAsarIntegrity"] = {"Resources/app.asar": {"algorithm": "SHA256", "hash": digest}}
+            with open(info, "wb") as f:
+                plistlib.dump(plist, f)
+        _desktop_profile_sign(copied)
+        # Keep the original outside automatic cleanup until rollback succeeds.
+        recovery = tempfile.mkdtemp(prefix=".recovery-", dir=profile)
+        saved = os.path.join(recovery, "Antigravity.app")
+        try:
+            os.rename(app, saved)
+        except Exception:
+            shutil.rmtree(recovery)
+            raise
+        try:
+            os.rename(copied, app)
+            _desktop_namespace_credentials(os.path.join(app, "Contents", "Resources", "bin", "language_server"), profile, check_only=True)
+        except Exception as failure:
+            try:
+                if os.path.exists(app):
+                    shutil.rmtree(app)
+                os.rename(saved, app)
+            except Exception as rollback:
+                raise OSError(f"repair failed ({failure}); rollback failed ({rollback}); original app retained at {saved}") from rollback
+            shutil.rmtree(recovery)
+            raise
+        shutil.rmtree(recovery)
+    ok(f"repaired API instance '{name}' — reopen it through the manager" if api_instance else
+       f"repaired credential isolation for '{name}' — reopen it and sign into the other account")
+    return 0
+
+def run_desktop_accounts(argv, overrides=None):
+    if os.geteuid() == 0:
+        warn("run desktop profiles without sudo, from your normal macOS account")
+        return 2
+    try:
+        if argv == ["list"]:
+            root = _desktop_profiles_root()
+            names = sorted(n for n in os.listdir(root) if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", n) and
+                           os.path.isdir(os.path.join(_desktop_profile_path(n), "Antigravity.app"))) if os.path.isdir(root) else []
+            for name in names:
+                info(name)
+            if not names:
+                info("no desktop profiles yet — use accounts manager create <name>")
+            return 0
+        if len(argv) == 2 and argv[0] in ("create", "open", "repair"):
+            if argv[0] == "create":
+                return desktop_profile_create(argv[1], overrides)
+            return desktop_profile_repair(argv[1]) if argv[0] == "repair" else desktop_profile_open(argv[1])
+        warn("usage: accounts manager <list|create <name>|open <name>|repair <name>> (macOS)")
+        return 2
+    except (OSError, ValueError, LookupError, subprocess.SubprocessError) as e:
+        warn(f"desktop profile error: {e}")
+        return 1
+
+def run_accounts(argv, overrides=None):
+    if sys.platform == "darwin" and argv and argv[0] == "manager":
+        return run_desktop_accounts(argv[1:], overrides)
     if os.name != "nt":
         warn("account management is Windows-only"); return 2
     if not argv:
@@ -1631,13 +2284,17 @@ def _mac_library_validation_entitlements(app, allow_disable=False):
     return {**entitlements, MAC_DISABLE_LIBRARY_VALIDATION: True}
 
 
-def _mac_codesign(path, bundle=False, entitlements=None):
+def _mac_codesign(path, bundle=False, entitlements=None, identifier=None):
     display = _mac_command(["/usr/bin/codesign", "-d", "--verbose=2", path], check=False)
     if entitlements is not None and display.returncode:
         raise OSError("cannot preserve Electron signing metadata before applying the Library Validation exception")
     args = ["/usr/bin/codesign", "--force", "--sign", "-"]
+    if identifier is not None:
+        args += ["--identifier", identifier]
     if display.returncode == 0:
         metadata = "identifier,flags,runtime" if entitlements is not None else "identifier,entitlements,flags,runtime"
+        if identifier is not None:
+            metadata = metadata.replace("identifier,", "")
         args.append("--preserve-metadata=" + metadata)
     with tempfile.TemporaryDirectory(prefix="agy-macos-entitlements-") as temp:
         if entitlements is not None:
@@ -1699,7 +2356,7 @@ def _mac_sign_transaction(entries, bundle_entitlements=None):
             restore_errors = []
             for path, saved in binary_copies:
                 try:
-                    shutil.copy2(saved, path)
+                    _copy_binary(saved, path)
                 except Exception as e:
                     restore_errors.append(str(e))
             for app, saved in bundle_copies:
@@ -1882,10 +2539,31 @@ def _mac_run_patch(targets, overrides, disable_library_validation=False):
     return rc
 
 
+def _mac_is_isolated_profile(app):
+    with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+        return plistlib.load(f).get("CFBundleIdentifier", "").startswith(
+            ("com.parsa.agy-profile.", "com.parsa.agy-api."))
+
+
 def _mac_run_restore(targets, overrides):
+    with tempfile.TemporaryDirectory(prefix="agy-profile-restore-") as temp:
+        return _mac_run_restore_impl(targets, overrides, temp)
+
+
+def _mac_run_restore_impl(targets, overrides, temp):
     rc = 0
     paths = {t: resolve(t, overrides.get(t)) for t in targets}
     app_failures = _mac_prepare_apps(paths)
+    profiles = {}
+    for path in paths.values():
+        app = _mac_app_bundle(path) if path else None
+        if app and app not in app_failures and app not in profiles:
+            try:
+                profiles[app] = _mac_is_isolated_profile(app)
+            except Exception as e:
+                app_failures[app] = str(e)
+    restored = {}
+    previous = {}
     touched_apps = []
     for t in targets:
         spec = SPEC[t]; path = paths[t]
@@ -1899,10 +2577,16 @@ def _mac_run_restore(targets, overrides):
             rc = 1; continue
         try:
             if spec["status"](path)[0] == "patched":
+                if profiles.get(app):
+                    saved = os.path.join(temp, str(len(previous)))
+                    _copy_binary(path, saved)
+                    previous[path] = saved
                 if not restore_file(path, spec["status"]):
                     rc = 1; continue
                 if app and app not in touched_apps:
                     touched_apps.append(app)
+                if app:
+                    restored.setdefault(app, {})[t] = path
             else:
                 warn("not patched — skipping restore (backup may be a different build)")
         except Exception as e:
@@ -1913,13 +2597,31 @@ def _mac_run_restore(targets, overrides):
         remaining = {target: path for target, (state, path) in states.items()
                      if state == "patched"}
         try:
-            if remaining:
+            if profiles.get(app):
+                # A copied profile has its own locally signed backend, ASAR
+                # and helpers. Its pre-restore seal describes patched bytes;
+                # sign the restored files and reseal, even on partial restore.
+                _mac_sign_transaction({**remaining, **restored[app]})
+            elif remaining:
                 _mac_sign_transaction(remaining)
             else:
                 _mac_restore_bundle_signature(app)
                 ok(f"original signature restored for {os.path.basename(app)}")
         except Exception as e:
             warn(f"macOS signature restore failed: {e}"); rc = 1
+            if profiles.get(app):
+                # Signing restores its signature snapshots on failure. Put
+                # the original binaries back too so their seal matches and
+                # the profile stays runnable and the restore can be retried.
+                for path in reversed(list(restored[app].values())):
+                    try:
+                        _copy_binary(previous[path], path)
+                    except Exception as rollback:
+                        warn(f"profile restore rollback failed: {rollback}")
+                        recovery = tempfile.mkdtemp(prefix=".restore-recovery-", dir=os.path.dirname(app))
+                        saved = os.path.join(recovery, os.path.basename(path))
+                        os.replace(previous[path], saved)
+                        warn(f"original profile binary retained at {saved}")
     return rc
 
 
@@ -2152,8 +2854,46 @@ def _accounts_submenu(console, qs, target_type, usage=None):
                     _tui_run(console, "Removing account…", acct_rm, target_type, name)
         _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
 
-def _accounts_menu(console, qs, usage=None):
+def _accounts_menu(console, qs, usage=None, overrides=None):
     import questionary
+    if sys.platform == "darwin":
+        while True:
+            _clear_tui(console)
+            act = _tui_ask(console, questionary.select("Desktop account profiles:", style=qs, choices=[
+                questionary.Choice("List profiles", "list"),
+                questionary.Choice("Create isolated profile", "create"),
+                questionary.Choice("Open profile", "open"),
+                questionary.Choice("Repair profile login isolation", "repair"),
+                questionary.Choice("Create API instance", "api-create"),
+                questionary.Choice("Open API instance", "api-open"),
+                questionary.Choice("Repair API instance", "api-repair"),
+                questionary.Choice("Back", "back"),
+            ]))
+            if act in (None, "back"):
+                return
+            args = [act]
+            if act != "list":
+                name = _tui_ask(console, questionary.text("Profile name (lowercase letters, digits, - or _):", style=qs))
+                if not name:
+                    continue
+                args.append(name.strip())
+            if act.startswith("api-"):
+                base_url = model = None
+                if act == "api-create":
+                    base_url = _tui_ask(console, questionary.text("API base URL:", style=qs))
+                    model = _tui_ask(console, questionary.text("Model ID:", style=qs))
+                    if not base_url or not model:
+                        continue
+                key = None
+                if act == "api-open":
+                    key = _tui_ask(console, questionary.password("API key (not saved):", style=qs))
+                    if not key:
+                        continue
+                _tui_run(console, "Updating API instance…", run_api_instances,
+                         [act[4:], args[1]], overrides, base_url, model, api_key=key)
+            else:
+                _tui_run(console, "Updating desktop profile…", run_desktop_accounts, args, overrides)
+            _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs))
     if os.name != "nt":
         console.print("[yellow]Account management is Windows-only.[/]")
         _tui_ask(console, questionary.press_any_key_to_continue("Enter to continue…", style=qs)); return
@@ -2518,7 +3258,7 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
         if action in ("refresh", "refresh-quotas"):
             continue
         if action == "accounts":
-            _accounts_menu(console, qs, usage); continue
+            _accounts_menu(console, qs, usage, overrides=overrides); continue
         _clear_tui(console)
         console.rule(f"[bold cyan]{action}[/]")
         opts = []
@@ -2549,12 +3289,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Manage the Antigravity environment (patch location gates and manage profiles). "
                     "Run with no arguments for the interactive menu.")
-    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts"), nargs="?",
-                    help="menu (default) | status | patch | restore | "
+    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts", "api"), nargs="?",
+                    help="menu (default) | status | patch | restore | accounts manager <list|create|open|repair> [name] (macOS) | "
                          "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]")
     ap.add_argument("targets", nargs="*", default=[], metavar="{" + ",".join(TARGETS) + "}",
                     help="which apps to act on (default: all)")
     for t in TARGETS: ap.add_argument(f"--path-{t}", help=f"explicit path for {t}")
+    ap.add_argument("--base-url", help="Gemini-compatible proxy base URL for a new API instance")
+    ap.add_argument("--model", help="exact proxy model ID for a new API instance")
+    ap.add_argument("--api-key-env", help="environment variable containing the API-instance key (the key is not saved)")
     ap.add_argument("--macos-disable-library-validation", action="store_true",
                     help="allow an Electron app's main executable to load other/unsigned libraries after ad-hoc signing (macOS patch/menu only)")
     args = ap.parse_args(argv)
@@ -2562,8 +3305,13 @@ def main(argv=None):
     if args.macos_disable_library_validation and (sys.platform != "darwin" or args.action not in (None, "menu", "patch")):
         ap.error("--macos-disable-library-validation is only available for patch/menu on macOS")
 
+    if args.action != "api" and (args.base_url is not None or args.model is not None or args.api_key_env is not None):
+        ap.error("--base-url, --model and --api-key-env are only available for API instances")
     if args.action == "accounts":
-        return run_accounts(args.targets)
+        return run_accounts(args.targets, {t: getattr(args, f"path_{t}") for t in TARGETS})
+    if args.action == "api":
+        return run_api_instances(args.targets, {t: getattr(args, f"path_{t}") for t in TARGETS},
+                                 args.base_url, args.model, args.api_key_env)
 
     bad = [t for t in args.targets if t not in TARGETS]
     if bad:
