@@ -1561,9 +1561,10 @@ class APIInstanceTests(unittest.TestCase):
 const assert = require("node:assert/strict"), vm = require("node:vm");
 if (typeof Response === "undefined") process.exit(77);
 global.location = new URL("https://127.0.0.1:12345/");
-let forwarded = 0;
-global.window = {fetch: async (url) => {
+let forwarded = 0, lastRequest;
+global.window = {fetch: async (url, init) => {
     forwarded++;
+    lastRequest = {url, init};
     if (String(url).endsWith("/GetUserStatus")) {
         const message = {userStatus: {fixtureStatus: true, cascadeModelConfigData: {
             clientModelConfigs: [{label: "Custom Model: ", modelOrAlias: {model: "MODEL_PLACEHOLDER_M318"}}],
@@ -1603,8 +1604,71 @@ vm.runInNewContext(HOOK, {require: () => ({contextBridge: {executeInMainWorld: (
     for (const config of [userStatus.cascadeModelConfigData.clientModelConfigs[0],
                           userStatus.cascadeModelConfigData.defaultOverrideModelConfig])
         assert.deepEqual(config.modelOrAlias, {model: "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM"});
+    const frame = message => {
+        const data = new TextEncoder().encode(JSON.stringify(message));
+        const bytes = new Uint8Array(data.length + 7);
+        new DataView(bytes.buffer).setUint32(1, data.length);
+        bytes.set(data, 5); bytes.set([128, 42], data.length + 5);
+        return bytes;
+    };
+    const permission = {commandPolicy: "fixture-deny"};
+    for (const method of ["GetSlashCommands", "StartCascade", "SendUserCascadeMessage"]) {
+        const url = route.replace("HasAuthToken", method);
+        const message = {requestedModel: "MODEL_PLACEHOLDER_M318", workspaceUris: ["file:///fixture"],
+            customAgentSpec: {builtinAgent: {customizationDiscovery: {agents: {
+                builtinAgentNames: ["fixture-agent"], inheritUser: false}}, cascadeConfig: {plannerConfig: {
+                    toolConfig: {permissionConfig: permission, invokeSubagent: {allowFork: false, maxNestingDepth: 1}},
+                    declarativeMixinConfig: {tools: [{name: "fixture-tool", builtin: true}]}}}}},
+            cascadeConfig: {plannerConfig: {toolConfig: {permissionConfig: permission}}}};
+        const body = frame(message);
+        const controller = new AbortController();
+        const init = {...options, body, signal: controller.signal, headers: {...options.headers, "x-fixture": "kept"}};
+        for (const unrelated of ["https://remote.example" + url, url + "/extra",
+                                 url.replace(method, "extra/" + method)]) {
+            await window.fetch(unrelated, init);
+            assert.equal(lastRequest.init, init);
+        }
+        for (const requestInput of [false, true]) {
+            await window.fetch(requestInput ? new Request(new URL(url, location), init) : url,
+                               requestInput ? undefined : init);
+            const bytes = lastRequest.init.body;
+            const length = new DataView(bytes.buffer).getUint32(1);
+            const updated = JSON.parse(new TextDecoder().decode(bytes.slice(5, length + 5)));
+            assert.deepEqual(Array.from(bytes.slice(length + 5)), [128, 42]);
+            assert.equal(lastRequest.init.headers.get("x-fixture"), "kept");
+            assert.deepEqual(updated.workspaceUris, message.workspaceUris);
+            const agent = updated.customAgentSpec.builtinAgent;
+            assert.equal(agent.model, "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM");
+            assert.equal(agent.customizationDiscovery.agents.inheritUser, false);
+            assert.ok(agent.customizationDiscovery.agents.builtinAgentNames.includes("fixture-agent"));
+            assert.ok(agent.customizationDiscovery.agents.builtinAgentNames.includes("DeepCoder"));
+            for (const config of [agent.cascadeConfig, updated.cascadeConfig]) {
+                const planner = config.plannerConfig;
+                assert.equal(planner.modelName, "models/test-model");
+                assert.equal(planner.planModel, agent.model);
+                assert.deepEqual(planner.toolConfig.permissionConfig, permission);
+                assert.equal(planner.toolConfig.invokeSubagent.alwaysInheritModel, true);
+                assert.equal(planner.toolConfig.invokeSubagent.enabled, true);
+                assert.ok(planner.declarativeMixinConfig.tools.some(tool => tool.name === "invoke_subagent" && tool.builtin));
+                assert.ok(planner.declarativeMixinConfig.tools.some(tool => tool.name === "wait" && tool.builtin));
+            }
+            assert.equal(agent.cascadeConfig.plannerConfig.toolConfig.invokeSubagent.allowFork, false);
+            assert.equal(agent.cascadeConfig.plannerConfig.toolConfig.invokeSubagent.maxNestingDepth, 1);
+            assert.ok(agent.cascadeConfig.plannerConfig.declarativeMixinConfig.tools.some(tool => tool.name === "fixture-tool"));
+        }
+        for (const badBody of [new Uint8Array([0, 0, 0, 9, 0]), new Uint8Array([1, 0, 0, 0, 0]),
+                               frame({customAgentSpec: {agentConfig: {}}}),
+                               frame({selectedAgentScript: {fixture: true}}),
+                               frame({agentScriptItem: {fixture: true}})]) {
+            const init = {...options, body: badBody};
+            await window.fetch(url, init);
+            assert.equal(lastRequest.init, init);
+        }
+    }
     const abort = new AbortController(); abort.abort();
     await assert.rejects(window.fetch(route, {...options, signal: abort.signal}));
+    await assert.rejects(window.fetch(route.replace("HasAuthToken", "StartCascade"),
+                                    {...options, body: frame({}), signal: abort.signal}));
 })().catch(error => {console.error(error); process.exitCode = 1;});
 '''.replace("HOOK", json.dumps(manager._desktop_api_preload("test-model")))
         result = manager.subprocess.run([shutil.which("node")], input=script, text=True,

@@ -1597,6 +1597,44 @@ def _desktop_api_preload(model):
     # against the configured provider and reports invalid keys normally.
     return r'''require("electron").contextBridge.executeInMainWorld({func: (model) => {
     const originalFetch = window.fetch;
+    const nativeRequests = new Set(["GetSlashCommands", "StartCascade", "SendUserCascadeMessage"]
+        .map(method => "/exa.language_server_pb.LanguageServerService/" + method));
+    const configureNativeAgent = message => {
+        // Use the desktop's supported builtin-agent path, not SDK-only specs.
+        // Keep permissions, workspace settings and user customizations intact.
+        if (message.selectedAgentScript || message.agentScriptItem) return false;
+        const spec = message.customAgentSpec ||= {};
+        if (spec.agentConfig || spec.customAgent || spec.codingAgent) return false;
+        const agent = spec.builtinAgent ||= {};
+        agent.defaultAgent ||= {isGoogle: true, isInteractive: true};
+        const byom = "MODEL_GOOGLE_GEMINI_INTERNAL_BYOM";
+        agent.model = byom;
+        const discovery = agent.customizationDiscovery ||= {};
+        const agents = discovery.agents ||= {};
+        agents.builtinAgentNames = [...new Set([...(agents.builtinAgentNames || []),
+            "self", "research", "DeepCoder", "DeepInvestigator", "browser", "browser-vision", "teamwork_preview"])];
+        const configure = config => {
+            const planner = config.plannerConfig ||= {};
+            planner.planModel = byom;
+            planner.requestedModel = {model: byom};
+            planner.modelName = model.startsWith("models/") ? model : "models/" + model;
+            const tools = planner.toolConfig ||= {};
+            const invoke = tools.invokeSubagent ||= {};
+            Object.assign(invoke, {enabled: true, alwaysInheritModel: true, fastModel: byom, heavyModel: byom});
+            invoke.maxNestingDepth = Math.min(Math.max(invoke.maxNestingDepth || 2, 1), 2);
+            invoke.allowFork ??= true;
+            const mixin = planner.declarativeMixinConfig ||= {};
+            const named = mixin.tools ||= [];
+            for (const name of ["invoke_subagent", "wait"])
+                if (!named.some(tool => tool.name === name)) named.push({name, builtin: true});
+        };
+        configure(agent.cascadeConfig ||= {});
+        // StartCascade stores the builtin config for descendants; subsequent
+        // requests also carry it for command discovery and resumed chats.
+        if (message.cascadeConfig) configure(message.cascadeConfig);
+        if (Object.prototype.hasOwnProperty.call(message, "requestedModel")) message.requestedModel = byom;
+        return true;
+    };
     const replies = {
         "/exa.language_server_pb.LanguageServerService/HasAuthToken": {hasToken: true},
         "/exa.language_server_pb.LanguageServerService/GetAuthStatus": {authResult: {hasValidAuth: true}},
@@ -1610,11 +1648,34 @@ def _desktop_api_preload(model):
             url.origin !== location.origin || method !== "POST" ||
             headers.get("content-type") !== "application/grpc-web+json" ||
             !(Object.prototype.hasOwnProperty.call(replies, url.pathname) ||
+              nativeRequests.has(url.pathname) ||
               url.pathname === "/exa.language_server_pb.LanguageServerService/GetUserStatus")) {
             return originalFetch.call(this, input, init);
         }
         const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
         if (signal?.aborted) return Promise.reject(signal.reason);
+        if (nativeRequests.has(url.pathname)) {
+            const receiver = this;
+            return (async () => {
+                let body;
+                try {
+                    const source = init?.body !== undefined ? new Response(init.body) : input instanceof Request ? input.clone() : null;
+                    if (!source) return originalFetch.call(receiver, input, init);
+                    const original = new Uint8Array(await source.arrayBuffer());
+                    if (original.length < 5 || original[0] !== 0) return originalFetch.call(receiver, input, init);
+                    const length = new DataView(original.buffer).getUint32(1);
+                    if (length > original.length - 5) return originalFetch.call(receiver, input, init);
+                    const message = JSON.parse(new TextDecoder().decode(original.slice(5, 5 + length)));
+                    if (!configureNativeAgent(message)) return originalFetch.call(receiver, input, init);
+                    const data = new TextEncoder().encode(JSON.stringify(message));
+                    body = new Uint8Array(original.length - length + data.length);
+                    new DataView(body.buffer).setUint32(1, data.length);
+                    body.set(data, 5); body.set(original.slice(5 + length), 5 + data.length);
+                } catch { return originalFetch.call(receiver, input, init); }
+                const forwardedHeaders = new Headers(headers); forwardedHeaders.delete("content-length");
+                return originalFetch.call(receiver, input, {...init, body, headers: forwardedHeaders});
+            })();
+        }
         if (url.pathname.endsWith("/GetUserStatus")) {
             return originalFetch.call(this, input, init).then(async response => {
                 // Recognized names can resolve to Google-only model enums.
