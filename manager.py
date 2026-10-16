@@ -524,17 +524,20 @@ def _gate_write(path, gate, off, g, before, app):
     return True
 
 # CLI eligibility screen
-# CLI 1.2.16 Windows x64: test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible ;
-# call failure builder ; spill rax/rbx/rcx at +0xd8/+0xe0/+0xe8.
-# Repeating test rax,rax keeps ZF=0, so jne selects eligible.
+# CLI 1.4.0 Linux x64: test rax,rax ; jne error ; test rcx,rcx ; je eligible ;
+# cmp byte[rcx+8],0 ; jne eligible ; mov rax,rcx ; call failure builder ;
+# spill rax/rbx/rcx at +0xe0/+0xe8/+0xf0.
+# Repeating test rcx,rcx keeps ZF=0, so jne selects eligible.
 CLI_GATE_X64 = Gate(
-    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
-    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
-    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
-    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
-    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
+    rb"\x48\x85\xc0\x0f\x85....\x48\x85\xc9\x0f\x84...."
+    rb"\x80\x79\x08\x00\x0f\x85....\x48\x89\xc8\x90\xe8...."
+    rb"\x48\x89\x84\x24\xe0\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe8\x00\x00\x00\x48\x89\x8c\x24\xf0\x00\x00\x00",
+    rb"\x48\x85\xc0\x0f\x85....\x48\x85\xc9\x0f\x84...."
+    rb"\x48\x85\xc9\x90\x0f\x85....\x48\x89\xc8\x90\xe8...."
+    rb"\x48\x89\x84\x24\xe0\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe8\x00\x00\x00\x48\x89\x8c\x24\xf0\x00\x00\x00",
+    b"\x48\x85\xc9\x90", offset=18, desc="eligibility screen off (x64)", arch="x64")
 
 def _cli_arm64_context(data, match, start, end):
     off = match.start()
