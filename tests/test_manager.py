@@ -143,16 +143,21 @@ class GateStateTests(unittest.TestCase):
             multi.resolve(b"X64--ARM")
 
     def test_current_cli_x64_signature_and_patch(self):
-        # CLI 1.2.16 Windows x64, file offset 0x29fa500, SHA256
-        # 871e1eeb205dd3269b762e81808b7a86fe7cf73b59da51b14e3d8ac005581bfe.
+        # CLI 1.4.0 Linux x64, signature at 0x8bfda29, SHA256
+        # 92179f638f204c5f0f0c0d659fcac8f34be0625adbe499dec4fe540d206746ef.
         source = bytes.fromhex(
-            "4885c00f8498020000807808000f858e020000"
-            "e8284afdff48898424d800000048899c24e000000048898c24e8000000")
+            "4885c90f841e020000807908000f8514020000"
+            "4889c890e81bdbfcff48898424e000000048899c24e800000048898c24f0000000")
         state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
         self.assertEqual((state, offset, gate), ("unpatched", 9, manager.CLI_GATE_X64))
         patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
         self.assertEqual(manager.CLI_GATE.resolve(patched, arch="x64"),
                          ("patched", 9, gate))
+        for original, replacement in ((b'\x80\x79\x08', b'\x80\x78\x08'),
+                                      (b'\x48\x89\xc8', b'\x48\x89\xd0'),
+                                      (b'\x24\xe0\x00', b'\x24\xd8\x00')):
+            with self.subTest(original=original), self.assertRaises(manager.SignatureNotFound):
+                manager.CLI_GATE.resolve(source.replace(original, replacement), arch="x64")
 
     def test_current_cli_arm64_signature_and_patch(self):
         # CLI 1.2.16 ARM64: identical gate bytes in macOS and Linux builds.
@@ -263,10 +268,10 @@ class ExtensionTests(unittest.TestCase):
     def binary(cls, shared=False):
         code = cls.hub_code()
         if shared:
-            # Ordinary CLI gate from the same real agy 1.3.0 executable.
+            # Combine the verified CLI 1.4.0 Linux x64 gate with the shared validator.
             code = bytes.fromhex(
-                "4885c00f8498020000807808000f858e020000e82845fdff"
-                "48898424d800000048899c24e000000048898c24e8000000") + b"\x90" * 7 + code
+                "4885c90f841e020000807908000f85140200004889c890e81bdbfcff"
+                "48898424e000000048899c24e800000048898c24f0000000") + b"\x90" * 7 + code
         image = bytearray(_minimal_pe(code=code))
         struct.pack_into("<I", image, 0x98 + 16, 0x80)
         return image
