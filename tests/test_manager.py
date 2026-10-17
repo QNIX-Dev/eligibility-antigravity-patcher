@@ -143,11 +143,11 @@ class GateStateTests(unittest.TestCase):
             multi.resolve(b"X64--ARM")
 
     def test_current_cli_x64_signature_and_patch(self):
-        # CLI 1.2.16 Windows x64, file offset 0x29fa500, SHA256
-        # 871e1eeb205dd3269b762e81808b7a86fe7cf73b59da51b14e3d8ac005581bfe.
+        # CLI 1.4.0 Windows x64 handleAuthResult, signature at 0x2c98449, SHA256
+        # f5466e6aaf9f1345cae476fecb9aebb9e82c2ca8dfd43136fa9747fcf075e062.
         source = bytes.fromhex(
-            "4885c00f8498020000807808000f858e020000"
-            "e8284afdff48898424d800000048899c24e000000048898c24e8000000")
+            "4885c90f841e020000807908000f85140200004889c890e81bdbfcff"
+            "48898424e000000048899c24e800000048898c24f0000000")
         state, offset, gate = manager.CLI_GATE.resolve(source, arch="x64")
         self.assertEqual((state, offset, gate), ("unpatched", 9, manager.CLI_GATE_X64))
         patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
@@ -155,14 +155,13 @@ class GateStateTests(unittest.TestCase):
                          ("patched", 9, gate))
 
     def test_current_cli_arm64_signature_and_patch(self):
-        # CLI 1.2.16 ARM64: identical gate bytes in macOS and Linux builds.
-        # macOS Mach-O: ldrb at 0x223bca8, SHA256
-        # 7dca095cfc1df2c057a385ed88a76c7ba98dc103258a80be87a8f42e484cb3aa.
-        # Linux ELF: ldrb at 0x7d05738, SHA256
-        # d0c06173f4ab2d6da7c17ba8d52a688234f30a79a7f65e25ace15863a295695f.
+        # CLI 1.4.0 ARM64: Linux ELF ldrb at 0x862a818, SHA256
+        # 51a1839c1055a9c80bbab0494e3adad38d4b83af9762166443438742e90651ca.
+        # Identical bytes in macOS Mach-O at 0x2503b58, SHA256
+        # a4502aaf310b2fd6eb657fcfec2fcc31a690fbbd0c2d14c8eefbb556409024ce.
         source = bytes.fromhex(
-            "a11800b5200f00b402204039e20e0037d472ff97"
-            "e0070ea9e20f0fa9e41710a9e61f11a9")
+            "811500b5800c00b402204039420c00379457ff97"
+            "e0870ea9e28f0fa9e49710a9e69f11a9")
         state, offset, gate = manager.CLI_GATE.resolve(source, arch="arm64")
         self.assertEqual((state, offset, gate), ("unpatched", 8, manager.CLI_GATE_ARM64))
         patched = source[:offset] + gate.fix + source[offset + len(gate.fix):]
@@ -171,8 +170,8 @@ class GateStateTests(unittest.TestCase):
 
     def test_cli_arm64_signature_requires_outer_registers(self):
         wrong_outer_register = bytes.fromhex(
-            "a21800b5200f00b402204039e20e0037d472ff97"
-            "e0070ea9e20f0fa9e41710a9e61f11a9")
+            "821500b5800c00b402204039420c00379457ff97"
+            "e0870ea9e28f0fa9e49710a9e69f11a9")
         with self.assertRaises(manager.SignatureNotFound):
             manager.CLI_GATE.resolve(wrong_outer_register, arch="arm64")
 
@@ -263,10 +262,10 @@ class ExtensionTests(unittest.TestCase):
     def binary(cls, shared=False):
         code = cls.hub_code()
         if shared:
-            # Ordinary CLI gate from the same real agy 1.3.0 executable.
+            # CLI 1.4.0 Windows x64 gate; the shared validator layout is unchanged.
             code = bytes.fromhex(
-                "4885c00f8498020000807808000f858e020000e82845fdff"
-                "48898424d800000048899c24e000000048898c24e8000000") + b"\x90" * 7 + code
+                "4885c90f841e020000807908000f85140200004889c890e81bdbfcff"
+                "48898424e000000048899c24e800000048898c24f0000000") + b"\x90" * 7 + code
         image = bytearray(_minimal_pe(code=code))
         struct.pack_into("<I", image, 0x98 + 16, 0x80)
         return image

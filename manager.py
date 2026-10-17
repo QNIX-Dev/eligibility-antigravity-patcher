@@ -524,17 +524,17 @@ def _gate_write(path, gate, off, g, before, app):
     return True
 
 # CLI eligibility screen
-# CLI 1.2.16 Windows x64: test rax,rax ; je ; cmp byte[rax+8],0 ; jne eligible ;
-# call failure builder ; spill rax/rbx/rcx at +0xd8/+0xe0/+0xe8.
-# Repeating test rax,rax keeps ZF=0, so jne selects eligible.
+# CLI 1.4.0 x64 handleAuthResult: test rcx,rcx ; je ; cmp byte[rcx+8],0 ; jne eligible ;
+# mov rax,rcx ; nop ; call IneligibilityFromResult ; spill rax/rbx/rcx at +0xe0/+0xe8/+0xf0.
+# Repeating test rcx,rcx keeps ZF=0, so jne selects eligible without changing the formatter.
 CLI_GATE_X64 = Gate(
-    rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
-    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
-    rb"\x48\x85\xc0\x0f\x84....\x48\x85\xc0\x90\x0f\x85...."
-    rb"\xe8....\x48\x89\x84\x24\xd8\x00\x00\x00"
-    rb"\x48\x89\x9c\x24\xe0\x00\x00\x00\x48\x89\x8c\x24\xe8\x00\x00\x00",
-    b"\x48\x85\xc0\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
+    rb"\x48\x85\xc9\x0f\x84....\x80\x79\x08\x00\x0f\x85....\x48\x89\xc8\x90"
+    rb"\xe8....\x48\x89\x84\x24\xe0\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe8\x00\x00\x00\x48\x89\x8c\x24\xf0\x00\x00\x00",
+    rb"\x48\x85\xc9\x0f\x84....\x48\x85\xc9\x90\x0f\x85....\x48\x89\xc8\x90"
+    rb"\xe8....\x48\x89\x84\x24\xe0\x00\x00\x00"
+    rb"\x48\x89\x9c\x24\xe8\x00\x00\x00\x48\x89\x8c\x24\xf0\x00\x00\x00",
+    b"\x48\x85\xc9\x90", offset=9, desc="eligibility screen off (x64)", arch="x64")
 
 def _cli_arm64_context(data, match, start, end):
     off = match.start()
@@ -544,14 +544,14 @@ def _cli_arm64_context(data, match, start, end):
     return ((cbnz_x1 & 0xff00001f) == 0xb5000001 and
             (cbz_x0 & 0xff00001f) == 0xb4000000)
 
-# CLI 1.2.16 macOS/Linux arm64: ldrb w2,[x0,#8] ; tbnz w2,#0,eligible ;
-# bl IneligibilityFromResult ; stp x0-x7 at +0xe0/+0xf0/+0x100/+0x110.
+# CLI 1.4.0 arm64: ldrb w2,[x0,#8] ; tbnz w2,#0,eligible ;
+# bl IneligibilityFromResult ; stp x0-x7 at +0xe8/+0xf8/+0x108/+0x118.
 # mov w2,#1 selects the existing eligible branch.
 CLI_GATE_ARM64 = Gate(
     rb"\x02\x20\x40\x39[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x07\x0e\xa9\xe2\x0f\x0f\xa9\xe4\x17\x10\xa9\xe6\x1f\x11\xa9",
+    rb"...[\x94-\x97]\xe0\x87\x0e\xa9\xe2\x8f\x0f\xa9\xe4\x97\x10\xa9\xe6\x9f\x11\xa9",
     rb"\x22\x00\x80\x52[\x02\x22\x42\x62\x82\xa2\xc2\xe2].[\x00-\x07]\x37"
-    rb"...[\x94-\x97]\xe0\x07\x0e\xa9\xe2\x0f\x0f\xa9\xe4\x17\x10\xa9\xe6\x1f\x11\xa9",
+    rb"...[\x94-\x97]\xe0\x87\x0e\xa9\xe2\x8f\x0f\xa9\xe4\x97\x10\xa9\xe6\x9f\x11\xa9",
     b"\x22\x00\x80\x52", desc="eligibility screen off (arm64)",
     arch="arm64", accept=_cli_arm64_context)
 
