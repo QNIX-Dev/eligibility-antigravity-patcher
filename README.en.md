@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; profile management and live quota monitoring on Windows)</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools (location restriction bypass on Windows, Linux & macOS — x64 and arm64; multi-account profiles on Windows and macOS; live quota monitoring on Windows)</b>
 </p>
 
 <p align="center">
@@ -94,13 +94,20 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 > ```
 
 > [!NOTE]
-> **macOS Notes (Code Signing & Gatekeeper):**
-> - **Automatic Ad-hoc Signing:** On macOS, modified Mach-O binaries (`agy`, `language_server`) and the `.app` bundle are automatically ad-hoc signed via `codesign`, and the `com.apple.quarantine` attribute is removed. Original signatures are saved in `*.app.agysignbak` for complete rollback via `restore`.
-> - **Electron & Library Validation:** If application launch is blocked due to Electron's Library Validation (ad-hoc signatures lack a Team ID), run the patch with the exception flag:
->   ```bash
->   python manager.py --macos-disable-library-validation patch ide
->   ```
->   This safely adds the `disable-library-validation=true` entitlement only to the selected `.app`'s main executable. See [technical details](#details) for full mechanics.
+> On macOS, binary patches are written and verified in a temporary file beside the target, then installed by atomic replacement. Restore and binary rollback also use replacement, avoiding in-place writes to signed executables. You still need write access to the containing directory. If `Operation not permitted` persists even with `sudo`, macOS App Management protection may be blocking changes inside the bundle. Open **System Settings → Privacy & Security → App Management**, enable the terminal app running the patcher (or the editor if using its integrated terminal), then quit and reopen that app and retry. `sudo` does not grant macOS privacy permissions. Close Antigravity before patching and restart it afterward.
+>
+> **macOS signing runs automatically only while patching on macOS.** The patcher first applies and verifies all selected changes, then ad-hoc signs each modified Mach-O (`agy` and `language_server`) separately, and finally signs the containing `.app` once. Every signature is verified with `codesign`; a failure rolls back the patches and temporary signature changes. When Python lacks extended-attribute APIs, the patcher uses the built-in `/usr/bin/xattr` tool; no extra Python package is needed. After signing succeeds, the patcher automatically removes `com.apple.quarantine` only from the selected applications (recursively for `.app` bundles), preventing Gatekeeper from blocking the locally modified code. During `restore`, the original bundle signature is returned after the last patched target inside that bundle is restored. Keep `*.app.agysignbak` directories for as long as you need the patch and full restoration support.
+>
+> Removing quarantine does not disable Gatekeeper globally or affect other applications or system settings. The original value of this attribute is not restored by the `restore` command.
+
+> [!WARNING]
+> **Electron and Library Validation on macOS.** The app's signing flags and entitlements are inspected before patch writes. If Library Validation is enabled without an exception, the patcher stops: ad-hoc signing removes the main executable's Team ID and may make it incompatible with the Electron Framework signature. Failure to read signing metadata or entitlements also stops the patch. To explicitly allow libraries with other or no signatures in the selected app, use:
+> ```bash
+> python3 manager.py --macos-disable-library-validation patch ide
+> ```
+> The flag applies only to `patch`/`menu` on macOS and adds `com.apple.security.cs.disable-library-validation=true` only to the selected Electron `.app`'s main executable, when needed. Other entitlements, the identifier, signing flags, and Hardened Runtime are preserved; frameworks and helpers are not re-signed. Entitlements are read back and checked after signing; failure triggers rollback. `restore` returns the original signature and entitlements from `*.app.agysignbak` after the last patched target is restored. To repair an already patched copy, rerun the CLI patch command with the flag.
+>
+> The exception weakens library loading checks for this executable only, rather than globally. Successful `codesign --verify` confirms the signature but does not guarantee that the app launches. Test patching, launching, and subsequent restoration on a separate `.app` copy; full launch validation requires macOS.
 
 ---
 
@@ -123,16 +130,34 @@ The patcher neutralizes local eligibility checks and directs each client into it
 > [!NOTE]
 > **Platform Support:** The `cli`, `manager`, `ide`, and `extension` patches support Windows, Linux, and macOS. The `cli` patch carries separate x64 and arm64 machine-code signatures and automatically selects the one matching the executable architecture. The `manager` patch follows the same model: its x64 signature covers Windows (including Windows-on-ARM, where the x64 backend runs under emulation), Linux x64, and Intel macOS, while its dedicated arm64 signature covers Linux arm64 and Apple Silicon macOS. The `ide` patch modifies JavaScript and therefore uses one architecture-independent signature across all platforms. The `extension` patch uses the verified x64 backend signature (ARM64 is deliberately excluded pending signature verification in real-world builds).
 >
-> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For `extension`, autodetection scans `~/.gemini/bin/`, ignoring `PATH`. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli` or `--path-extension`). Ensure the applications are closed before patching to prevent file locking issues. Account management and quota tracking (`accounts`) remain Windows-only for now.
+> On Linux, autodetection scans standard installation prefixes (such as `/opt`, `/usr/share`, `/usr/lib`, `~/.local/share`, `~/.local/bin`, and the launcher directories of `antigravity` and `antigravity-ide` in `PATH`). On macOS, it scans `.app` bundles under `/Applications` and `~/Applications` (the binaries live inside `Contents/Resources/`); after patching, signatures are refreshed from the inside out and the shared bundle is signed only after all selected targets. For `extension`, autodetection scans `~/.gemini/bin/`, ignoring `PATH`. For non-standard locations, specify the executable paths manually via command line options (e.g., `--path-cli` or `--path-extension`). Ensure the applications are closed before patching to prevent file locking issues. Account management and quota tracking (`accounts`) support Windows login snapshots; macOS supports isolated desktop profiles.
 
 ---
 
 ## <a id="accounts"></a>👥 Account Profiles & Quota Monitoring
 
-Safely saves the active Antigravity session under a unique profile name, allows you to switch between multiple accounts offline without browser-based re-authentication, and tracks real-time model quota usage (remaining amounts, availability percentages, and reset countdowns) for both saved profiles and active unsaved sessions.
+On Windows, saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser and monitor live model quotas. On macOS, creates isolated desktop app profiles for simultaneous accounts.
 
-### Management Scopes
-Sessions and quota checks are isolated into two independent scopes:
+### macOS: independent desktop accounts
+
+For Antigravity desktop **2.19.1 on Apple Silicon**, choose **Manage accounts** in the menu, then create and open a profile for each account. Run without `sudo`. Each new profile starts signed out; sign into its intended Google account in that window.
+
+```bash
+python manager.py accounts manager create work
+python manager.py accounts manager create personal
+python manager.py accounts manager open work
+python manager.py accounts manager open personal
+python manager.py accounts manager list
+```
+
+Profiles created before credential namespacing require repair: quit only the extra profile, run `python manager.py accounts manager repair <name>`, then open it again and sign into the other account. Keep the main app open. Do not sign out from an unrepaired copy, since its old fallback file is shared with the main login. Repair replaces only the copied app and preserves its project and conversation data. Creation and repair also isolate inherited backend backups; restoring an unsafe profile backup is refused. Full restore re-signs the isolated profile with its restored backend instead of reinstating a seal captured with patched bytes. If signing fails, restored binaries roll back so the operation can be retried; a failed binary rollback retains the original in a reported `.restore-recovery-*` directory. Installed vendor apps still restore their original signatures. If repair rollback fails, the original app is kept in a separate `.recovery-*` folder and the error reports its path for manual recovery. Intel macOS profiles are refused until their credential constructor is verified; existing Intel binary patching is unchanged.
+
+Use lowercase letters, digits, `_` or `-` in profile names. Profiles live under `~/Library/Application Support/agy-manager/profiles/`, with private permissions and separate app copies, window state, settings, browser data and conversation storage. No existing login or conversation history is imported. Backend credentials use a separate owner-only file for each profile under `~/.gemini/agy-profile-<hash>` instead of the shared Keychain or `jetski-standalone-oauth-token` login; never share these credential files or profile folders. The copied ARM64 backend's fallback constructor is verified and updated to use that private filename; the main app's credential file is untouched. Opening an existing profile again focuses its own instance.
+
+Each copy uses about 650 MB and is signed locally, including nested code; the installed app is untouched. Copied helper executables receive the Library Validation exception needed to load the locally signed framework, plus JIT permission. This applies only to the profile copies. Profile-copy updates are disabled to preserve isolation. Support for newer builds requires verifying their storage and launch layouts before adding them. The commands above manage desktop profiles; the Windows commands below still manage saved login snapshots.
+
+### Windows Management Scopes
+Sessions are isolated into two independent scopes:
 1. **CLI + Manager + Extension** (share a common credential stored in Windows Credential Manager).
 2. **IDE** (uses its own authorization keys in the SQLite database `state.vscdb` inside VS Code).
 
@@ -195,6 +220,7 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 2. The check and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP`: the flag is forced to `true` and the conditional jump is removed, so execution continues along the success path.
 3. This validator's result is returned by `GetAuthStatus` and used by the login routine, so both locations receive the same forced-success verdict during initial login and subsequent restarts.
 4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain the same gate in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → `ldp x3,x4,[sp,#0x80]` → `stp x3,x4,[x0,#0x60]`. The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]`, forcing the flag to `true`, removing the conditional jump, and continuing along the success path. The signature fixes the current context instructions and allows only the branch displacement to vary. The `MultiGate` class automatically selects the x64 or arm64 signature.
+The profile credential gate matches ARM64 `adrp/add x3` → `mov x4,#29` → `stp x3,x4` → `filepath.Join` in backend 2.19.1. It resolves the referenced filename through Mach-O segment addresses, verifies the original literal, replaces it with a 28-byte profile filename and changes the length to `mov x4,#28`. Duplicate or unsupported signatures stop before replacement.
 </details>
 
 <details>
