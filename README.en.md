@@ -36,7 +36,7 @@
 `agy-manager` combines essential tools for a seamless development experience in the Antigravity ecosystem:
 
 - 🔓 **Location Restriction Bypass:** Disable local availability blockers ("not available in your location") across all core components (CLI, Manager, IDE, and the IDE extension).
-- 👥 **Account Profiles & Live Quota Monitoring:** Safely store and quickly switch between multiple authorization profiles offline without browser-based re-authentication, plus track real-time model quota usage (5-hour and weekly windows for Gemini and Claude/GPT model groups), reset countdowns, and remaining percentages across all saved profiles and the active session.
+- 👥 **Account Profiles & Live Quota Monitoring:** Safely store and switch profiles offline (Windows), run isolated desktop app profiles concurrently (macOS), plus monitor real-time model quotas (5-hour and weekly windows for Gemini, Claude, and GPT).
 - 🎨 **Interactive TUI Dashboard:** Convenient terminal interface built with `rich` and `questionary` for managing patches and profiles, featuring an automatic live quota summary table right on the home screen.
 - ⚡ **Zero-Dependency Core:** All scriptable CLI commands (patching, profile switching, and quota inspection) run purely on Python's standard library with no external dependencies required.
 - 🛡️ **Safe & Reversible:** The patcher requires exactly one original or patched signature inside PE/ELF/Mach-O executable sections, verifies the backup and every write, and rolls back automatically on failure. Original files are kept as `*.agybak`; on macOS, the `.app` signature state is also saved in a sibling `*.app.agysignbak` directory.
@@ -83,7 +83,7 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 | `python manager.py patch` | Patch all detected applications. |
 | `python manager.py restore` | Revert all changes and restore original files. |
 | `python manager.py patch <cli\|manager\|ide\|extension>` | Patch only the specified applications. |
-| `python manager.py accounts <cli-manager\|ide> <action> [name1] [name2]` | Manage saved authorization profiles and inspect quotas (see details below). |
+| `python manager.py accounts <scope> <action> [options]` | Manage account profiles (Windows & macOS) and inspect quotas (details below). |
 
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
@@ -94,16 +94,14 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 > ```
 
 > [!NOTE]
-> On macOS, binary patches are written and verified in a temporary file beside the target, then installed by atomic replacement. Restore and binary rollback also use replacement, avoiding in-place writes to signed executables. You still need write access to the containing directory. If `Operation not permitted` persists even with `sudo`, macOS App Management protection may be blocking changes inside the bundle. Open **System Settings → Privacy & Security → App Management**, enable the terminal app running the patcher (or the editor if using its integrated terminal), then quit and reopen that app and retry. `sudo` does not grant macOS privacy permissions. Close Antigravity before patching and restart it afterward.
+> On macOS, binary patching, restoration, and rollbacks use atomic file replacement instead of in-place writes to signed executables. Write permissions to the containing directory are required. If `Operation not permitted` persists even with `sudo`, macOS App Management may be blocking changes. Open **System Settings → Privacy & Security → App Management**, grant access to your terminal (or editor), restart it, and retry (`sudo` does not grant macOS privacy permissions). Close Antigravity before patching and restart it afterward.
 >
-> **macOS signing runs automatically only while patching on macOS.** The patcher first applies and verifies all selected changes, then ad-hoc signs each modified Mach-O (`agy` and `language_server`) separately, and finally signs the containing `.app` once. Every signature is verified with `codesign`; a failure rolls back the patches and temporary signature changes. When Python lacks extended-attribute APIs, the patcher uses the built-in `/usr/bin/xattr` tool; no extra Python package is needed. After signing succeeds, the patcher automatically removes `com.apple.quarantine` only from the selected applications (recursively for `.app` bundles), preventing Gatekeeper from blocking the locally modified code. During `restore`, the original bundle signature is returned after the last patched target inside that bundle is restored. Keep `*.app.agysignbak` directories for as long as you need the patch and full restoration support.
->
-> Removing quarantine does not disable Gatekeeper globally or affect other applications or system settings. The original value of this attribute is not restored by the `restore` command.
+> **macOS signing runs automatically:** the patcher applies changes, creates ad-hoc signatures for modified Mach-O binaries (`agy` and `language_server`), signs the outer `.app` bundle, and validates the result via `codesign`. On success, `com.apple.quarantine` is recursively removed from the selected applications so Gatekeeper permits execution. The `*.app.agysignbak` directories preserve original signatures for full restoration via `restore`.
 
 > [!WARNING]
 > **Electron and Library Validation on macOS.** The app's signing flags and entitlements are inspected before patch writes. If Library Validation is enabled without an exception, the patcher stops: ad-hoc signing removes the main executable's Team ID and may make it incompatible with the Electron Framework signature. Failure to read signing metadata or entitlements also stops the patch. To explicitly allow libraries with other or no signatures in the selected app, use:
 > ```bash
-> python3 manager.py --macos-disable-library-validation patch ide
+> python manager.py --macos-disable-library-validation patch ide
 > ```
 > The flag applies only to `patch`/`menu` on macOS and adds `com.apple.security.cs.disable-library-validation=true` only to the selected Electron `.app`'s main executable, when needed. Other entitlements, the identifier, signing flags, and Hardened Runtime are preserved; frameworks and helpers are not re-signed. Entitlements are read back and checked after signing; failure triggers rollback. `restore` returns the original signature and entitlements from `*.app.agysignbak` after the last patched target is restored. To repair an already patched copy, rerun the CLI patch command with the flag.
 >
@@ -136,62 +134,62 @@ The patcher neutralizes local eligibility checks and directs each client into it
 
 ## <a id="accounts"></a>👥 Account Profiles & Quota Monitoring
 
-On Windows, saves the current active Antigravity session under a unique profile name, allowing you to switch between profiles offline without invoking the browser and monitor live model quotas. On macOS, creates isolated desktop app profiles for simultaneous accounts.
+Enables seamless multi-account workflows without browser-based re-authentication: on Windows via fast offline session switching and quota monitoring; on macOS via isolated desktop application profiles.
 
-### macOS: independent desktop accounts
+### macOS: Independent Desktop Profiles
 
-For Antigravity desktop **2.19.1 on Apple Silicon**, choose **Manage accounts** in the menu, then create and open a profile for each account. Run without `sudo`. Each new profile starts signed out; sign into its intended Google account in that window.
+On **Apple Silicon (Antigravity 2.19.1)**, you can run multiple application windows with different Google accounts simultaneously. Each profile gets a dedicated, locally signed app copy (`~650 MB`) with isolated window state, settings, history, and a private credential file under `~/.gemini/agy-profile-<hash>`.
 
 ```bash
-python manager.py accounts manager create work
-python manager.py accounts manager create personal
-python manager.py accounts manager open work
-python manager.py accounts manager open personal
-python manager.py accounts manager list
+python manager.py accounts manager create work     # Create a new isolated profile
+python manager.py accounts manager open work       # Launch profile window (sign into your account)
+python manager.py accounts manager list            # List existing profiles
+python manager.py accounts manager repair work     # Update profile to the latest isolation format
 ```
 
-Profiles created before credential namespacing require repair: quit only the extra profile, run `python manager.py accounts manager repair <name>`, then open it again and sign into the other account. Keep the main app open. Do not sign out from an unrepaired copy, since its old fallback file is shared with the main login. Repair replaces only the copied app and preserves its project and conversation data. Creation and repair also isolate inherited backend backups; restoring an unsafe profile backup is refused. Full restore re-signs the isolated profile with its restored backend instead of reinstating a seal captured with patched bytes. If signing fails, restored binaries roll back so the operation can be retried; a failed binary rollback retains the original in a reported `.restore-recovery-*` directory. Installed vendor apps still restore their original signatures. If repair rollback fails, the original app is kept in a separate `.recovery-*` folder and the error reports its path for manual recovery. Intel macOS profiles are refused until their credential constructor is verified; existing Intel binary patching is unchanged.
-
-Use lowercase letters, digits, `_` or `-` in profile names. Profiles live under `~/Library/Application Support/agy-manager/profiles/`, with private permissions and separate app copies, window state, settings, browser data and conversation storage. No existing login or conversation history is imported. Backend credentials use a separate owner-only file for each profile under `~/.gemini/agy-profile-<hash>` instead of the shared Keychain or `jetski-standalone-oauth-token` login; never share these credential files or profile folders. The copied ARM64 backend's fallback constructor is verified and updated to use that private filename; the main app's credential file is untouched. Opening an existing profile again focuses its own instance.
-
-Each copy uses about 650 MB and is signed locally, including nested code; the installed app is untouched. Copied helper executables receive the Library Validation exception needed to load the locally signed framework, plus JIT permission. This applies only to the profile copies. Profile-copy updates are disabled to preserve isolation. Support for newer builds requires verifying their storage and launch layouts before adding them. The commands above manage desktop profiles; the Windows commands below still manage saved login snapshots.
+> [!TIP]
+> - **Management:** Create, launch, and update profiles via the CLI commands above or through the interactive menu (**Manage accounts**). Run without `sudo`.
+> - **Isolation:** Profiles reside in `~/Library/Application Support/agy-manager/profiles/`. Credentials and conversation history are fully isolated from the main app.
+> - **Updating Legacy Profiles:** If a profile was created before credential isolation, quit its window and run `repair <name>` to refresh the binary without losing projects or conversations.
 
 ### Windows Management Scopes
 Sessions are isolated into two independent scopes:
 1. **CLI + Manager + Extension** (share a common credential stored in Windows Credential Manager).
 2. **IDE** (uses its own authorization keys in the SQLite database `state.vscdb` inside VS Code).
 
-This separation avoids database locking conflicts, lets you query quotas and switch accounts for different tools independently.
+This separation avoids database locking conflicts, lets you query quotas, and switch accounts for different tools independently.
 
-### Live Quota Monitoring
+### Real-Time Quota Monitoring (Windows)
 The quota inspection engine communicates directly with Google's internal quota service (`retrieveUserQuotaSummary`) using only Python's standard library:
 - **Tracked Model Groups:** 5-hour and weekly windows for the **Gemini Models** group (`5h` / `weekly`) and third-party **Claude and GPT models** (`5h` / `weekly`).
 - **Color-Coded Status:** Normal quota is green, low remaining quota (20% or less) is highlighted in yellow, and exhausted limits (`0% [RATE-LIMITED]`) are shown in red. Disabled buckets display `unavailable`, and unsupported windows display `no data`.
-- **Unsaved Session Support:** If an active session has not yet been saved under a profile name, it appears as **Current · unsaved** — saving a profile is not required to view quotas. If the active login matches a saved profile, only that profile's row appears, marked with an active indicator (`●`). Saving an active session seamlessly moves the quota snapshot to the saved profile name without duplicating rows.
-- **Safety and Autonomy:** Quota queries are strictly read-only, use the account's existing OAuth session, and refresh expired tokens in memory when needed without modifying stored credentials on disk or switching the active account. Failure of one account (such as network errors or revoked tokens) is isolated and does not hide data for other accounts. Passing a reset time does not assume that quota has refilled until confirmed by a refreshed response.
+- **Unsaved Session Support:** If an active session has not yet been saved under a profile name, it appears as **Current · unsaved** — saving a profile is not required to view quotas. If the active login matches a saved profile, only that profile's row appears, marked with an active indicator (`●`).
+- **Safety and Autonomy:** Quota queries are strictly read-only, use the account's existing OAuth session, and refresh expired tokens in memory when needed without modifying stored credentials on disk or switching the active account. Failure of one account is isolated and does not hide data for others.
 
 ### Usage in the Interactive Menu (TUI)
-The TUI runs on a separate terminal screen that stays open until the program exits. Patching, restoring, refreshing data, and account operations display an animation while messages appear as work proceeds. Resizing the window redraws tables and menus together while preserving selections and entered text; long paths are shortened with `…`. **PgUp/PgDn** scroll through long tables and operation results. Redrawing uses already loaded data without querying quotas again. When interrupted, the current operation finishes before the UI closes. Exiting restores the regular terminal:
-1. **Automatic Startup Summary:** Launching `python manager.py` (or `python manager.py menu`) automatically queries quotas for all profiles and active logins across both scopes, rendering compact summary tables directly on the main dashboard.
-2. **On-Demand Refresh:** The **Refresh quotas** option in the main menu updates data across both scopes on demand.
-3. **Accounts Menu Operations:**
-   - Select **Manage accounts** in the main menu, then choose the scope: **CLI + Manager + Extension** or **IDE**.
-   - Displays saved profiles and the live quota table (one row per account: 5-hour and weekly remaining amounts, percentages, and check timestamp).
-   - Available actions: **Check usage / quota** (refresh quotas for the chosen scope), **Save current login as…** (save active session), **Switch to…** (switch profile), **Rename…**, **Sign out locally** (local logout), and **Remove…** (delete profile).
+The interactive TUI runs via `python manager.py` (or `python manager.py menu`) in fullscreen mode with scroll support (**PgUp/PgDn**) and responsive terminal redraws:
+1. **Startup Quota Summary (Windows):** Automatically queries quotas for all saved profiles and active logins, displaying summary tables directly on the dashboard.
+2. **Refresh Quotas (Windows):** The **Refresh quotas** option in the main menu updates quota data across both scopes on demand.
+3. **Account Management (Manage accounts):**
+   - **Windows:** choose scope (**CLI + Manager + Extension** or **IDE**) to view quota tables and perform actions (**Check usage / quota**, **Save current login as…**, **Switch to…**, **Rename…**, **Sign out locally**, **Remove…**).
+   - **macOS:** list, create, launch, and repair (`repair`) isolated desktop profiles.
 
 ### Usage via the Command Line (CLI)
-Command structure: `python manager.py accounts <cli-manager|ide> <action> [name]`
 
-The `cli-manager` scope includes CLI, Manager, and Extension, which share the same login.
+- **macOS (desktop profiles):** `python manager.py accounts manager <create|open|list|repair> [name]`
+- **Windows (sessions & quotas):** `python manager.py accounts <cli-manager|ide> <action> [options]`
 
-| Action | Example Command | Description |
+> [!NOTE]
+> The `cli-manager` scope encompasses CLI, Manager, and Extension, which share the same login credential.
+
+| Action (Windows) | Example Command | Description |
 | :--- | :--- | :--- |
-| `usage [name]` | `python manager.py accounts cli-manager usage` | Fetch detailed quota breakdowns (remaining percentages, reset countdown timers, and local reset dates) for all saved profiles plus any unsaved active session in the chosen scope. Specifying a profile name (`... usage work`) checks only that account. Returns exit code `1` if any profile could not be checked. |
-| `list` (or `ls`) | `python manager.py accounts cli-manager list` | List saved profiles for the chosen scope and mark the active one. |
+| `usage [name]` | `python manager.py accounts cli-manager usage` | Detailed quota breakdown (percentages, reset timers) for all profiles or a specific profile. |
+| `list` (or `ls`) | `python manager.py accounts cli-manager list` | List saved profiles for the chosen scope with an active indicator (`●`). |
 | `save <name>` | `python manager.py accounts cli-manager save work` | Save the current active session under the specified name. |
 | `use <name>` (or `switch`) | `python manager.py accounts cli-manager use personal` | Switch to a saved profile. |
-| `logout` | `python manager.py accounts cli-manager logout` | Sign out locally (allowing you to sign into another account). |
-| `rename <old> <new>` (or `mv`) | `python manager.py accounts cli-manager rename work personal` | Rename a saved profile. |
+| `logout` | `python manager.py accounts cli-manager logout` | Sign out locally (to sign into another account). |
+| `rename <old> <new>` | `python manager.py accounts cli-manager rename work personal` | Rename a saved profile. |
 | `rm <name>` | `python manager.py accounts cli-manager rm work` | Remove a saved profile. |
 | `current` (or `who`) | `python manager.py accounts cli-manager current` | Print the name of the current active profile. |
 
@@ -220,7 +218,7 @@ The Electron Manager communicates with a local Go backend `language_server.exe` 
 2. The check and jump are overwritten with `mov byte ptr [rax+8],1` + `NOP`: the flag is forced to `true` and the conditional jump is removed, so execution continues along the success path.
 3. This validator's result is returned by `GetAuthStatus` and used by the login routine, so both locations receive the same forced-success verdict during initial login and subsequent restarts.
 4. **arm64 builds** (Linux arm64 and Apple Silicon macOS) contain the same gate in AArch64 code: `ldrb w3,[x0,#8]` → `tbz w3,#0,skip` → `ldp x3,x4,[sp,#0x80]` → `stp x3,x4,[x0,#0x60]`. The patch rewrites `ldrb;tbz` into `mov w3,#1 ; strb w3,[x0,#8]`, forcing the flag to `true`, removing the conditional jump, and continuing along the success path. The signature fixes the current context instructions and allows only the branch displacement to vary. The `MultiGate` class automatically selects the x64 or arm64 signature.
-The profile credential gate matches ARM64 `adrp/add x3` → `mov x4,#29` → `stp x3,x4` → `filepath.Join` in backend 2.19.1. It resolves the referenced filename through Mach-O segment addresses, verifies the original literal, replaces it with a 28-byte profile filename and changes the length to `mov x4,#28`. Duplicate or unsupported signatures stop before replacement.
+5. **Profile credential isolation (macOS ARM64):** Matches the fallback token constructor in backend 2.19.1: `adrp/add x3` → `mov x4,#29` → `stp x3,x4` → `filepath.Join`. The target address is resolved via Mach-O segments, the original literal is validated and replaced with the 28-byte profile filename, and the length instruction is changed to `mov x4,#28`. Duplicate or unsupported signatures safely abort before modification.
 </details>
 
 <details>
@@ -253,6 +251,7 @@ Profile switching is fully offline and does not call standard logout endpoints (
 3. **Blob Size Limit Bypass:** generic credentials in Credential Manager are limited to 2560 bytes, but the IDE's JSON state can exceed 8 KB. IDE profiles are automatically sharded into 2000-byte pieces and stored as indexed entries (`.../<index>`).
 4. **Syncing and Lock Prevention:** Before writing a new profile, the active session is automatically synced to preserve any rotated session keys.
 5. **Live Quotas:** The client request and response schema were verified in Windows x64 CLI 1.2.16/1.2.17 and Manager 2.19.1. The patcher queries Google's `v1internal:retrieveUserQuotaSummary` endpoint using only the standard library, refreshing an expired OAuth token in memory when needed. Saved IDE credits/status snapshots are not used as live quota data. This internal API can change; unsupported responses are reported without inventing quota values.
+6. **macOS Profile Isolation:** Each profile gets a dedicated app copy with private user data and a unique token file (`~/.gemini/agy-profile-<hash>`). Helper executables receive the required entitlements and local ad-hoc signatures.
 </details>
 
 <details>
