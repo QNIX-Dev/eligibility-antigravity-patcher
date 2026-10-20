@@ -83,6 +83,7 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 | `python manager.py patch` | Patch all detected applications. |
 | `python manager.py restore` | Revert all changes and restore original files. |
 | `python manager.py patch <cli\|manager\|ide\|extension>` | Patch only the specified applications. |
+| `python manager.py autoupdate <off\|on\|status>` | Disable/enable the Antigravity CLI's background self-update that silently overwrites the patch (details below). |
 | `python manager.py accounts <scope> <action> [options]` | Manage account profiles (Windows & macOS) and inspect quotas (details below). |
 
 > [!TIP]
@@ -209,6 +210,16 @@ At startup, the CLI reads the `hasValidAuth` field (the byte at offset `+8`) of 
 </details>
 
 <details>
+<summary>🚫 <b>Disabling the CLI background self-update (`autoupdate`)</b></summary>
+
+On every start and after login the CLI spawns a background updater process (`entrypoints.MaybeLaunchCLI` → the shared update trigger): it downloads a manifest, extracts the archive, and atomically replaces the `agy` binary — the patch is wiped without any warning, and the region error only shows up on the next launch.
+
+1. The shared update trigger contains a built-in check: the background branch (launch flag `false`) reads `AGY_CLI_DISABLE_AUTO_UPDATE` via `os.Getenv` and, when the value is exactly `true`, immediately returns an "updates disabled" result without spawning anything. The manual `agy update` path (`TriggerUpdateAndRelaunch`) passes the flag `true` and is not affected. The behavior was verified by disassembling and running real x64 builds (without the variable the CLI log shows `auto_updater.go: Spawned background update process`; with it, the line is absent).
+2. The `python manager.py autoupdate off` command enables the variable permanently: on Windows via a value in `HKCU\Environment` with a `WM_SETTINGCHANGE` broadcast, on macOS/Linux via a marked `# agy-manager: …` line in the current shell's startup file (`.zshrc`/`.bashrc`/`config.fish`/`.profile`). `autoupdate on` removes it, `autoupdate status` shows both the session and persistent state.
+3. No binaries are modified: the patcher only configures the client's own built-in switch. `status`/`patch` additionally recognize a binary replaced by an update (the file differs from the saved backup) and suggest re-running `patch` and `autoupdate off`.
+</details>
+
+<details>
 <summary>📦 <b>Manager Patch (`language_server.exe` Go Backend)</b></summary>
 
 The Electron Manager communicates with a local Go backend `language_server.exe` via connect-rpc. The `hasValidAuth` verdict (the byte at offset `+8` of the AuthResult) is decided in a single root location — the `authclient.(*PersonalAuthValidator).Validate` function.
@@ -270,7 +281,8 @@ The patcher fully automates the signing pipeline and entitlement management requ
 ## <a id="warnings"></a>⚠️ Caveats & Warnings
 
 - **Version Compatibility:** The patcher is only guaranteed to work on the **latest** versions of the applications. It relies on binary signatures tied to specific builds, so on older versions it may fail to locate the required instructions and simply do nothing — the status will show as `unknown` and no file is modified (a safe no-op). Update the app to the latest version if this happens.
-- **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. Re-apply the changes by running `python manager.py patch` again.
+- **Updates Overwrite Patches:** Updating any of the applications will overwrite the modified binaries. The `status` command recognizes the replacement (the installed file differs from the backup) and tells you to re-run `patch`; the backup is refreshed automatically. Re-apply the changes by running `python manager.py patch` again.
+- **CLI background self-update:** On every start and after login the Antigravity CLI spawns a background updater process that silently replaces `agy` with a fresh build — the patched binary disappears between sessions. The client itself supports `AGY_CLI_DISABLE_AUTO_UPDATE=true`, which disables exactly that background trigger (a manual `agy update` keeps working). The `python manager.py autoupdate off` command enables it permanently: on Windows via the user environment (HKCU\Environment), on macOS/Linux via a marked line in your shell's startup file (`.zshrc`/`.bashrc`/`config.fish`/`.profile`). Restart the terminal afterwards so agy picks up the change.
 - **File Locks & Running Processes:** Make sure all target applications in the corresponding scope (CLI, Manager, IDE, or the editor with the extension) are completely closed before patching or switching profiles. Otherwise, the OS will block file writes, or the active process may overwrite the restored database credentials from its in-memory cache.
 - **Token Security:** Credentials and profiles are stored in Windows Credential Manager and the local SQLite database. Quota checks send access tokens only to Google's quota service and refresh tokens only to Google's OAuth service over HTTPS. Tokens and raw service responses are never printed, redirects are refused, and refreshed credentials are not written back to the saved or active login. No credentials are sent to third-party services.
 - **Terms of Service:** Modifying proprietary client-side binaries might violate the applications' Terms of Service (ToS). This project is intended solely for educational purposes—use it at your own risk.
