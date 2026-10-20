@@ -115,6 +115,19 @@ def _binary_backup_matches(path, bak):
     except (LookupError, OSError, ValueError):
         return False
 
+def _update_replaced_hint(path):
+    """Recognize an app update that replaced a previously patched target."""
+    bak = path + BAK
+    try:
+        if not os.path.isfile(path) or not os.path.isfile(bak):
+            return None
+        if os.path.getsize(path) == os.path.getsize(bak):
+            return None
+    except OSError:
+        return None
+    return (f"installed {os.path.basename(path)} differs from its backup — an app update "
+            f"replaced it; re-run patch (a fresh backup will be saved)")
+
 def make_backup(path, binary=False):
     """Create or refresh a verified clean backup."""
     bak = path + BAK
@@ -535,7 +548,14 @@ def gate_patch(path, gate, app, fname):
         with mapped(path) as d:
             kind, off, g = gate.resolve(d, ranges, arch)
     except (LookupError, OSError, ValueError) as e:
-        warn(str(e)); return False
+        warn(str(e))
+        if isinstance(e, LookupError):
+            hint = _update_replaced_hint(path)
+            if hint:
+                info(hint)
+                if app == "CLI":
+                    info("disable the CLI's background self-update with: python manager.py autoupdate off")
+        return False
     if kind == "patched":
         ok(f"{app} already patched"); return True
     bak = make_backup(path, binary=True)
@@ -549,7 +569,11 @@ def gate_patch(path, gate, app, fname):
                 raise OSError("patch snapshot verification failed")
             if not _files_equal(before, bak) and not _binary_backup_matches(before, bak):
                 raise OSError("target changed after backup")
-            return _gate_write(path, gate, off, g, before, app)
+            if not _gate_write(path, gate, off, g, before, app):
+                return False
+            if app == "CLI":
+                info("the CLI updates itself in the background; disable that with: python manager.py autoupdate off")
+            return True
     except Exception as e:
         warn(f"{app} patch failed: {e}")
         return False
@@ -753,7 +777,11 @@ def ide_patch(path):
     try:
         kind = _ide_gate_state(d)
     except LookupError as e:
-        warn(str(e)); return False
+        warn(str(e))
+        hint = _update_replaced_hint(path)
+        if hint:
+            info(hint)
+        return False
     if kind == "patched":
         ok("IDE already patched"); return True
     off = IDE_RE.search(d).end(1)
@@ -784,6 +812,131 @@ def ide_patch(path):
     for c in _ide_cache_dirs(): rmtree_quiet(c)
     _patch_success("IDE", "isGoogleInternal=true", off)
     return True
+
+# Antigravity CLI background auto-update
+# The CLI spawns a background updater at startup and after login that silently
+# replaces the patched binary. agy itself honors AGY_CLI_DISABLE_AUTO_UPDATE
+# for that background trigger only; a manual `agy update` keeps working.
+AUTOUPDATE_ENV = "AGY_CLI_DISABLE_AUTO_UPDATE"
+AUTOUPDATE_MARK = "# agy-manager: antigravity cli background auto-update"
+
+def _autoupdate_rc_candidates():
+    """Return (existing-first rc candidates, fish syntax) for the login shell."""
+    home = os.path.expanduser("~")
+    shell = os.path.basename(os.environ.get("SHELL") or "")
+    if shell == "fish":
+        return [os.path.join(home, ".config", "fish", "config.fish")], True
+    if shell == "zsh":
+        names = (".zshrc", ".zprofile", ".profile")
+    elif shell == "bash":
+        names = (".bashrc", ".bash_profile", ".profile")
+    else:
+        names = (".profile",)
+    return [os.path.join(home, n) for n in names], False
+
+def _autoupdate_line(fish):
+    return (f"set -gx {AUTOUPDATE_ENV} true" if fish
+            else f"export {AUTOUPDATE_ENV}=true")
+
+def _autoupdate_read_rc(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+def _autoupdate_persist_posix(enable):
+    """Add or remove the marked variable lines in a shell startup file."""
+    paths, fish = _autoupdate_rc_candidates()
+    managed = {AUTOUPDATE_MARK, _autoupdate_line(True), _autoupdate_line(False)}
+    if enable:
+        path = next((p for p in paths if os.path.isfile(p)), paths[0])
+        lines = [l for l in _autoupdate_read_rc(path) if l not in managed]
+        lines += ["", AUTOUPDATE_MARK, _autoupdate_line(fish)]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        lines = _autoupdate_read_rc(path)
+        kept = [l for l in lines if l not in managed]
+        if kept != lines:
+            with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write("\n".join(kept) + "\n")
+    return None
+
+def _autoupdate_persist_windows(enable):
+    """Set or remove the variable in the user environment."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        if enable:
+            winreg.SetValueEx(key, AUTOUPDATE_ENV, 0, winreg.REG_SZ, "true")
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOUPDATE_ENV)
+            except FileNotFoundError:
+                pass
+    try:
+        # Let already-running shells see the change without a re-login.
+        import ctypes
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0,
+                                                  ctypes.c_wchar_p("Environment"), 0x2, 5000, None)
+    except Exception:
+        pass
+
+def _autoupdate_persistent_state():
+    """Return (disabled persistently, where)."""
+    if os.name == "nt":
+        where = "the user environment (HKCU\\Environment)"
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                value, _ = winreg.QueryValueEx(key, AUTOUPDATE_ENV)
+                return str(value).lower() == "true", where
+        except OSError:
+            return False, where
+    rc_paths, _ = _autoupdate_rc_candidates()
+    for path in rc_paths:
+        if os.path.isfile(path) and any(l in {AUTOUPDATE_MARK, _autoupdate_line(True),
+                                              _autoupdate_line(False)}
+                                        for l in _autoupdate_read_rc(path)):
+            return True, path
+    return False, None
+
+def run_autoupdate(argv):
+    """Control the CLI background auto-update that overwrites patched binaries."""
+    action = argv[0] if argv else "status"
+    if action not in ("on", "off", "status"):
+        warn(f"unknown autoupdate action: {action} (use on | off | status)")
+        return 2
+    session = os.environ.get(AUTOUPDATE_ENV)
+    session_off = session is not None and session.lower() == "true"
+    persistent, where = _autoupdate_persistent_state()
+    if action == "status":
+        ok(f"Antigravity CLI background auto-update: {'disabled' if session_off or persistent else 'enabled'}")
+        info(f"session: {AUTOUPDATE_ENV}={session!r}")
+        info(f"persistent: {('set in ' + where) if persistent else 'not set'}")
+        if not (session_off or persistent):
+            info("disable it with: python manager.py autoupdate off")
+        return 0
+    if action == "off":
+        where = (_autoupdate_persist_windows(True) if os.name == "nt"
+                 else _autoupdate_persist_posix(True)) or "the user environment (HKCU\\Environment)"
+        os.environ[AUTOUPDATE_ENV] = "true"
+        ok("Antigravity CLI background auto-update disabled")
+        info(f"persisted in {where}")
+        info("manual `agy update` keeps working; restart the terminal so agy sees the change")
+        return 0
+    if os.name == "nt":
+        _autoupdate_persist_windows(False)
+    else:
+        _autoupdate_persist_posix(False)
+    os.environ.pop(AUTOUPDATE_ENV, None)
+    ok("Antigravity CLI background auto-update re-enabled")
+    info("updates install in the background again; re-run patch after each update")
+    return 0
 
 # Accounts
 # Live logins remain opaque: CLI + Manager + Extension use Credential Manager; IDE uses state.vscdb.
@@ -2468,6 +2621,10 @@ def run(action, targets, overrides, macos_disable_library_validation=False):
         try:
             if action == "status":
                 st, _ = spec["status"](path); ok(f"status: {st}")
+                if st != "patched":
+                    hint = _update_replaced_hint(path)
+                    if hint:
+                        info(hint)
             elif action == "patch":
                 if not spec["patch"](path): rc = 1
             elif action == "restore":
@@ -3097,8 +3254,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Manage the Antigravity environment (patch location gates and manage profiles). "
                     "Run with no arguments for the interactive menu.")
-    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts"), nargs="?",
-                    help="menu (default) | status | patch | restore | accounts manager <list|create|open|repair> [name] (macOS) | "
+    ap.add_argument("action", choices=("menu", "status", "patch", "restore", "accounts", "autoupdate"), nargs="?",
+                    help="menu (default) | status | patch | restore | autoupdate on|off|status | accounts manager <list|create|open|repair> [name] (macOS) | "
                          "accounts <cli-manager|ide> <list|save|use|rename|current|logout|rm|usage> [name1] [name2]")
     ap.add_argument("targets", nargs="*", default=[], metavar="{" + ",".join(TARGETS) + "}",
                     help="which apps to act on (default: all)")
@@ -3112,6 +3269,9 @@ def main(argv=None):
 
     if args.action == "accounts":
         return run_accounts(args.targets, {t: getattr(args, f"path_{t}") for t in TARGETS})
+
+    if args.action == "autoupdate":
+        return run_autoupdate(args.targets)
 
     bad = [t for t in args.targets if t not in TARGETS]
     if bad:
