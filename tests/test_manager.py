@@ -410,6 +410,229 @@ class ExtensionTests(unittest.TestCase):
             with open(path, "rb") as f:
                 self.assertEqual(f.read(), updated)
 
+class UpdateReplacedTests(unittest.TestCase):
+    # Manager 2.19.1 Windows x64 validator bytes (see GateStateTests).
+    HUB_CODE = bytes.fromhex("80780800743b488b54247048895060")
+
+    @classmethod
+    def _binary(cls, code=None):
+        image = bytearray(_minimal_pe(code=cls.HUB_CODE if code is None else code))
+        struct.pack_into("<I", image, 0x98 + 16, 0x80)
+        return bytes(image)
+
+    def test_status_and_patch_explain_replaced_target(self):
+        for kind in ("gate_intact", "gate_missing"):
+            with (self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "language_server.exe")
+                original = self._binary()
+                _write(path, original)
+                overrides = {"manager": path}
+                self.assertEqual(manager.run("patch", ["manager"], overrides), 0)
+                updated = (original + b"\x90" * 8 if kind == "gate_intact"
+                           else self._binary(code=b"\x90" * 16) + b"\x90" * 8)
+                _write(path, updated)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run("status", ["manager"], overrides), 0)
+                self.assertIn("app update replaced it", out.getvalue())
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    result = manager.run("patch", ["manager"], overrides)
+                if kind == "gate_intact":
+                    self.assertEqual(result, 0)
+                    with open(path + manager.BAK, "rb") as f:
+                        self.assertEqual(f.read(), updated)
+                else:
+                    self.assertEqual(result, 1)
+                    self.assertIn("app update replaced it", out.getvalue())
+
+    def test_status_hints_absent_without_replacement(self):
+        for setup in ("no_backup", "same_size"):
+            with (self.subTest(setup=setup), tempfile.TemporaryDirectory() as tmp,
+                  contextlib.redirect_stdout(io.StringIO())):
+                path = os.path.join(tmp, "language_server.exe")
+                original = self._binary()
+                _write(path, original)
+                if setup == "no_backup":
+                    os.utime(path, (1_000_000_000, 1_000_000_000))
+                else:
+                    _write(path + manager.BAK, original)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run("status", ["manager"], {"manager": path}), 0)
+                self.assertNotIn("app update replaced it", out.getvalue())
+
+    def test_cli_patch_failure_suggests_disabling_auto_update(self):
+        with (tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO())):
+            path = os.path.join(tmp, "agy.exe")
+            code = (bytes.fromhex(
+                "4885c90f841e020000807908000f85140200004889c890e81bdbfcff"
+                "48898424e000000048899c24e800000048898c24f0000000")
+                    + b"\x90" * 7 + self.HUB_CODE)
+            image = bytearray(_minimal_pe(code=code))
+            struct.pack_into("<I", image, 0x98 + 16, 0x80)
+            _write(path, bytes(image))
+            self.assertEqual(manager.run("patch", ["cli"], {"cli": path}), 0)
+            # A CLI update replaced the binary and its gate is not recognized.
+            replaced = bytearray(_minimal_pe(code=b"\x90" * 16))
+            struct.pack_into("<I", replaced, 0x98 + 16, 0x80)
+            _write(path, bytes(replaced) + b"\x90" * 8)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run("patch", ["cli"], {"cli": path}), 1)
+            self.assertIn("app update replaced it", out.getvalue())
+            self.assertIn("autoupdate off", out.getvalue())
+
+    def test_cli_patch_prints_self_update_note(self):
+        # Shared CLI/Manager/Extension fixture so the CLI gate resolves on x64.
+        with (tempfile.TemporaryDirectory() as tmp,
+              contextlib.redirect_stdout(io.StringIO())):
+            path = os.path.join(tmp, "agy.exe")
+            code = (bytes.fromhex(
+                "4885c90f841e020000807908000f85140200004889c890e81bdbfcff"
+                "48898424e000000048899c24e800000048898c24f0000000")
+                    + b"\x90" * 7 + self.HUB_CODE)
+            image = bytearray(_minimal_pe(code=code))
+            struct.pack_into("<I", image, 0x98 + 16, 0x80)
+            _write(path, bytes(image))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run("patch", ["cli"], {"cli": path}), 0)
+            self.assertIn("updates itself in the background", out.getvalue())
+
+
+class AutoupdateTests(unittest.TestCase):
+    @staticmethod
+    def _posix(home, shell):
+        # Force the POSIX branch even on Windows so no test touches the real
+        # user environment or registry (mock.patch.dict restores added keys).
+        return (mock.patch.object(manager.os.path, "expanduser", return_value=home),
+                mock.patch.object(manager.os, "name", "posix"),
+                mock.patch.dict(manager.os.environ,
+                                {"SHELL": shell, "HOME": home, manager.AUTOUPDATE_ENV: ""}))
+
+    def test_posix_off_persists_marked_lines_and_on_removes_them(self):
+        for shell, rels in (("/bin/bash", (".profile", ".bashrc")),
+                            ("/usr/bin/fish", (".config/fish/config.fish",))):
+            with (self.subTest(shell=shell), tempfile.TemporaryDirectory() as home,
+                  contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO())):
+                rc = os.path.join(home, rels[-1])
+                os.makedirs(os.path.dirname(rc), exist_ok=True)
+                _write(rc, b"# existing config\n")
+                for patcher in self._posix(home, shell):
+                    stack.enter_context(patcher)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["off"]), 0)
+                for rel in rels:
+                    with open(os.path.join(home, rel), encoding="utf-8") as f:
+                        content = f.read()
+                    self.assertIn(manager.AUTOUPDATE_MARK, content)
+                    expected = (f"set -gx {manager.AUTOUPDATE_ENV} true" if shell.endswith("fish")
+                                else f"export {manager.AUTOUPDATE_ENV}=true")
+                    self.assertIn(expected, content)
+                self.assertIn("# existing config", open(rc, encoding="utf-8").read())
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["status"]), 0)
+                self.assertIn("disabled", out.getvalue())
+                self.assertIn("persistent: set in", out.getvalue())
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(manager.run_autoupdate(["on"]), 0)
+                for rel in rels:
+                    with open(os.path.join(home, rel), encoding="utf-8") as f:
+                        content = f.read()
+                    self.assertNotIn(manager.AUTOUPDATE_MARK, content)
+                    self.assertNotIn(manager.AUTOUPDATE_ENV, content)
+                self.assertIn("# existing config", open(rc, encoding="utf-8").read())
+
+    def test_posix_bash_login_profile_without_rc_source_keeps_variable(self):
+        # A bash login shell reads .bash_profile even when it never sources
+        # .bashrc, so the variable must land in both files.
+        with (tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack,
+              contextlib.redirect_stdout(io.StringIO())):
+            bashrc = os.path.join(home, ".bashrc")
+            profile = os.path.join(home, ".bash_profile")
+            _write(bashrc, b"# aliases\n")
+            _write(profile, b"# login profile without .bashrc\n")
+            for patcher in self._posix(home, "/bin/bash"):
+                stack.enter_context(patcher)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manager.run_autoupdate(["off"]), 0)
+            expected = f"export {manager.AUTOUPDATE_ENV}=true"
+            for path in (bashrc, profile):
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+                self.assertIn(expected, content)
+                self.assertIn(manager.AUTOUPDATE_MARK, content)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run_autoupdate(["status"]), 0)
+            self.assertIn("disabled", out.getvalue())
+            self.assertIn("persistent: set in", out.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(manager.run_autoupdate(["on"]), 0)
+            for path in (bashrc, profile):
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+                self.assertNotIn(manager.AUTOUPDATE_ENV, content)
+                self.assertNotIn(manager.AUTOUPDATE_MARK, content)
+
+    def test_status_marker_line_alone_is_not_a_persistent_setting(self):
+        # A lone marker comment without the actual line must not read as disabled.
+        with (tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack,
+              contextlib.redirect_stdout(io.StringIO())):
+            rc = os.path.join(home, ".bashrc")
+            _write(rc, (manager.AUTOUPDATE_MARK + "\n").encode())
+            for patcher in self._posix(home, "/bin/bash"):
+                stack.enter_context(patcher)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run_autoupdate(["status"]), 0)
+            self.assertIn("background auto-update: enabled", out.getvalue())
+            self.assertIn("persistent: not set", out.getvalue())
+
+    def test_windows_registry_roundtrip(self):
+        class FakeWinreg:
+            HKEY_CURRENT_USER = object()
+            KEY_SET_VALUE = object()
+            REG_SZ = 1
+            def __init__(self): self.store = {}
+            def OpenKey(self, root, sub, *rest): return self
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def SetValueEx(self, key, name, reserved, typ, value): self.store[name] = value
+            def DeleteValue(self, key, name): self.store.pop(name, None)
+            def QueryValueEx(self, key, name):
+                if name not in self.store: raise FileNotFoundError(name)
+                return self.store[name], self.REG_SZ
+        fake = FakeWinreg()
+        with (tempfile.TemporaryDirectory(),
+              mock.patch.dict("sys.modules", {"winreg": fake}),
+              mock.patch.object(manager.os, "name", "nt"),
+              mock.patch.object(manager, "_win_broadcast_environment_change") as broadcast,
+              contextlib.redirect_stdout(io.StringIO())):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(manager.run_autoupdate(["off"]), 0)
+                self.assertEqual(fake.store[manager.AUTOUPDATE_ENV], "true")
+                self.assertEqual(manager.run_autoupdate(["status"]), 0)
+                self.assertEqual(manager.run_autoupdate(["on"]), 0)
+            self.assertEqual(fake.store.get(manager.AUTOUPDATE_ENV), None)
+            self.assertEqual(broadcast.call_count, 2)
+            self.assertIn("disabled", out.getvalue())
+            self.assertIn("re-enabled", out.getvalue())
+
+    def test_unknown_action_fails_with_usage(self):
+        with (tempfile.TemporaryDirectory(),
+              mock.patch.object(manager.os.path, "expanduser",
+                                return_value=tempfile.gettempdir()),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(manager.run_autoupdate(["bogus"]), 2)
+
+
 class AccountTests(unittest.TestCase):
     @staticmethod
     def _cli_bundle(refresh_token, saved_at="now"):
