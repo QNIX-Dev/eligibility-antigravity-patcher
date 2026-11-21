@@ -13,6 +13,7 @@ except Exception:
 BAK = ".agybak"
 MAC_SIGNATURE_BAK = ".agysignbak"
 MAC_DISABLE_LIBRARY_VALIDATION = "com.apple.security.cs.disable-library-validation"
+HOMEBREW_WRAPPER_STATUS = "Homebrew wrapper"
 TARGETS = ("cli", "manager", "ide", "extension")
 
 # Utilities
@@ -517,8 +518,14 @@ class MultiGate:
             return matches[0]
         raise SignatureNotFound("no architecture gate signature matched (unsupported version?)")
 
+def _is_homebrew_command_wrapper(resolved_path):
+    return os.path.basename(os.path.dirname(resolved_path)) == ".homebrew-command-wrappers"
+
+
 def gate_status(path, gate):
     try:
+        if sys.platform == "darwin" and _is_homebrew_command_wrapper(os.path.realpath(path)):
+            return (HOMEBREW_WRAPPER_STATUS, None)
         ranges, arch = executable_info(path)
         with mapped(path) as d:
             return (gate.resolve(d, ranges, arch)[0], None)
@@ -528,6 +535,9 @@ def gate_status(path, gate):
 def gate_patch(path, gate, app, fname):
     if sys.platform == "darwin":
         path = os.path.realpath(path)
+        if _is_homebrew_command_wrapper(path):
+            warn(f"{path} is a Homebrew command wrapper. Binary patching stopped.")
+            return False
     if is_locked(path, app):
         return False
     try:
@@ -2505,8 +2515,9 @@ def scan(overrides):
 
 # Interactive UI
 _STYLE = {"patched": "bold green", "unpatched": "yellow", "unknown": "magenta",
-          "not found": "dim", "error": "bold red"}
-_ICON  = {"patched": "✓", "unpatched": "●", "unknown": "?", "not found": "·", "error": "!"}
+          "not found": "dim", "error": "bold red", HOMEBREW_WRAPPER_STATUS: "yellow"}
+_ICON  = {"patched": "✓", "unpatched": "●", "unknown": "?", "not found": "·", "error": "!",
+          HOMEBREW_WRAPPER_STATUS: "!"}
 
 def _render(console, paths, status):
     from rich.table import Table
@@ -3074,7 +3085,7 @@ def _interactive(console, overrides, macos_disable_library_validation=False):
             path, st = paths[t], status[t]
             if not path:
                 continue
-            if action == "patch" and st == "patched": continue
+            if action == "patch" and st in ("patched", HOMEBREW_WRAPPER_STATUS): continue
             if action == "restore" and st != "patched": continue
             opts.append(questionary.Choice(f"{SPEC[t]['name']}  · {st}", value=t))
         if not opts:

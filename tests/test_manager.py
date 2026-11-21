@@ -1705,6 +1705,35 @@ class TransactionTests(unittest.TestCase):
 
 
 class MacCodeSigningTests(unittest.TestCase):
+    def test_macos_patch_rejects_homebrew_command_wrapper_before_write_probe(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch.object(manager.sys, "platform", "darwin"),
+              mock.patch.object(manager, "is_locked") as probe,
+              mock.patch.object(manager, "make_backup") as backup,
+              mock.patch.object(manager, "_mac_sign_transaction") as sign,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            wrapper = os.path.join(tmp, ".homebrew-command-wrappers", "agy")
+            original = b"#!/bin/bash\nexit 0\n"
+            os.makedirs(os.path.dirname(wrapper))
+            _write(wrapper, original)
+            os.chmod(wrapper, 0o555)
+            entry = os.path.join(tmp, "agy")
+            if not _try_symlink(wrapper, entry):
+                entry = wrapper
+            cli = dict(manager.SPEC["cli"], find=lambda: [entry])
+            with mock.patch.dict(manager.SPEC, {"cli": cli}):
+                self.assertEqual(manager.state("cli"), (entry, "Homebrew wrapper"))
+                self.assertEqual(manager.run("status", ["cli"], {}), 0)
+                self.assertEqual(manager.run("patch", ["cli"], {}), 1)
+
+            self.assertIn("status: Homebrew wrapper", output.getvalue())
+            self.assertIn("is a Homebrew command wrapper", output.getvalue())
+            probe.assert_not_called()
+            backup.assert_not_called()
+            sign.assert_not_called()
+            with open(wrapper, "rb") as f:
+                self.assertEqual(f.read(), original)
+
     def test_electron_preflight_failures_leave_app_untouched(self):
         for failure in ("conflict", "entitlements", "entitlement_type", "flags", "team", "read"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
