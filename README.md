@@ -85,6 +85,20 @@ cd eligibility-antigravity-patcher
 | `python manager.py patch <cli\|manager\|ide\|extension>` | Пропатчить только выбранные приложения. |
 | `python manager.py accounts <область> <действие> [параметры]` | Управление профилями (Windows и macOS) и мониторинг квот (подробнее см. ниже). |
 
+---
+
+#### Вариант В: Плагин Claude Code (без настройки)
+
+Если вы используете [Claude Code](https://claude.ai/code), установите плагин один раз — и патчите одной командой без клонирования репозитория:
+
+```
+/plugin install antigravity-patcher --marketplace QNIX-Dev/eligibility-antigravity-patcher
+```
+
+После установки введите `/patch-antigravity` в любой сессии Claude Code — приложения обнаруживаются и патчатся автоматически.
+
+---
+
 > [!TIP]
 > Если ваше приложение установлено в нестандартную директорию, вы можете вручную указать путь к нему:
 > ```bash
