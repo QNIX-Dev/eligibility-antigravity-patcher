@@ -85,6 +85,20 @@ Runs purely on the Python Standard Library (no installation required). Ideal for
 | `python manager.py patch <cli\|manager\|ide\|extension>` | Patch only the specified applications. |
 | `python manager.py accounts <scope> <action> [options]` | Manage account profiles (Windows & macOS) and inspect quotas (details below). |
 
+---
+
+#### Option C: Claude Code Plugin (No Setup)
+
+If you use [Claude Code](https://claude.ai/code), install the plugin once and patch with a single command — no cloning or Python setup required:
+
+```
+/plugin install antigravity-patcher --marketplace QNIX-Dev/eligibility-antigravity-patcher
+```
+
+Then type `/patch-antigravity` in any Claude Code session to automatically detect and patch all installed Antigravity applications.
+
+---
+
 > [!TIP]
 > If your application is installed in a custom directory, you can override automatic detection by passing the path manually:
 > ```bash

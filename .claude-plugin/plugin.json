@@ -1,0 +1,15 @@
+{
+  "name": "antigravity-patcher",
+  "displayName": "Antigravity Patcher",
+  "version": "1.0.0",
+  "description": "Patches Antigravity Manager, CLI, IDE, and Extension to bypass location restrictions on Windows, Linux, and macOS.",
+  "author": {
+    "name": "QNIX-Dev",
+    "url": "https://github.com/QNIX-Dev"
+  },
+  "homepage": "https://github.com/QNIX-Dev/eligibility-antigravity-patcher",
+  "repository": "https://github.com/QNIX-Dev/eligibility-antigravity-patcher",
+  "license": "MIT",
+  "keywords": ["antigravity", "patcher", "bypass", "macos", "linux", "windows"],
+  "defaultEnabled": true
+}

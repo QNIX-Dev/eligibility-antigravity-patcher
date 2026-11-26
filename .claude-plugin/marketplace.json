@@ -1,0 +1,16 @@
+{
+  "name": "antigravity-patcher",
+  "description": "Claude Code plugin for patching Antigravity tools to bypass location restrictions",
+  "owner": {
+    "name": "QNIX-Dev",
+    "url": "https://github.com/QNIX-Dev"
+  },
+  "plugins": [
+    {
+      "name": "antigravity-patcher",
+      "source": "./",
+      "description": "Patches Antigravity Manager, CLI, IDE, and Extension to bypass location restrictions on Windows, Linux, and macOS.",
+      "version": "1.0.0"
+    }
+  ]
+}
